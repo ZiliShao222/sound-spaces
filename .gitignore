@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data
+data/
+*.log
+models/
+video_dir/
+tb/
+checkpoints/
+*.pth
+
+# System
+.DS_Store
+Thumbs.db
+
+# Conda
+Miniconda*.sh
+
+# Habitat specific
+habitat-sim/build/
+habitat-sim/build*/
+habitat-lab/.pytest_cache/
+habitat-lab/build/
+
+# SoundSpaces specific
+sound-spaces/data/
+sound-spaces/models/
+sound-spaces/video_dir/
+sound-spaces/tb/
+sound-spaces/*.log
