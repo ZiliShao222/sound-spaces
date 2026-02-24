@@ -1,6 +1,7 @@
 # SoundSpaces 项目
 
 完整的环境配置，包含所有必要的依赖和安装说明。
+自取，多了必要的habitat-sim和habitat-lab,当时下载挺费时，也许这样会简单点
 
 **注意：此仓库包含了原始的 [facebookresearch/sound-spaces](https://github.com/facebookresearch/sound-spaces) 以及所有必要的依赖项目。**
 
