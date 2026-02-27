@@ -7,6 +7,7 @@ import datetime as dt
 from typing import Dict, Any
 
 import habitat
+import numpy as np
 import soundspaces  # noqa: F401 - register SoundSpaces datasets/tasks
 from ss_baselines.av_nav.config.default import get_task_config
 from ss_baselines.common.utils import images_to_video_with_audio
@@ -51,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resolution",
         type=int,
-        default=512,
+        default=256,
         help="RGB/Depth resolution (square).",
     )
     parser.add_argument(
@@ -76,6 +77,17 @@ def parse_args() -> argparse.Namespace:
         "--episode-log",
         default=None,
         help="Path to per-episode metrics log file (default: auto under ./logs).",
+    )
+    parser.add_argument(
+        "--audio-activity-log",
+        default=None,
+        help="Path to per-episode audio activity log (JSONL).",
+    )
+    parser.add_argument(
+        "--audio-activity-threshold",
+        type=float,
+        default=1e-6,
+        help="Amplitude threshold to mark a timestep as audible.",
     )
     parser.add_argument(
         "--mean-log",
@@ -156,6 +168,8 @@ def build_config(args: argparse.Namespace) -> habitat.Config:
 
     if args.video_audio and "AUDIOGOAL_SENSOR" not in cfg.TASK.SENSORS:
         cfg.TASK.SENSORS.append("AUDIOGOAL_SENSOR")
+    if args.audio_activity_log and "AUDIOGOAL_SENSOR" not in cfg.TASK.SENSORS:
+        cfg.TASK.SENSORS.append("AUDIOGOAL_SENSOR")
 
     if "distractor" in split_name:
         cfg.SIMULATOR.AUDIO.HAS_DISTRACTOR_SOUND = True
@@ -217,7 +231,7 @@ def main() -> None:
     env = habitat.Env(config=cfg)
 
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    split_range = f"{args.split_l}-{args.split_r}"
+    split_range = f"{args.split_l}:{args.split_r}"
     if args.episode_log is None or args.mean_log is None:
         base_dir = os.path.join("logs", f"[{split_range}]_{timestamp}")
         os.makedirs(base_dir, exist_ok=True)
@@ -248,12 +262,22 @@ def main() -> None:
     printed_shape = False
 
     if args.video:
+        if args.video_dir == "video_dir":
+            args.video_dir = os.path.join(
+                "output_video",
+                f"[{split_range}]_{timestamp}",
+            )
         os.makedirs(args.video_dir, exist_ok=True)
     if args.episode_log:
         os.makedirs(os.path.dirname(args.episode_log) or ".", exist_ok=True)
         episode_log_f = open(args.episode_log, "w", encoding="utf-8")
     else:
         episode_log_f = None
+    if args.audio_activity_log:
+        os.makedirs(os.path.dirname(args.audio_activity_log) or ".", exist_ok=True)
+        audio_activity_log_f = open(args.audio_activity_log, "w", encoding="utf-8")
+    else:
+        audio_activity_log_f = None
     if args.mean_log:
         os.makedirs(os.path.dirname(args.mean_log) or ".", exist_ok=True)
         mean_log_f = open(args.mean_log, "w", encoding="utf-8")
@@ -268,6 +292,8 @@ def main() -> None:
 
         frames = []
         audios = []
+        audio_intervals = []
+        audio_interval_start = None
         step_count = 0
         done = False
         while not done:
@@ -285,7 +311,23 @@ def main() -> None:
                 frames.append(frame)
                 if args.video_audio and "audiogoal" in observations:
                     audios.append(observations["audiogoal"])
+            if audio_activity_log_f is not None:
+                if "audiogoal" in observations:
+                    audio = observations["audiogoal"]
+                    audio_active = float(np.max(np.abs(audio))) > args.audio_activity_threshold
+                elif hasattr(env.sim, "is_silent"):
+                    audio_active = not env.sim.is_silent
+                else:
+                    audio_active = False
+                if audio_active:
+                    if audio_interval_start is None:
+                        audio_interval_start = step_count
+                elif audio_interval_start is not None:
+                    audio_intervals.append([audio_interval_start, step_count - 1])
+                    audio_interval_start = None
             step_count += 1
+        if audio_activity_log_f is not None and audio_interval_start is not None:
+            audio_intervals.append([audio_interval_start, step_count - 1])
 
         metrics = filter_metrics(env.get_metrics())
         for k, v in metrics.items():
@@ -302,6 +344,22 @@ def main() -> None:
         if episode_log_f is not None:
             episode_log_f.write(line + "\n")
             episode_log_f.flush()
+        if audio_activity_log_f is not None:
+            audio_activity_log_f.write(
+                json.dumps(
+                    {
+                        "episode": episode_count,
+                        "scene": ep.scene_id,
+                        "episode_id": ep.episode_id,
+                        "sound_intervals": audio_intervals,
+                        "threshold": args.audio_activity_threshold,
+                        "steps": step_count,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            audio_activity_log_f.flush()
         if mean_log_f is not None:
             mean_log_f.write(
                 json.dumps(
@@ -321,7 +379,7 @@ def main() -> None:
             print(line)
 
         if args.video and len(frames) > 0:
-            video_name = f"{os.path.basename(ep.scene_id)}_{ep.episode_id}"
+            video_name = f"episode_{episode_count}"
             fps = args.video_fps or int(1 / cfg.SIMULATOR.STEP_TIME)
             if args.video_audio and len(audios) > 0:
                 images_to_video_with_audio(
@@ -344,6 +402,8 @@ def main() -> None:
     mean_metrics = {k: v / episode_count for k, v in sum_metrics.items()}
     if episode_log_f is not None:
         episode_log_f.close()
+    if audio_activity_log_f is not None:
+        audio_activity_log_f.close()
     if mean_log_f is not None:
         mean_log_f.close()
     print(f"Completed {episode_count} episodes on split={cfg.DATASET.SPLIT}")

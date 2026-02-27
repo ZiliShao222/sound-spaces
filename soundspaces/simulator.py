@@ -676,11 +676,21 @@ class SoundSpacesSim(Simulator, ABC):
         self._egomap_cache[self._current_scene][(self._receiver_position_index, self._rotation_angle)] = egomap
 
     def get_current_audiogoal_observation(self):
+        cache_enabled = getattr(self.config.AUDIO, "CACHE", True)
+        if not cache_enabled:
+            joint_index = (
+                self._episode_step_count,
+                self._source_position_index,
+                self._receiver_position_index,
+                self.azimuth_angle,
+            )
+        else:
+            joint_index = (self._source_position_index, self._receiver_position_index, self.azimuth_angle)
+
         if self.config.AUDIO.HAS_DISTRACTOR_SOUND:
             # by default, does not cache for distractor sound
             audiogoal = self._compute_audiogoal()
         else:
-            joint_index = (self._source_position_index, self._receiver_position_index, self.azimuth_angle)
             if joint_index not in self._audiogoal_cache:
                 self._audiogoal_cache[joint_index] = self._compute_audiogoal()
             audiogoal = self._audiogoal_cache[joint_index]
@@ -688,11 +698,21 @@ class SoundSpacesSim(Simulator, ABC):
         return audiogoal
 
     def get_current_spectrogram_observation(self, audiogoal2spectrogram):
+        cache_enabled = getattr(self.config.AUDIO, "CACHE", True)
+        if not cache_enabled:
+            joint_index = (
+                self._episode_step_count,
+                self._source_position_index,
+                self._receiver_position_index,
+                self.azimuth_angle,
+            )
+        else:
+            joint_index = (self._source_position_index, self._receiver_position_index, self.azimuth_angle)
+
         if self.config.AUDIO.HAS_DISTRACTOR_SOUND:
             audiogoal = self.get_current_audiogoal_observation()
             spectrogram = audiogoal2spectrogram(audiogoal)
         else:
-            joint_index = (self._source_position_index, self._receiver_position_index, self.azimuth_angle)
             if joint_index not in self._spectrogram_cache:
                 audiogoal = self.get_current_audiogoal_observation()
                 self._spectrogram_cache[joint_index] = audiogoal2spectrogram(audiogoal)
