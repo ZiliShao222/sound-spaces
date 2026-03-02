@@ -253,23 +253,33 @@ def plot_top_down_map(info, dataset='replica', pred=None):
         direction_vector_agent = np.array([rounded_pred[1], 0, -rounded_pred[0]])
         direction_vector = quaternion_rotate_vector(source_rotation, direction_vector_agent)
 
-        grid_size = (
-            (maps.COORDINATE_MAX - maps.COORDINATE_MIN) / 10000,
-            (maps.COORDINATE_MAX - maps.COORDINATE_MIN) / 10000,
-        )
-        delta_x = int(-direction_vector[0] / grid_size[0])
-        delta_y = int(direction_vector[2] / grid_size[1])
+        if hasattr(maps, "COORDINATE_MAX") and hasattr(maps, "COORDINATE_MIN"):
+            if hasattr(maps, "COORDINATE_MAX") and hasattr(maps, "COORDINATE_MIN"):
+                grid_size = (
+                    (maps.COORDINATE_MAX - maps.COORDINATE_MIN) / 10000,
+                    (maps.COORDINATE_MAX - maps.COORDINATE_MIN) / 10000,
+                )
+                delta_x = int(-direction_vector[0] / grid_size[0])
+                delta_y = int(direction_vector[2] / grid_size[1])
+            else:
+                delta_x = None
+                delta_y = None
+        else:
+            # Skip pred overlay if map scale constants are unavailable.
+            delta_x = None
+            delta_y = None
 
-        x = np.clip(map_agent_pos[0] + delta_x, a_min=0, a_max=top_down_map.shape[0])
-        y = np.clip(map_agent_pos[1] + delta_y, a_min=0, a_max=top_down_map.shape[1])
-        point_padding = 20
-        for m in range(x - point_padding, x + point_padding + 1):
-            for n in range(y - point_padding, y + point_padding + 1):
-                if np.linalg.norm(np.array([m - x, n - y])) <= point_padding and \
-                        0 <= m < top_down_map.shape[0] and 0 <= n < top_down_map.shape[1]:
-                    top_down_map[m, n] = (0, 255, 255)
-        if np.linalg.norm(rounded_pred) < 1:
-            assert delta_x == 0 and delta_y == 0
+        if delta_x is not None and delta_y is not None:
+            x = np.clip(map_agent_pos[0] + delta_x, a_min=0, a_max=top_down_map.shape[0])
+            y = np.clip(map_agent_pos[1] + delta_y, a_min=0, a_max=top_down_map.shape[1])
+            point_padding = 20
+            for m in range(x - point_padding, x + point_padding + 1):
+                for n in range(y - point_padding, y + point_padding + 1):
+                    if np.linalg.norm(np.array([m - x, n - y])) <= point_padding and \
+                            0 <= m < top_down_map.shape[0] and 0 <= n < top_down_map.shape[1]:
+                        top_down_map[m, n] = (0, 255, 255)
+            if np.linalg.norm(rounded_pred) < 1:
+                assert delta_x == 0 and delta_y == 0
 
     if top_down_map.shape[0] > top_down_map.shape[1]:
         top_down_map = np.rot90(top_down_map, 1)
@@ -546,30 +556,43 @@ def observations_to_image(observation: Dict, info: Dict, pred=None) -> np.ndarra
 
             # current_position = sim.get_agent_state().position
             # agent_state = sim.get_agent_state()
-            source_rotation = info["top_down_map"]["agent_rotation"]
+            if "agent_rotation" not in info["top_down_map"]:
+                # Some configs don't provide agent_rotation; skip pred overlay in that case.
+                source_rotation = None
+            else:
+                source_rotation = info["top_down_map"]["agent_rotation"]
 
             rounded_pred = np.round(pred[1])
             direction_vector_agent = np.array([rounded_pred[1], 0, -rounded_pred[0]])
-            direction_vector = quaternion_rotate_vector(source_rotation, direction_vector_agent)
+            if source_rotation is None:
+                direction_vector = direction_vector_agent
+            else:
+                direction_vector = quaternion_rotate_vector(source_rotation, direction_vector_agent)
             # pred_goal_location = source_position + direction_vector.astype(np.float32)
 
-            grid_size = (
-                (maps.COORDINATE_MAX - maps.COORDINATE_MIN) / 10000,
-                (maps.COORDINATE_MAX - maps.COORDINATE_MIN) / 10000,
-            )
-            delta_x = int(-direction_vector[0] / grid_size[0])
-            delta_y = int(direction_vector[2] / grid_size[1])
+            if hasattr(maps, "COORDINATE_MAX") and hasattr(maps, "COORDINATE_MIN"):
+                grid_size = (
+                    (maps.COORDINATE_MAX - maps.COORDINATE_MIN) / 10000,
+                    (maps.COORDINATE_MAX - maps.COORDINATE_MIN) / 10000,
+                )
+                delta_x = int(-direction_vector[0] / grid_size[0])
+                delta_y = int(direction_vector[2] / grid_size[1])
+            else:
+                # Skip pred overlay if map scale constants are unavailable.
+                delta_x = None
+                delta_y = None
 
-            x = np.clip(map_agent_pos[0] + delta_x, a_min=0, a_max=top_down_map.shape[0])
-            y = np.clip(map_agent_pos[1] + delta_y, a_min=0, a_max=top_down_map.shape[1])
-            point_padding = 12
-            for m in range(x - point_padding, x + point_padding + 1):
-                for n in range(y - point_padding, y + point_padding + 1):
-                    if np.linalg.norm(np.array([m - x, n - y])) <= point_padding and \
-                            0 <= m < top_down_map.shape[0] and 0 <= n < top_down_map.shape[1]:
-                        top_down_map[m, n] = (0, 255, 255)
-            if np.linalg.norm(rounded_pred) < 1:
-                assert delta_x == 0 and delta_y == 0
+            if delta_x is not None and delta_y is not None:
+                x = np.clip(map_agent_pos[0] + delta_x, a_min=0, a_max=top_down_map.shape[0])
+                y = np.clip(map_agent_pos[1] + delta_y, a_min=0, a_max=top_down_map.shape[1])
+                point_padding = 12
+                for m in range(x - point_padding, x + point_padding + 1):
+                    for n in range(y - point_padding, y + point_padding + 1):
+                        if np.linalg.norm(np.array([m - x, n - y])) <= point_padding and \
+                                0 <= m < top_down_map.shape[0] and 0 <= n < top_down_map.shape[1]:
+                            top_down_map[m, n] = (0, 255, 255)
+                if np.linalg.norm(rounded_pred) < 1:
+                    assert delta_x == 0 and delta_y == 0
 
         if top_down_map.shape[0] > top_down_map.shape[1]:
             top_down_map = np.rot90(top_down_map, 1)

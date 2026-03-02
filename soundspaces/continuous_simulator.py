@@ -92,6 +92,10 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
         self._receiver_position_index = None
         self._rotation_angle = None
         self._current_sound = None
+        self._sound_ids = None
+        self._sound_positions = None
+        self._active_sound_idx = None
+        self._sound_schedule = None
         self._offset = None
         self._duration = None
         self._audio_index = None
@@ -313,11 +317,30 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
             assert hasattr(self.config.AGENT_0, 'DURATION')
             self._duration = int(self.config.AGENT_0.DURATION)
         self._audio_index = 0
-        is_same_sound = config.AGENT_0.SOUND_ID == self._current_sound
-        if not is_same_sound:
-            self._current_sound = self.config.AGENT_0.SOUND_ID
-            self._load_single_source_sound()
-            logging.debug("Switch to sound {} with duration {} seconds".format(self._current_sound, self._duration))
+        sound_sources = getattr(self.config.AGENT_0, "SOUND_SOURCES", None)
+        if sound_sources:
+            self._sound_ids = []
+            self._sound_positions = []
+            for src in sound_sources:
+                self._sound_ids.append(src["sound_id"])
+                self._sound_positions.append(src["position"])
+            self._sound_schedule = getattr(
+                self.config.AGENT_0, "SOUND_SOURCE_SCHEDULE", ["round_robin", 40]
+            )
+        else:
+            self._sound_ids = [self.config.AGENT_0.SOUND_ID]
+            self._sound_positions = [self.config.AGENT_0.GOAL_POSITION]
+            self._sound_schedule = None
+
+        self._active_sound_idx = 0
+        self._current_sound = self._sound_ids[0]
+        for sid in self._sound_ids:
+            self._load_single_source_sound(sid)
+        logging.debug(
+            "Switch to sound(s) {} with duration {} seconds".format(
+                self._sound_ids, self._duration
+            )
+        )
 
         is_same_scene = config.SCENE == self._current_scene
         if not is_same_scene:
@@ -338,7 +361,9 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
         self._update_agents_state()
         audio_sensor = self._sim.get_agent(0)._sensors["audio_sensor"]
         # 1.5 is the offset for the height
-        audio_sensor.setAudioSourceTransform(np.array(self.config.AGENT_0.GOAL_POSITION) + np.array([0, 1.5, 0]))
+        audio_sensor.setAudioSourceTransform(
+            np.array(self._sound_positions[self._active_sound_idx]) + np.array([0, 1.5, 0])
+        )
         self._episode_step_count = 0
         self._last_rir = None
         self._current_sample_index = np.random.randint(self.config.AUDIO.RIR_SAMPLING_RATE * self.config.STEP_TIME)
@@ -381,13 +406,16 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
             "episode is not active, environment not RESET or "
             "STOP action called previously"
         )
+        self._maybe_switch_active_sound()
         self._last_rir = np.transpose(np.array(self._prev_sim_obs["audio_sensor"]))
         sim_obs = self._sim.step(action)
         self._prev_sim_obs = sim_obs
         observations = self._sensor_suite.get_observations(sim_obs)
         self._episode_step_count += 1
-        self._current_sample_index = int(self._current_sample_index + self.config.AUDIO.RIR_SAMPLING_RATE *
-                                         self.config.STEP_TIME) % self.current_source_sound.shape[0]
+        self._current_sample_index = int(
+            self._current_sample_index
+            + self.config.AUDIO.RIR_SAMPLING_RATE * self.config.STEP_TIME
+        ) % self.current_source_sound.shape[0]
 
         return observations
 
@@ -401,14 +429,14 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
             self._source_sound_dict[sound] = audio_data
             self._audio_length = audio_data.shape[0] // self.config.AUDIO.RIR_SAMPLING_RATE
 
-    def _load_single_source_sound(self):
-        if self._current_sound not in self._source_sound_dict:
-            audio_data, sr = librosa.load(os.path.join(self.source_sound_dir, self._current_sound),
+    def _load_single_source_sound(self, sound_id: str):
+        if sound_id not in self._source_sound_dict:
+            audio_data, sr = librosa.load(os.path.join(self.source_sound_dir, sound_id),
                                           sr=self.config.AUDIO.RIR_SAMPLING_RATE)
             if audio_data.shape[0]//self.config.AUDIO.RIR_SAMPLING_RATE == 1:
                 audio_data = np.concatenate([audio_data] * 3, axis=0)  # duplicate to be longer than longest RIR
-            self._source_sound_dict[self._current_sound] = audio_data
-        self._audio_length = self._source_sound_dict[self._current_sound].shape[0]//self.config.AUDIO.RIR_SAMPLING_RATE
+            self._source_sound_dict[sound_id] = audio_data
+        self._audio_length = self._source_sound_dict[sound_id].shape[0]//self.config.AUDIO.RIR_SAMPLING_RATE
 
     def _compute_audiogoal(self):
         sampling_rate = self.config.AUDIO.RIR_SAMPLING_RATE
@@ -424,6 +452,28 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
                 audiogoal = crossfade(audiogoal_from_last_rir, audiogoal, sampling_rate)
 
         return audiogoal
+
+    def _maybe_switch_active_sound(self):
+        if not self._sound_ids or len(self._sound_ids) == 1:
+            return
+        interval = 40
+        if self._sound_schedule and isinstance(self._sound_schedule, list):
+            if len(self._sound_schedule) > 1:
+                interval = int(self._sound_schedule[1])
+        if interval <= 0:
+            interval = 1
+        idx = (self._episode_step_count // interval) % len(self._sound_ids)
+        if idx == self._active_sound_idx:
+            return
+        self._active_sound_idx = idx
+        self._current_sound = self._sound_ids[idx]
+        self._current_sample_index = 0
+        print("interval in use:", interval)
+
+        audio_sensor = self._sim.get_agent(0)._sensors["audio_sensor"]
+        audio_sensor.setAudioSourceTransform(
+            np.array(self._sound_positions[idx]) + np.array([0, 1.5, 0])
+        )
 
     def _convolve_with_rir(self, rir):
         sampling_rate = self.config.AUDIO.RIR_SAMPLING_RATE

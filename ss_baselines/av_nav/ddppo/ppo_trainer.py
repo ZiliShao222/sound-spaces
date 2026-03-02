@@ -20,6 +20,7 @@ import torch
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 from numpy.linalg import norm
+from gym import spaces
 
 from habitat import Config, logger
 from ss_baselines.common.utils import observations_to_image
@@ -46,6 +47,7 @@ from ss_baselines.savi.ppo.slurm_utils import (
     requeue_job,
     save_interrupted_state,
 )
+from soundspaces.tasks.shortest_path_follower import ShortestPathFollower
 
 
 class DataParallelPassthrough(torch.nn.DataParallel):
@@ -520,3 +522,431 @@ class PPOTrainer(BaseRLTrainer):
                     count_checkpoints += 1
 
             self.envs.close()
+
+    def _sample_random_actions(self, action_space, num_envs: int):
+        action_ids = torch.randint(
+                1,
+                4,
+                (num_envs, 1),
+                device=self.device,
+                dtype=torch.long,
+            )
+        return action_ids, [int(a.item()) for a in action_ids]
+        # if isinstance(action_space, spaces.Discrete):
+        #     if action_space.n <= 1:
+        #         logger.warning(
+        #             "Action space has <=1 action; falling back to action=0."
+        #         )
+        #         action_ids = torch.zeros(
+        #             (num_envs, 1), device=self.device, dtype=torch.long
+        #         )
+        #         return action_ids, [0 for _ in range(num_envs)]
+        #     action_ids = torch.randint(
+        #         1,
+        #         action_space.n,
+        #         (num_envs, 1),
+        #         device=self.device,
+        #         dtype=torch.long,
+        #     )
+        #     return action_ids, [int(a[0].item()) for a in action_ids]
+
+        # samples = [action_space.sample() for _ in range(num_envs)]
+        # actions = torch.as_tensor(samples, device=self.device)
+        # if actions.ndim == 1:
+        #     actions = actions.unsqueeze(1)
+        # return actions, samples
+
+    def _eval_checkpoint(
+        self,
+        checkpoint_path: str,
+        writer: TensorboardWriter,
+        checkpoint_index: int = 0,
+    ) -> Dict:
+        random.seed(self.config.SEED)
+        np.random.seed(self.config.SEED)
+        torch.manual_seed(self.config.SEED)
+
+        random_policy = False
+        ckpt_dict = None
+        if checkpoint_path and os.path.isfile(checkpoint_path):
+            try:
+                ckpt_dict = self.load_checkpoint(
+                    checkpoint_path, map_location="cpu"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to load ckpt {checkpoint_path}; "
+                    f"falling back to random policy: {exc}"
+                )
+                random_policy = True
+        else:
+            logger.warning(
+                f"Checkpoint not found at {checkpoint_path}; "
+                "falling back to random policy."
+            )
+            random_policy = True
+
+        if (
+            not random_policy
+            and ckpt_dict is not None
+            and self.config.EVAL.USE_CKPT_CONFIG
+        ):
+            config = self._setup_eval_config(ckpt_dict["config"])
+        else:
+            if self.config.EVAL.USE_CKPT_CONFIG and random_policy:
+                logger.warning(
+                    "EVAL.USE_CKPT_CONFIG is True but no ckpt loaded; "
+                    "using eval config only."
+                )
+            config = self.config.clone()
+
+        ppo_cfg = config.RL.PPO
+
+        config.defrost()
+        config.TASK_CONFIG.DATASET.SPLIT = config.EVAL.SPLIT
+        if (
+            self.config.DISPLAY_RESOLUTION
+            != config.TASK_CONFIG.SIMULATOR.DEPTH_SENSOR.WIDTH
+        ):
+            model_resolution = config.TASK_CONFIG.SIMULATOR.DEPTH_SENSOR.WIDTH
+            config.TASK_CONFIG.SIMULATOR.DEPTH_SENSOR.WIDTH = (
+                config.TASK_CONFIG.SIMULATOR.RGB_SENSOR.HEIGHT
+            ) = (
+                config.TASK_CONFIG.SIMULATOR.RGB_SENSOR.WIDTH
+            ) = (
+                config.TASK_CONFIG.SIMULATOR.DEPTH_SENSOR.HEIGHT
+            ) = self.config.DISPLAY_RESOLUTION
+        else:
+            model_resolution = self.config.DISPLAY_RESOLUTION
+        config.freeze()
+
+        if random_policy:
+            # Keep v0 action space so numeric action ids map to STOP/MOVE_FORWARD/TURN_LEFT/TURN_RIGHT.
+            # Using "move-all" removes TURN_LEFT/RIGHT and breaks integer action ids.
+            config.defrost()
+            config.TASK_CONFIG.SIMULATOR.ACTION_SPACE_CONFIG = "v0"
+            config.freeze()
+
+        if len(self.config.VIDEO_OPTION) > 0:
+            config.defrost()
+            config.TASK_CONFIG.TASK.MEASUREMENTS.append("TOP_DOWN_MAP")
+            config.TASK_CONFIG.TASK.MEASUREMENTS.append("COLLISIONS")
+            config.freeze()
+        elif "top_down_map" in self.config.VISUALIZATION_OPTION:
+            config.defrost()
+            config.TASK_CONFIG.TASK.MEASUREMENTS.append("TOP_DOWN_MAP")
+            config.freeze()
+
+        logger.info(f"env config: {config}")
+        self.envs = construct_envs(
+            config, get_env_class(config.ENV_NAME)
+        )
+        if self.config.DISPLAY_RESOLUTION != model_resolution:
+            observation_space = self.envs.observation_spaces[0]
+            observation_space.spaces["depth"] = spaces.Box(
+                low=0,
+                high=1,
+                shape=(model_resolution, model_resolution, 1),
+                dtype=np.uint8,
+            )
+            observation_space.spaces["rgb"] = spaces.Box(
+                low=0,
+                high=1,
+                shape=(model_resolution, model_resolution, 3),
+                dtype=np.uint8,
+            )
+        else:
+            observation_space = self.envs.observation_spaces[0]
+        self._setup_actor_critic_agent(ppo_cfg, observation_space)
+
+        if config.FOLLOW_SHORTEST_PATH:
+            follower = ShortestPathFollower(
+                self.envs.workers[0]._env.habitat_env.sim, 0.5, False
+            )
+
+        if not random_policy and ckpt_dict is not None:
+            self.agent.load_state_dict(ckpt_dict["state_dict"])
+            self.actor_critic = self.agent.actor_critic
+
+        self.metric_uuids = []
+        for metric_name in self.config.TASK_CONFIG.TASK.MEASUREMENTS:
+            metric_cfg = getattr(self.config.TASK_CONFIG.TASK, metric_name)
+            measure_type = baseline_registry.get_measure(metric_cfg.TYPE)
+            assert measure_type is not None, "invalid measurement type {}".format(
+                metric_cfg.TYPE
+            )
+            self.metric_uuids.append(
+                measure_type(sim=None, task=None, config=None)._get_uuid()
+            )
+
+        observations = self.envs.reset()
+        if self.config.DISPLAY_RESOLUTION != model_resolution:
+            resize_observation(observations, model_resolution)
+        batch = batch_obs(observations, self.device)
+
+        current_episode_reward = torch.zeros(
+            self.envs.num_envs, 1, device=self.device
+        )
+
+        test_recurrent_hidden_states = torch.zeros(
+            self.actor_critic.net.num_recurrent_layers,
+            self.config.NUM_PROCESSES,
+            ppo_cfg.hidden_size,
+            device=self.device,
+        )
+        prev_actions = torch.zeros(
+            self.config.NUM_PROCESSES, 1, device=self.device, dtype=torch.long
+        )
+        not_done_masks = torch.zeros(
+            self.config.NUM_PROCESSES, 1, device=self.device
+        )
+        stats_episodes = dict()
+
+        rgb_frames = [[] for _ in range(self.config.NUM_PROCESSES)]
+        audios = [[] for _ in range(self.config.NUM_PROCESSES)]
+        if len(self.config.VIDEO_OPTION) > 0:
+            os.makedirs(self.config.VIDEO_DIR, exist_ok=True)
+
+        t = tqdm(total=self.config.TEST_EPISODE_COUNT)
+        while (
+            len(stats_episodes) < self.config.TEST_EPISODE_COUNT
+            and self.envs.num_envs > 0
+        ):
+            current_episodes = self.envs.current_episodes()
+
+            env_actions = None
+            if random_policy and not config.FOLLOW_SHORTEST_PATH: 
+                
+                actions, env_actions = self._sample_random_actions(
+                    self.envs.action_spaces[0], self.envs.num_envs
+                )
+                # env_actions = actions
+                prev_actions.copy_(actions)
+                print(f'env_actions: {env_actions}')
+            else:
+                with torch.no_grad():
+                    _, actions, _, test_recurrent_hidden_states = (
+                        self.actor_critic.act(
+                            batch,
+                            test_recurrent_hidden_states,
+                            prev_actions,
+                            not_done_masks,
+                            deterministic=False,
+                        )
+                    )
+                    prev_actions.copy_(actions)
+
+            if config.FOLLOW_SHORTEST_PATH:
+                actions = [
+                    follower.get_next_action(
+                        self.envs.workers[0]
+                        ._env.habitat_env.current_episode.goals[0]
+                        .view_points[0]
+                        .agent_state.position
+                    )
+                ]
+                outputs = self.envs.step(actions)
+            elif env_actions is not None:
+                outputs = self.envs.step(env_actions)
+            else:
+                outputs = self.envs.step([a[0].item() for a in actions])
+
+            observations, rewards, dones, infos = [
+                list(x) for x in zip(*outputs)
+            ]
+            for i in range(self.envs.num_envs):
+                if len(self.config.VIDEO_OPTION) > 0:
+                    if (
+                        config.TASK_CONFIG.SIMULATOR.CONTINUOUS_VIEW_CHANGE
+                        and "intermediate" in observations[i]
+                    ):
+                        for observation in observations[i]["intermediate"]:
+                            frame = observations_to_image(
+                                observation, infos[i]
+                            )
+                            rgb_frames[i].append(frame)
+                        del observations[i]["intermediate"]
+
+                    if "rgb" not in observations[i]:
+                        observations[i]["rgb"] = np.zeros(
+                            (
+                                self.config.DISPLAY_RESOLUTION,
+                                self.config.DISPLAY_RESOLUTION,
+                                3,
+                            )
+                        )
+                    frame = observations_to_image(observations[i], infos[i])
+                    rgb_frames[i].append(frame)
+                    audios[i].append(observations[i]["audiogoal"])
+
+            if self.config.DISPLAY_RESOLUTION != model_resolution:
+                resize_observation(observations, model_resolution)
+            batch = batch_obs(observations, self.device)
+
+            not_done_masks = torch.tensor(
+                [[0.0] if done else [1.0] for done in dones],
+                dtype=torch.float,
+                device=self.device,
+            )
+
+            rewards = torch.tensor(
+                rewards, dtype=torch.float, device=self.device
+            ).unsqueeze(1)
+            current_episode_reward += rewards
+            next_episodes = self.envs.current_episodes()
+            envs_to_pause = []
+            for i in range(self.envs.num_envs):
+                if (
+                    next_episodes[i].scene_id,
+                    next_episodes[i].episode_id,
+                ) in stats_episodes:
+                    envs_to_pause.append(i)
+
+                if not_done_masks[i].item() == 0:
+                    episode_stats = dict()
+                    for metric_uuid in self.metric_uuids:
+                        episode_stats[metric_uuid] = infos[i][metric_uuid]
+                    episode_stats["reward"] = current_episode_reward[i].item()
+                    episode_stats["geodesic_distance"] = (
+                        current_episodes[i].info["geodesic_distance"]
+                    )
+                    episode_stats["euclidean_distance"] = norm(
+                        np.array(current_episodes[i].goals[0].position)
+                        - np.array(current_episodes[i].start_position)
+                    )
+                    logger.info(
+                        f"[Episode done] scene={current_episodes[i].scene_id} "
+                        f"id={current_episodes[i].episode_id} stats={episode_stats}"
+                    )
+                    current_episode_reward[i] = 0
+                    stats_episodes[
+                        (
+                            current_episodes[i].scene_id,
+                            current_episodes[i].episode_id,
+                        )
+                    ] = episode_stats
+                    t.update()
+
+                    if len(self.config.VIDEO_OPTION) > 0:
+                        fps = int(
+                            1 / self.config.TASK_CONFIG.SIMULATOR.STEP_TIME
+                        )
+                        if "sound" in current_episodes[i].info:
+                            sound = current_episodes[i].info["sound"]
+                        else:
+                            sound = (
+                                current_episodes[i]
+                                .sound_id.split("/")[1][:-4]
+                            )
+                        generate_video(
+                            video_option=self.config.VIDEO_OPTION,
+                            video_dir=self.config.VIDEO_DIR,
+                            images=rgb_frames[i][:-1],
+                            scene_name=current_episodes[i].scene_id.split(
+                                "/"
+                            )[3],
+                            sound=sound,
+                            sr=self.config.TASK_CONFIG.SIMULATOR.AUDIO.RIR_SAMPLING_RATE,
+                            episode_id=current_episodes[i].episode_id,
+                            checkpoint_idx=checkpoint_index,
+                            metric_name="spl",
+                            metric_value=infos[i]["spl"],
+                            tb_writer=writer,
+                            audios=audios[i][:-1],
+                            fps=fps,
+                        )
+
+                        rgb_frames[i] = []
+                        audios[i] = []
+
+                    if "top_down_map" in self.config.VISUALIZATION_OPTION:
+                        top_down_map = plot_top_down_map(
+                            infos[i],
+                            dataset=self.config.TASK_CONFIG.SIMULATOR.SCENE_DATASET,
+                        )
+                        scene = current_episodes[i].scene_id.split("/")[3]
+                        writer.add_image(
+                            "{}_{}_{}/{}".format(
+                                config.EVAL.SPLIT,
+                                scene,
+                                current_episodes[i].episode_id,
+                                config.BASE_TASK_CONFIG_PATH.split("/")[
+                                    -1
+                                ][:-5],
+                            ),
+                            top_down_map,
+                            dataformats="WHC",
+                        )
+
+            (
+                self.envs,
+                test_recurrent_hidden_states,
+                not_done_masks,
+                current_episode_reward,
+                prev_actions,
+                batch,
+                rgb_frames,
+            ) = self._pause_envs(
+                envs_to_pause,
+                self.envs,
+                test_recurrent_hidden_states,
+                not_done_masks,
+                current_episode_reward,
+                prev_actions,
+                batch,
+                rgb_frames,
+            )
+
+        aggregated_stats = dict()
+        for stat_key in next(iter(stats_episodes.values())).keys():
+            aggregated_stats[stat_key] = sum(
+                [v[stat_key] for v in stats_episodes.values()]
+            )
+        num_episodes = len(stats_episodes)
+
+        stats_file = os.path.join(
+            config.TENSORBOARD_DIR,
+            "{}_stats_{}.json".format(config.EVAL.SPLIT, config.SEED),
+        )
+        new_stats_episodes = {
+            ",".join(key): value for key, value in stats_episodes.items()
+        }
+        with open(stats_file, "w") as fo:
+            json.dump(new_stats_episodes, fo, cls=NpEncoder)
+
+        episode_reward_mean = aggregated_stats["reward"] / num_episodes
+        episode_metrics_mean = {}
+        for metric_uuid in self.metric_uuids:
+            episode_metrics_mean[metric_uuid] = (
+                aggregated_stats[metric_uuid] / num_episodes
+            )
+
+        logger.info(f"Average episode reward: {episode_reward_mean:.6f}")
+        for metric_uuid in self.metric_uuids:
+            logger.info(
+                f"Average episode {metric_uuid}: "
+                f"{episode_metrics_mean[metric_uuid]:.6f}"
+            )
+
+        if not config.EVAL.SPLIT.startswith("test"):
+            writer.add_scalar(
+                "{}/reward".format(config.EVAL.SPLIT),
+                episode_reward_mean,
+                checkpoint_index,
+            )
+            for metric_uuid in self.metric_uuids:
+                writer.add_scalar(
+                    f"{config.EVAL.SPLIT}/{metric_uuid}",
+                    episode_metrics_mean[metric_uuid],
+                    checkpoint_index,
+                )
+
+        self.envs.close()
+
+        result = {"episode_reward_mean": episode_reward_mean}
+        for metric_uuid in self.metric_uuids:
+            result[
+                "episode_{}_mean".format(metric_uuid)
+            ] = episode_metrics_mean[metric_uuid]
+
+        return result

@@ -102,24 +102,36 @@ class BaseRLTrainer(BaseTrainer):
 
             if os.path.isfile(self.config.EVAL_CKPT_PATH_DIR):
                 # evaluate singe checkpoint
-                result = self._eval_checkpoint(self.config.EVAL_CKPT_PATH_DIR, writer)
+                result = self._eval_checkpoint(
+                    self.config.EVAL_CKPT_PATH_DIR, writer
+                )
                 return result
-            else:
-                # evaluate multiple checkpoints in order
-                while True:
-                    current_ckpt = None
-                    while current_ckpt is None:
-                        current_ckpt = poll_checkpoint_folder(
-                            self.config.EVAL_CKPT_PATH_DIR, prev_ckpt_ind, eval_interval
-                        )
-                        time.sleep(2)  # sleep for 2 secs before polling again
-                    logger.info(f"=======current_ckpt: {current_ckpt}=======")
-                    prev_ckpt_ind += eval_interval
-                    self._eval_checkpoint(
-                        checkpoint_path=current_ckpt,
-                        writer=writer,
-                        checkpoint_index=prev_ckpt_ind
+            if not os.path.isdir(self.config.EVAL_CKPT_PATH_DIR):
+                logger.warning(
+                    "EVAL_CKPT_PATH_DIR is neither a file nor a directory: "
+                    f"{self.config.EVAL_CKPT_PATH_DIR}. "
+                    "Proceeding with trainer eval fallback."
+                )
+                result = self._eval_checkpoint(
+                    self.config.EVAL_CKPT_PATH_DIR, writer
+                )
+                return result
+
+            # evaluate multiple checkpoints in order
+            while True:
+                current_ckpt = None
+                while current_ckpt is None:
+                    current_ckpt = poll_checkpoint_folder(
+                        self.config.EVAL_CKPT_PATH_DIR, prev_ckpt_ind, eval_interval
                     )
+                    time.sleep(2)  # sleep for 2 secs before polling again
+                logger.info(f"=======current_ckpt: {current_ckpt}=======")
+                prev_ckpt_ind += eval_interval
+                self._eval_checkpoint(
+                    checkpoint_path=current_ckpt,
+                    writer=writer,
+                    checkpoint_index=prev_ckpt_ind
+                )
 
     def _setup_eval_config(self, checkpoint_config: Config) -> Config:
         r"""Sets up and returns a merged config for evaluation. Config

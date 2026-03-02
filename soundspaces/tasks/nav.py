@@ -769,7 +769,8 @@ class PoseSensor(Sensor):
         self._episode_time += 1.0
 
         return np.array(
-            [-agent_position_xyz[2], agent_position_xyz[0], agent_heading, ep_time],
+            # Flatten heading to scalar to avoid creating an inhomogeneous array.
+            [-agent_position_xyz[2], agent_position_xyz[0], agent_heading.item(), ep_time],
             dtype=np.float32
         )
 

@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-stop-steps",
         type=int,
-        default=500,
+        default=100,
         help="Disallow STOP action for the first N steps of each episode.",
     )
     parser.add_argument(
@@ -97,7 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--video",
         action="store_true",
-        default=False,
+        default=True,
         help="Save per-episode visualization videos.",
     )
     parser.add_argument(

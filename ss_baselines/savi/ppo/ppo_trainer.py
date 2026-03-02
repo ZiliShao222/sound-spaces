@@ -209,6 +209,21 @@ class PPOTrainer(BaseRLTrainer):
 
         return count_steps, count_checkpoints, start_update
 
+    def _sample_random_actions(self, action_space, num_envs: int):
+        if hasattr(action_space, "n") and action_space.n > 1:
+            action_ids = torch.randint(
+                1,
+                action_space.n,
+                (num_envs, 1),
+                device=self.device,
+                dtype=torch.long,
+            )
+        else:
+            action_ids = torch.zeros(
+                (num_envs, 1), device=self.device, dtype=torch.long
+            )
+        return action_ids, [int(a.item()) for a in action_ids]
+
     METRICS_BLACKLIST = {"top_down_map", "collisions.is_collision"}
 
     @classmethod
@@ -677,12 +692,24 @@ class PPOTrainer(BaseRLTrainer):
         np.random.seed(self.config.SEED)
         torch.manual_seed(self.config.SEED)
             
-        # Map location CPU is almost always better than mapping to a CUDA device.
-        ckpt_dict = self.load_checkpoint(checkpoint_path, map_location="cpu")
+        random_policy = False
+        ckpt_dict = None
+        if checkpoint_path and os.path.isfile(checkpoint_path):
+            # Map location CPU is almost always better than mapping to a CUDA device.
+            ckpt_dict = self.load_checkpoint(checkpoint_path, map_location="cpu")
+        else:
+            logger.warning(
+                f"Checkpoint not found at {checkpoint_path}; falling back to random policy."
+            )
+            random_policy = True
 
-        if self.config.EVAL.USE_CKPT_CONFIG:
+        if self.config.EVAL.USE_CKPT_CONFIG and ckpt_dict is not None:
             config = self._setup_eval_config(ckpt_dict["config"])
         else:
+            if self.config.EVAL.USE_CKPT_CONFIG and random_policy:
+                logger.warning(
+                    "EVAL.USE_CKPT_CONFIG is True but no ckpt loaded; using eval config only."
+                )
             config = self.config.clone()
 
         ppo_cfg = config.RL.PPO
@@ -720,10 +747,11 @@ class PPOTrainer(BaseRLTrainer):
             observation_space = self.envs.observation_spaces[0]
         self._setup_actor_critic_agent(ppo_cfg, observation_space)
 
-        self.agent.load_state_dict(ckpt_dict["state_dict"])
-        self.actor_critic = self.agent.actor_critic
-        if self.config.RL.PPO.use_belief_predictor and "belief_predictor" in ckpt_dict:
-            self.belief_predictor.load_state_dict(ckpt_dict["belief_predictor"])
+        if not random_policy and ckpt_dict is not None:
+            self.agent.load_state_dict(ckpt_dict["state_dict"])
+            self.actor_critic = self.agent.actor_critic
+            if self.config.RL.PPO.use_belief_predictor and "belief_predictor" in ckpt_dict:
+                self.belief_predictor.load_state_dict(ckpt_dict["belief_predictor"])
 
         self.metric_uuids = []
         # get name of performance metric, e.g. "spl"
@@ -808,20 +836,28 @@ class PPOTrainer(BaseRLTrainer):
         ):
             current_episodes = self.envs.current_episodes()
 
-            with torch.no_grad():
-                _, actions, _, test_recurrent_hidden_states, test_em_features = self.actor_critic.act(
-                    batch,
-                    test_recurrent_hidden_states,
-                    prev_actions,
-                    not_done_masks,
-                    test_em.memory[:, 0] if ppo_cfg.use_external_memory else None,
-                    test_em.masks if ppo_cfg.use_external_memory else None,
-                    deterministic=False
+            if random_policy:
+                actions, env_actions = self._sample_random_actions(
+                    self.envs.action_spaces[0], self.envs.num_envs
                 )
-
                 prev_actions.copy_(actions)
+                actions = env_actions
+                test_em_features = None
+            else:
+                with torch.no_grad():
+                    _, actions, _, test_recurrent_hidden_states, test_em_features = self.actor_critic.act(
+                        batch,
+                        test_recurrent_hidden_states,
+                        prev_actions,
+                        not_done_masks,
+                        test_em.memory[:, 0] if ppo_cfg.use_external_memory else None,
+                        test_em.masks if ppo_cfg.use_external_memory else None,
+                        deterministic=False
+                    )
 
-            actions = [a[0].item() for a in actions]
+                    prev_actions.copy_(actions)
+
+                actions = [a[0].item() for a in actions]
             outputs = self.envs.step(actions)
 
             observations, rewards, dones, infos = [
@@ -840,7 +876,7 @@ class PPOTrainer(BaseRLTrainer):
                 device=self.device,
             )
             # Update external memory
-            if ppo_cfg.use_external_memory:
+            if ppo_cfg.use_external_memory and test_em_features is not None:
                 test_em.insert(test_em_features, not_done_masks)
             if self.config.RL.PPO.use_belief_predictor:
                 self.belief_predictor.update(batch, dones)

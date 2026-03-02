@@ -33,6 +33,8 @@ class SemanticAudioGoalNavEpisode(NavigationEpisode):
     """
     object_category: str
     sound_id: str
+    sound_sources: Optional[List[dict]] = None
+    sound_source_schedule: Optional[list] = None
     distractor_sound_id: str = None
     distractor_position_index: attr.ib(converter=int) = None
     offset: attr.ib(converter=int)
@@ -199,8 +201,27 @@ def merge_sim_episode_config(
         agent_cfg.defrost()
         agent_cfg.START_POSITION = episode.start_position
         agent_cfg.START_ROTATION = episode.start_rotation
-        agent_cfg.GOAL_POSITION = episode.goals[0].position
-        agent_cfg.SOUND_ID = episode.sound_id
+        goal_positions = [g.position for g in episode.goals]
+        agent_cfg.GOAL_POSITION = goal_positions[0]
+        agent_cfg.GOAL_POSITIONS = goal_positions
+        if hasattr(episode, "sound_sources") and episode.sound_sources:
+            sound_sources = []
+            for idx, src in enumerate(episode.sound_sources):
+                src_dict = dict(src)
+                if "position" not in src_dict:
+                    pos = (
+                        goal_positions[idx]
+                        if idx < len(goal_positions)
+                        else goal_positions[-1]
+                    )
+                    src_dict["position"] = pos
+                sound_sources.append(src_dict)
+            agent_cfg.SOUND_SOURCES = sound_sources
+            agent_cfg.SOUND_ID = sound_sources[0]["sound_id"]
+        else:
+            agent_cfg.SOUND_ID = episode.sound_id
+        if hasattr(episode, "sound_source_schedule") and episode.sound_source_schedule:
+            agent_cfg.SOUND_SOURCE_SCHEDULE = episode.sound_source_schedule
         agent_cfg.DISTRACTOR_SOUND_ID = episode.distractor_sound_id
         agent_cfg.DISTRACTOR_POSITION_INDEX = episode.distractor_position_index
         agent_cfg.OFFSET = episode.offset
