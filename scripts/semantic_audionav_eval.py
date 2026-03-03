@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-stop-steps",
         type=int,
-        default=100,
+        default=200,
         help="Disallow STOP action for the first N steps of each episode.",
     )
     parser.add_argument(

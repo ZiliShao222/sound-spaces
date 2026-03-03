@@ -720,6 +720,27 @@ class SoundSpacesSim(Simulator, ABC):
 
         return spectrogram
 
+    def set_active_goal(self, position, sound_id=None) -> bool:
+        updated = False
+        if sound_id is not None and sound_id != self._current_sound:
+            self._current_sound = sound_id
+            self._load_single_source_sound()
+            self._audiogoal_cache = dict()
+            self._spectrogram_cache = dict()
+            updated = True
+        if position is not None:
+            try:
+                self._source_position_index = self._position_to_index(position)
+            except Exception:
+                return updated
+            if not self.config.USE_RENDERED_OBSERVATIONS:
+                audio_sensor = self._sim.get_agent(0)._sensors["audio_sensor"]
+                audio_sensor.setAudioSourceTransform(
+                    np.array(position) + np.array([0, 1.5, 0])
+                )
+            updated = True
+        return updated
+
     def geodesic_distance(self, position_a, position_bs, episode=None):
         distances = []
         for position_b in position_bs:

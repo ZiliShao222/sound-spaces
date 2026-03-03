@@ -325,7 +325,7 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
                 self._sound_ids.append(src["sound_id"])
                 self._sound_positions.append(src["position"])
             self._sound_schedule = getattr(
-                self.config.AGENT_0, "SOUND_SOURCE_SCHEDULE", ["round_robin", 40]
+                self.config.AGENT_0, "SOUND_SOURCE_SCHEDULE", ["round_robin", 25]
             )
         else:
             self._sound_ids = [self.config.AGENT_0.SOUND_ID]
@@ -456,7 +456,7 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
     def _maybe_switch_active_sound(self):
         if not self._sound_ids or len(self._sound_ids) == 1:
             return
-        interval = 40
+        interval = 25
         if self._sound_schedule and isinstance(self._sound_schedule, list):
             if len(self._sound_schedule) > 1:
                 interval = int(self._sound_schedule[1])
@@ -510,6 +510,22 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
 
     def get_current_spectrogram_observation(self, audiogoal2spectrogram):
         return audiogoal2spectrogram(self.get_current_audiogoal_observation())
+
+    def set_active_sound_index(self, idx: int) -> bool:
+        if not self._sound_ids or not self._sound_positions:
+            return False
+        if idx < 0 or idx >= len(self._sound_ids):
+            return False
+        if idx == self._active_sound_idx:
+            return True
+        self._active_sound_idx = idx
+        self._current_sound = self._sound_ids[idx]
+        self._current_sample_index = 0
+        audio_sensor = self._sim.get_agent(0)._sensors["audio_sensor"]
+        audio_sensor.setAudioSourceTransform(
+            np.array(self._sound_positions[idx]) + np.array([0, 1.5, 0])
+        )
+        return True
 
     def geodesic_distance(self, position_a, position_bs, episode=None):
         if episode is None or episode._shortest_path_cache is None:

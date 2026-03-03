@@ -16,6 +16,7 @@ from habitat.core.dataset import Dataset, Episode
 from habitat.core.logging import logger
 from habitat.core.registry import registry
 from habitat.core.simulator import AgentState, Sensor, SensorTypes, Simulator
+from habitat.core.embodied_task import SimulatorTaskAction
 from habitat.tasks.nav.nav import Measure, EmbodiedTask, Success
 from habitat.core.utils import not_none_validator
 from habitat.tasks.nav.nav import (
@@ -184,6 +185,73 @@ class SemanticAudioNavigationTask(NavigationTask):
     ) -> Any:
         return merge_sim_episode_config(sim_config, episode)
 
+    def reset(self, episode: Episode):
+        self._all_goals = list(episode.goals) if episode.goals else []
+        self._goal_index = 0
+        self._found_goal_indices = set()
+        if self._all_goals:
+            episode.goals = [self._all_goals[0]]
+        return super().reset(episode)
+
+    def _check_episode_is_active(
+        self,
+        *args: Any,
+        observations=None,
+        action=None,
+        episode: Episode,
+        **kwargs: Any,
+    ) -> bool:
+        if getattr(self, "is_stop_called", False):
+            return False
+        if getattr(self, "is_submit_called", False):
+            self.is_submit_called = False  # type: ignore
+            return self._handle_submit(episode)
+        return True
+
+    def _handle_submit(self, episode: Episode) -> bool:
+        if not self._all_goals:
+            return True
+        goal = self._all_goals[self._goal_index]
+        success_distance = getattr(self._config.SUCCESS, "SUCCESS_DISTANCE", 1.0)
+        distance = self._distance_to_goal(goal, episode)
+        if distance is None or distance >= success_distance:
+            return True
+        self._found_goal_indices.add(self._goal_index)
+        if self._goal_index + 1 >= len(self._all_goals):
+            return False
+        self._goal_index += 1
+        episode.goals = [self._all_goals[self._goal_index]]
+        self._apply_goal_to_sim(episode, self._goal_index)
+        return True
+
+    def _distance_to_goal(self, goal: SemanticAudioGoal, episode: Episode) -> Optional[float]:
+        current_position = self._sim.get_agent_state().position
+        distance_to_cfg = getattr(self._config, "DISTANCE_TO_GOAL", None)
+        distance_to = getattr(distance_to_cfg, "DISTANCE_TO", "POINT")
+        if distance_to == "VIEW_POINTS" and goal.view_points:
+            targets = [vp.agent_state.position for vp in goal.view_points]
+        else:
+            targets = [goal.position]
+        return self._sim.geodesic_distance(current_position, targets, episode)
+
+    def _apply_goal_to_sim(self, episode: Episode, goal_index: int) -> None:
+        if hasattr(self._sim, "set_active_sound_index"):
+            try:
+                self._sim.set_active_sound_index(goal_index)
+                return
+            except Exception:
+                pass
+        goal = self._all_goals[goal_index]
+        sound_id = None
+        sound_sources = getattr(episode, "sound_sources", None)
+        if sound_sources and goal_index < len(sound_sources):
+            sound_id = sound_sources[goal_index].get("sound_id")
+        if hasattr(self._sim, "set_active_goal"):
+            try:
+                self._sim.set_active_goal(goal.position, sound_id=sound_id)
+            except Exception:
+                pass
+
 
 def merge_sim_episode_config(
         sim_config: Config, episode: Type[Episode]
@@ -253,3 +321,15 @@ class SWS(Measure):
     ):
         ep_success = task.measurements.measures[Success.cls_uuid].get_metric()
         self._metric = ep_success * self._sim.is_silent
+
+
+@registry.register_task_action
+class SubmitAction(SimulatorTaskAction):
+    name: str = "SUBMIT"
+
+    def reset(self, task: EmbodiedTask, *args: Any, **kwargs: Any):
+        task.is_submit_called = False  # type: ignore
+
+    def step(self, task: EmbodiedTask, *args: Any, **kwargs: Any):
+        task.is_submit_called = True  # type: ignore
+        return self._sim.get_observations_at()  # type: ignore
