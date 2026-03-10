@@ -7,6 +7,7 @@ import datetime as dt
 from typing import Dict, Any
 
 import habitat
+from habitat.core.dataset import EpisodeIterator
 import numpy as np
 import soundspaces  # noqa: F401 - register SoundSpaces datasets/tasks
 from ss_baselines.av_nav.config.default import get_task_config
@@ -42,6 +43,36 @@ def parse_args() -> argparse.Namespace:
         default="test",
         choices=sorted(SPLIT_ALIASES.keys()),
         help="Dataset split alias (test/val/distractor/...).",
+    )
+    parser.add_argument(
+        "--scene",
+        default=None,
+        help="Filter episodes by scene name (e.g., yqstnuAEVhm).",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        default=None,
+        help="Override dataset .json.gz path (optional).",
+    )
+    parser.add_argument(
+        "--scenes-dir",
+        default=None,
+        help="Override DATASET.SCENES_DIR (e.g., data/scene_datasets/hm3d/val).",
+    )
+    parser.add_argument(
+        "--scene-dataset",
+        default=None,
+        help="Override SIMULATOR.SCENE_DATASET (e.g., 'hm3d').",
+    )
+    parser.add_argument(
+        "--scene-dataset-config",
+        default=None,
+        help="Override SIMULATOR.SCENE_DATASET with a config path (hm3d json).",
+    )
+    parser.add_argument(
+        "--disable-content-scenes",
+        action="store_true",
+        help="Do not load per-scene content files (use only DATA_PATH).",
     )
     parser.add_argument(
         "--num-episodes",
@@ -88,6 +119,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1e-6,
         help="Amplitude threshold to mark a timestep as audible.",
+    )
+    parser.add_argument(
+        "--disable-reverb",
+        action="store_true",
+        help="Disable indirect sound/echo (set indirectRayCount=0, no transmission).",
+    )
+    parser.add_argument(
+        "--disable-crossfade",
+        action="store_true",
+        help="Disable audio crossfade between consecutive RIRs.",
     )
     parser.add_argument(
         "--mean-log",
@@ -144,6 +185,25 @@ def build_config(args: argparse.Namespace) -> habitat.Config:
 
     cfg.defrost()
     cfg.DATASET.SPLIT = split_name
+    if args.dataset_path:
+        cfg.DATASET.DATA_PATH = args.dataset_path
+    if args.scenes_dir:
+        cfg.DATASET.SCENES_DIR = args.scenes_dir
+    if args.scene_dataset_config:
+        cfg.SIMULATOR.SCENE_DATASET = args.scene_dataset_config
+    elif args.scene_dataset:
+        cfg.SIMULATOR.SCENE_DATASET = args.scene_dataset
+    if args.disable_content_scenes:
+        cfg.DATASET.CONTENT_SCENES = []
+    print(
+        "dataset_path_in_use={path} scenes_dir={scenes_dir} scene_dataset={scene_dataset} "
+        "content_scenes={content_scenes}".format(
+            path=cfg.DATASET.DATA_PATH,
+            scenes_dir=cfg.DATASET.SCENES_DIR,
+            scene_dataset=cfg.SIMULATOR.SCENE_DATASET,
+            content_scenes=list(cfg.DATASET.CONTENT_SCENES),
+        )
+    )
 
     cfg.SIMULATOR.RGB_SENSOR.WIDTH = args.resolution
     cfg.SIMULATOR.RGB_SENSOR.HEIGHT = args.resolution
@@ -170,6 +230,10 @@ def build_config(args: argparse.Namespace) -> habitat.Config:
         cfg.TASK.SENSORS.append("AUDIOGOAL_SENSOR")
     if args.audio_activity_log and "AUDIOGOAL_SENSOR" not in cfg.TASK.SENSORS:
         cfg.TASK.SENSORS.append("AUDIOGOAL_SENSOR")
+    if args.disable_reverb:
+        cfg.SIMULATOR.AUDIO.DISABLE_REVERB = True
+    if args.disable_crossfade:
+        cfg.SIMULATOR.AUDIO.CROSSFADE = False
 
     if "distractor" in split_name:
         cfg.SIMULATOR.AUDIO.HAS_DISTRACTOR_SOUND = True
@@ -242,21 +306,44 @@ def main() -> None:
 
     scene_names = []
     for ep in env.episodes:
-        scene_base = os.path.basename(ep.scene_id).split(".")[0]
-        if scene_base not in scene_names:
-            scene_names.append(scene_base)
+        scene_path = ep.scene_id
+        scene_base = os.path.basename(scene_path).split(".")[0]
+        scene_parent = os.path.basename(os.path.dirname(scene_path))
+        scene_key = scene_parent or scene_base
+        if scene_key not in scene_names:
+            scene_names.append(scene_key)
     scene_names.sort()
     split_l = max(0, args.split_l)
     split_r = min(len(scene_names), args.split_r)
-    selected_scenes = set(scene_names[split_l:split_r])
-    if selected_scenes:
+    if args.scene:
         env.episodes = [
             ep
             for ep in env.episodes
-            if os.path.basename(ep.scene_id).split(".")[0] in selected_scenes
+            if os.path.basename(ep.scene_id).split(".")[0] == args.scene
+            or os.path.basename(os.path.dirname(ep.scene_id)) == args.scene
         ]
+    else:
+        selected_scenes = set(scene_names[split_l:split_r])
+        if selected_scenes:
+            env.episodes = [
+                ep
+                for ep in env.episodes
+                if os.path.basename(ep.scene_id).split(".")[0] in selected_scenes
+                or os.path.basename(os.path.dirname(ep.scene_id)) in selected_scenes
+            ]
+        else:
+            print(
+                f"warning: split range {split_l}:{split_r} selects no scenes; using all episodes"
+            )
 
-    total_episodes = args.num_episodes or len(env.episodes)
+    # Ensure deterministic order by episode_id (dataset may already be shuffled)
+    episodes_list = list(env.episodes)
+    episodes_by_id = {
+        int(getattr(e, "episode_id", 0)): e for e in episodes_list
+    }
+    ordered_ids = sorted(episodes_by_id.keys())
+    print("episodes_loaded_order=" + ",".join([str(i) for i in ordered_ids]))
+    total_episodes = args.num_episodes or len(ordered_ids)
     episode_count = 0
     sum_metrics: Dict[str, float] = {}
     printed_shape = False
@@ -285,7 +372,32 @@ def main() -> None:
         mean_log_f = None
 
     while episode_count < total_episodes:
+        # Force exact episode order
+        target_ep = episodes_by_id[ordered_ids[episode_count]]
+        env.current_episode = target_ep
         observations = env.reset()
+        if env.current_episode.episode_id != target_ep.episode_id:
+            print(
+                f"warning: reset returned episode_id={env.current_episode.episode_id} "
+                f"(expected {target_ep.episode_id})"
+            )
+        else:
+            print(f"reset_ok episode_id={env.current_episode.episode_id}")
+        ep = env.current_episode
+        goals_now = getattr(ep, "goals", []) or []
+        task = getattr(env, "_task", None)
+        all_goals = getattr(task, "_all_goals", None) if task is not None else None
+        all_goals = all_goals or goals_now
+        goal_cats = [
+            str(getattr(g, "object_category", ""))
+            for g in all_goals
+            if getattr(g, "object_category", None)
+        ]
+        episode_loaded_line = (
+            f"episode_loaded id={ep.episode_id} scene={ep.scene_id} goals={len(all_goals)} "
+            f"goal_categories={','.join(goal_cats)} current_goal_count={len(goals_now)}"
+        )
+        print(episode_loaded_line)
         if not printed_shape and "spectrogram" in observations:
             print(f"spectrogram shape: {observations['spectrogram'].shape}")
             printed_shape = True
@@ -339,7 +451,7 @@ def main() -> None:
         goal_suffix = f" goal={goal_label}" if goal_label else ""
         line = (
             f"[episode {episode_count}] scene={ep.scene_id} id={ep.episode_id}"
-            f"{goal_suffix} metrics={json.dumps(metrics, sort_keys=True)}"
+            f"{goal_suffix} {episode_loaded_line} metrics={json.dumps(metrics, sort_keys=True)}"
         )
         if episode_log_f is not None:
             episode_log_f.write(line + "\n")
