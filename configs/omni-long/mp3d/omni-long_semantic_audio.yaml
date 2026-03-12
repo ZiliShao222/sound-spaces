@@ -1,0 +1,81 @@
+ENVIRONMENT:
+  MAX_EPISODE_STEPS: 500
+
+SIMULATOR:
+  HABITAT_SIM_V0:
+    GPU_DEVICE_ID: 0
+
+  TYPE: "ContinuousSoundSpacesSim"
+  ACTION_SPACE_CONFIG: "v0"
+  SCENE_DATASET: "data/scene_datasets/mp3d/mp3d.scene_dataset_config.json"
+  GRID_SIZE: 1.0
+  FORWARD_STEP_SIZE: 0.25
+  TURN_ANGLE: 10
+  STEP_TIME: 0.25
+  USE_RENDERED_OBSERVATIONS: False
+
+  RGB_SENSOR:
+    WIDTH: 512
+    HEIGHT: 512
+    HFOV: 90
+    POSITION: [0.0, 1.25, 0.0]
+
+  DEPTH_SENSOR:
+    WIDTH: 512
+    HEIGHT: 512
+    HFOV: 90
+    POSITION: [0.0, 1.25, 0.0]
+
+  AUDIO:
+    EVERLASTING: True
+    RIR_SAMPLING_RATE: 16000
+    SOURCE_SOUND_DIR: "data/sounds/semantic_splits"
+    CROSSFADE: True
+
+TASK:
+  TYPE: "OmniLongSemanticAudioNav"
+
+  GOAL_ORDER_MODE: "ordered"
+
+  POSSIBLE_ACTIONS: ["STOP", "LIFELONG_SUBMIT", "MOVE_FORWARD", "TURN_LEFT", "TURN_RIGHT"]
+  ACTIONS:
+    LIFELONG_SUBMIT:
+      TYPE: "LifelongSubmitAction"
+
+  SUCCESS_DISTANCE: 1.0
+  SUCCESS:
+    SUCCESS_DISTANCE: 1.0
+
+  SENSORS: [
+    "AUDIOGOAL_SENSOR",
+    "SPECTROGRAM_SENSOR",
+    "POINTGOAL_WITH_GPS_COMPASS_SENSOR"
+  ]
+
+  GOAL_SENSOR_UUID: "spectrogram"
+
+  POINTGOAL_WITH_GPS_COMPASS_SENSOR:
+    GOAL_FORMAT: "CARTESIAN"
+    DIMENSIONALITY: 2
+
+  DISTANCE_TO_GOAL:
+    DISTANCE_TO: "VIEW_POINTS"
+
+  MEASUREMENTS: [
+    "DISTANCE_TO_GOAL",
+    "SUCCESS",
+    "SPL",
+    "SOFT_SPL",
+    "NUM_ACTION",
+    "LIFELONG_GOALS_FOUND",
+    "LIFELONG_GOAL_COMPLETION",
+    "LIFELONG_TASK_SUCCESS"
+  ]
+
+DATASET:
+  TYPE: "OmniLongNav"
+  SPLIT: "val"
+  CONTENT_SCENES: ["*"]
+  VERSION: "v1"
+  SCENES_DIR: "data/scene_datasets/mp3d"
+  DATA_PATH: "output/QUCTc6BB5sX/trajectory_dataset.json.gz"

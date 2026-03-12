@@ -1,0 +1,32 @@
+# General (goat-bench style)
+seed: 77
+exp_name: "exp_eval_omni-long"
+output_parent_dir: "results"
+
+# Scene / dataset paths
+scene_dataset_config_path: "data/scene_datasets/mp3d/mp3d.scene_dataset_config.json"
+scene_data_path: "data/scene_datasets/mp3d"
+test_data_dir: "output/QUCTc6BB5sX/trajectory_dataset.json.gz"
+
+# Habitat task config (our omni-long base config)
+habitat_config_path: "configs/omni-long/mp3d/omni-long_semantic_audio.yaml"
+
+# Lifelong task controls
+task_type: "OmniLongSemanticAudioNav"
+goal_order_mode: "ordered"  # ordered / unordered
+num_episodes: 50
+max_steps: 500
+print_every: 1
+
+# Policy (pluggable)
+policy_name: "distance_submit"
+policy_kwargs:
+  submit_distance: 1.0
+  min_submit_steps: 0
+  submit_probability: 0.0
+submit_action_name: "LIFELONG_SUBMIT"
+distance_submit_threshold: 1.0
+
+# Optional overrides
+split: "val"
+disable_content_scenes: true
