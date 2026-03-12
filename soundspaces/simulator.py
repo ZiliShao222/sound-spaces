@@ -36,6 +36,7 @@ from habitat.core.simulator import (
 )
 from soundspaces.utils import load_metadata
 from soundspaces.mp3d_utils import HouseReader
+from pathlib import Path
 
 
 class DummySimulator:
@@ -132,7 +133,7 @@ class SoundSpacesSim(Simulator, ABC):
         self._use_oracle_planner = True
         self._oracle_actions = list()
 
-        self.points, self.graph = load_metadata(self.metadata_dir)
+        self.points, self.graph = self._load_graph_or_raise()
         for node in self.graph.nodes():
             self._position_to_index_mapping[self.position_encoding(self.graph.nodes()[node]['point'])] = node
 
@@ -160,7 +161,19 @@ class SoundSpacesSim(Simulator, ABC):
         audio_sensor_spec.acousticsConfig.indirectRayCount = 500
         audio_sensor_spec.acousticsConfig.temporalCoherence = True
         audio_sensor_spec.acousticsConfig.transmission = True
+        if bool(getattr(self.config.AUDIO, "DISABLE_REVERB", False)):
+            audio_sensor_spec.acousticsConfig.indirectRayCount = 0
+            audio_sensor_spec.acousticsConfig.temporalCoherence = False
+            audio_sensor_spec.acousticsConfig.transmission = False
         self._sim.add_sensor(audio_sensor_spec)
+
+    def _audio_materials_path(self, scene_path: str) -> str:
+        scene_lower = (scene_path or "").lower()
+        if "hm3d" in scene_lower:
+            hm3d_cfg = os.path.join("data", "hm3d_material_config.json")
+            if os.path.isfile(hm3d_cfg):
+                return hm3d_cfg
+        return os.path.join("data", "mp3d_material_config.json")
 
     def create_sim_config(
         self, _sensor_suite: SensorSuite
@@ -314,12 +327,55 @@ class SoundSpacesSim(Simulator, ABC):
 
     @property
     def metadata_dir(self):
-        return os.path.join(self.config.AUDIO.METADATA_DIR, self.config.SCENE_DATASET, self.current_scene_name)
+        return os.path.join(
+            self.config.AUDIO.METADATA_DIR,
+            self._scene_dataset_name(),
+            self.current_scene_name,
+        )
+
+    def _load_graph_or_raise(self):
+        try:
+            return load_metadata(self.metadata_dir)
+        except (FileNotFoundError, FileExistsError) as exc:
+            if "hm3d" in self._scene_dataset_name().lower():
+                raise RuntimeError(
+                    "HM3D metadata missing for SoundSpacesSim. "
+                    "Use ContinuousSoundSpacesSim (default in semantic_audionav_eval.py) "
+                    "or generate metadata at: {}".format(self.metadata_dir)
+                ) from exc
+            raise
 
     @property
     def current_scene_name(self):
-        # config.SCENE (_current_scene) looks like 'data/scene_datasets/replica/office_1/habitat/mesh_semantic.ply'
-        return self._current_scene.split('/')[3]
+        scene_path = Path(self._current_scene)
+        parts = scene_path.parts
+        if "hm3d" in parts:
+            idx = parts.index("hm3d")
+            if len(parts) > idx + 2:
+                return parts[idx + 2]
+        if "mp3d" in parts:
+            idx = parts.index("mp3d")
+            if len(parts) > idx + 1:
+                return parts[idx + 1]
+        if "replica" in parts:
+            idx = parts.index("replica")
+            if len(parts) > idx + 1:
+                return parts[idx + 1]
+        return scene_path.stem
+
+    def _scene_dataset_name(self) -> str:
+        scene_parts = Path(self._current_scene).parts
+        for name in ("hm3d", "mp3d", "replica"):
+            if name in scene_parts:
+                return name
+        ds = self.config.SCENE_DATASET
+        if ds and os.path.isfile(ds):
+            ds_lower = ds.lower()
+            for name in ("hm3d", "mp3d", "replica"):
+                if name in ds_lower:
+                    return name
+            return Path(ds).stem
+        return str(ds)
 
     @property
     def current_scene_observation_file(self):
@@ -380,7 +436,7 @@ class SoundSpacesSim(Simulator, ABC):
 
             logging.debug('Loaded scene {}'.format(self.current_scene_name))
 
-            self.points, self.graph = load_metadata(self.metadata_dir)
+            self.points, self.graph = self._load_graph_or_raise()
             for node in self.graph.nodes():
                 self._position_to_index_mapping[self.position_encoding(self.graph.nodes()[node]['point'])] = node
             self._instance2label_mapping = None
@@ -389,7 +445,9 @@ class SoundSpacesSim(Simulator, ABC):
             audio_sensor = self._sim.get_agent(0)._sensors["audio_sensor"]
             audio_sensor.setAudioSourceTransform(np.array(self.config.AGENT_0.GOAL_POSITION) + np.array([0, 1.5, 0]))
             if not self.material_configured:
-                audio_sensor.setAudioMaterialsJSON("data/mp3d_material_config.json")
+                audio_sensor.setAudioMaterialsJSON(
+                    self._audio_materials_path(self.current_scene_name)
+                )
                 self.material_configured = True
 
         if not is_same_scene or not is_same_sound:

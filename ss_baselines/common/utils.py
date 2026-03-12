@@ -549,7 +549,7 @@ def observations_to_image(observation: Dict, info: Dict, pred=None) -> np.ndarra
             image=top_down_map,
             agent_center_coord=map_agent_pos,
             agent_rotation=info["top_down_map"]["agent_angle"],
-            agent_radius_px=top_down_map.shape[0] // 16,
+            agent_radius_px=top_down_map.shape[0] // 32,
         )
         if pred is not None:
             from habitat.utils.geometry_utils import quaternion_rotate_vector

@@ -618,8 +618,6 @@ class ImageNavDeterministicScanner:
     def _pose_only_view(self, view: Dict[str, Any]) -> Dict[str, Any]:
         """Return a compact render-parameter view payload without image paths."""
         return {
-            "semantic_id": int(view["semantic_id"]),
-            "category": view["category"],
             "resolution": {
                 "width": int(self.args.width),
                 "height": int(self.args.height),
@@ -627,10 +625,6 @@ class ImageNavDeterministicScanner:
             "hfov": float(self.args.hfov),
             "position": list(view["position"]),
             "agent_base_position": list(view["agent_base_position"]),
-            "floor_position": list(view["floor_position"]),
-            "floor_index": view["floor_index"],
-            "floor_y": view["floor_y"],
-            "object_center": list(view["object_center"]),
             "rotation": list(view["rotation"]),
             "radius": view["radius"],
             "angle_deg": view["angle_deg"],
@@ -1261,6 +1255,12 @@ class ImageNavDeterministicScanner:
         """Compute a roll-free look-at quaternion from sensor origin to target center."""
         sensor_origin = self._sensor_world_position(base_position)
         forward = np.array(target, dtype=np.float32) - sensor_origin
+        horizontal_only = bool(getattr(self.args, "horizontal_only_rotation", True))
+        if horizontal_only:
+            forward[1] = 0.0
+            horizontal_norm = float(np.linalg.norm(forward))
+            if horizontal_norm <= 1e-6:
+                forward = np.array([0.0, 0.0, -1.0], dtype=np.float32)
         forward_norm = float(np.linalg.norm(forward))
         if forward_norm <= 1e-6:
             return quat_from_angle_axis(
@@ -2162,6 +2162,113 @@ class ImageNavDeterministicScanner:
             f"_iou_{self._format_percent(iou)}.png"
         )
 
+    def _surface_distance_from_floor_point(
+        self,
+        floor_position: np.ndarray,
+        target: SemanticTarget,
+    ) -> float:
+        """Compute floor-viewpoint distance to target surface in the x-z plane."""
+        delta_xz = (
+            np.array(floor_position[[0, 2]], dtype=np.float32)
+            - np.array(target.center[[0, 2]], dtype=np.float32)
+        )
+        center_dist = float(np.linalg.norm(delta_xz))
+        return max(0.0, center_dist - float(target.horizontal_radius))
+
+    def _resample_candidates_around_viewpoint(
+        self,
+        target: SemanticTarget,
+        seed_candidate: ViewpointCandidate,
+        retry_radius: float,
+        max_retries: int,
+    ) -> List[ViewpointCandidate]:
+        """Sample nearby fallback viewpoints around one failed render candidate."""
+        retries: List[ViewpointCandidate] = []
+        if max_retries <= 0 or retry_radius <= 1e-6:
+            return retries
+
+        seed_floor = np.array(seed_candidate.floor_position, dtype=np.float32)
+        floor_level = self._nearest_floor_level(float(seed_floor[1]))
+        seen = {
+            (
+                round(float(seed_floor[0]), 3),
+                round(float(seed_floor[1]), 3),
+                round(float(seed_floor[2]), 3),
+            )
+        }
+        golden_angle_rad = math.radians(137.50776405003785)
+        base_angle_rad = math.radians(float(seed_candidate.angle_deg % 360))
+
+        for attempt_idx in range(max_retries):
+            radius = float(retry_radius) * math.sqrt(
+                float(attempt_idx + 1) / float(max_retries)
+            )
+            theta = base_angle_rad + float(attempt_idx + 1) * golden_angle_rad
+            probe = np.array(
+                [
+                    float(seed_floor[0]) + radius * math.cos(theta),
+                    float(seed_floor[1]),
+                    float(seed_floor[2]) + radius * math.sin(theta),
+                ],
+                dtype=np.float32,
+            )
+            snapped = self._snap_to_floor_navmesh(probe, floor_level=floor_level)
+            if snapped is None:
+                continue
+
+            key = (
+                round(float(snapped[0]), 3),
+                round(float(snapped[1]), 3),
+                round(float(snapped[2]), 3),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+
+            base_position = np.array(snapped, dtype=np.float32)
+            sensor_position = self._sensor_world_position(base_position)
+            rotation = self._look_at_quaternion(base_position, target.center)
+            edge_clearance = self._distance_to_navmesh_edge(base_position)
+            nearby_count, nearby_penalty = self._nearby_object_stats_2d(
+                base_position,
+                target_id=target.semantic_id,
+            )
+            sensor_clearance = self._min_sensor_clearance(
+                sensor_position,
+                target_id=target.semantic_id,
+            )
+            retry_floor = self._nearest_floor_level(float(base_position[1]))
+            retry_floor_y = (
+                float(retry_floor.y)
+                if retry_floor is not None
+                else float(base_position[1])
+            )
+
+            retries.append(
+                ViewpointCandidate(
+                    floor_position=base_position,
+                    sensor_position=sensor_position,
+                    base_position=base_position,
+                    rotation=rotation,
+                    surface_distance=self._surface_distance_from_floor_point(
+                        base_position,
+                        target,
+                    ),
+                    angle_deg=self._estimate_angle_deg(base_position, target),
+                    edge_clearance=float(edge_clearance),
+                    nearby_count=int(nearby_count),
+                    nearby_penalty=float(nearby_penalty),
+                    sensor_clearance=float(sensor_clearance),
+                    sensor_offset=float(self.sensor_height),
+                    floor_level_index=self._floor_level_index(retry_floor),
+                    floor_level_y=float(retry_floor_y),
+                )
+            )
+            if len(retries) >= int(max_retries):
+                break
+
+        return retries
+
     def _scan_target(
         self,
         target: SemanticTarget,
@@ -2261,171 +2368,205 @@ class ImageNavDeterministicScanner:
             selected_candidates.append(candidate)
             scan_diagnostics["selected"] = int(len(selected_candidates))
 
+        retry_radius = max(
+            0.0,
+            float(getattr(self.args, "render_validation_retry_radius", 0.25)),
+        )
+        retry_max_attempts = max(
+            0,
+            int(getattr(self.args, "render_validation_retry_max_attempts", 10)),
+        )
+
         for candidate in selected_candidates:
-            rotation = candidate.rotation
-            quat_xyzw = _quat_to_list(rotation)
-            alignment_deg = self._forward_alignment_deg(
-                candidate.sensor_position,
-                rotation,
-                target.center,
-            )
-            self.logger.debug(
-                "[Align] %s %d | forward-target angle = %.3f deg",
-                self.target_label,
-                target.semantic_id,
-                alignment_deg,
+            attempt_candidates: List[ViewpointCandidate] = [candidate]
+            attempt_candidates.extend(
+                self._resample_candidates_around_viewpoint(
+                    target=target,
+                    seed_candidate=candidate,
+                    retry_radius=retry_radius,
+                    max_retries=retry_max_attempts,
+                )
             )
 
-            try:
-                rgb, semantic = self._observe(
-                    candidate.base_position,
+            for retry_index, active_candidate in enumerate(attempt_candidates):
+                rotation = active_candidate.rotation
+                quat_xyzw = _quat_to_list(rotation)
+                alignment_deg = self._forward_alignment_deg(
+                    active_candidate.sensor_position,
                     rotation,
-                    target_id=target.semantic_id,
+                    target.center,
                 )
-            except Exception:
-                observe_failures += 1
-                scan_diagnostics["observe_failures"] = int(observe_failures)
-                invalid_views.append(
-                    self._invalid_view_record(
-                        target=target,
-                        stage="render",
-                        reason="observe_failure",
-                        floor_position=candidate.floor_position,
-                        base_position=candidate.base_position,
-                        sensor_position=candidate.sensor_position,
-                        rotation=candidate.rotation,
-                        angle_deg=int(candidate.angle_deg),
-                        surface_distance=float(candidate.surface_distance),
-                        details={
-                            "edge_clearance": float(candidate.edge_clearance),
-                            "sensor_clearance": float(candidate.sensor_clearance),
-                        },
+                self.logger.debug(
+                    "[Align] %s %d | forward-target angle = %.3f deg | retry=%d",
+                    self.target_label,
+                    target.semantic_id,
+                    alignment_deg,
+                    int(retry_index),
+                )
+
+                try:
+                    rgb, semantic = self._observe(
+                        active_candidate.base_position,
+                        rotation,
+                        target_id=target.semantic_id,
                     )
-                )
-                continue
-
-            center_projection = self._project_world_point(
-                target.center,
-                sensor_position=candidate.sensor_position,
-                rotation=rotation,
-            )
-            if center_projection is None:
-                center_pixel = self._image_center_pixel()
-            else:
-                center_pixel = (center_projection[0], center_projection[1])
-
-            entity_mask = self._entity_mask_from_aabb(
-                target,
-                candidate.sensor_position,
-                rotation,
-            )
-            semantic_mask = self._semantic_instance_mask(semantic, target.semantic_id)
-            bbox = self._mask_bbox(entity_mask)
-            visible_ratio = self._mask_visible_ratio(entity_mask)
-            mask_iou = self._mask_iou(entity_mask, semantic_mask)
-            if mask_iou < float(self.args.min_iou):
-                scan_diagnostics["iou_reject"] += 1
-                invalid_views.append(
-                    self._invalid_view_record(
-                        target=target,
-                        stage="render_validation",
-                        reason="iou_reject",
-                        floor_position=candidate.floor_position,
-                        base_position=candidate.base_position,
-                        sensor_position=candidate.sensor_position,
-                        rotation=candidate.rotation,
-                        angle_deg=int(candidate.angle_deg),
-                        surface_distance=float(candidate.surface_distance),
-                        details={
-                            "iou": float(mask_iou),
-                            "min_iou": float(self.args.min_iou),
-                            "frame_cov": float(visible_ratio),
-                            "bbox": list(bbox) if bbox is not None else None,
-                        },
+                except Exception:
+                    observe_failures += 1
+                    scan_diagnostics["observe_failures"] = int(observe_failures)
+                    invalid_views.append(
+                        self._invalid_view_record(
+                            target=target,
+                            stage="render",
+                            reason="observe_failure",
+                            floor_position=active_candidate.floor_position,
+                            base_position=active_candidate.base_position,
+                            sensor_position=active_candidate.sensor_position,
+                            rotation=active_candidate.rotation,
+                            angle_deg=int(active_candidate.angle_deg),
+                            surface_distance=float(active_candidate.surface_distance),
+                            details={
+                                "edge_clearance": float(active_candidate.edge_clearance),
+                                "sensor_clearance": float(active_candidate.sensor_clearance),
+                                "retry_index": int(retry_index),
+                                "retry_radius": float(retry_radius),
+                                "retry_max_attempts": int(retry_max_attempts),
+                            },
+                        )
                     )
+                    continue
+
+                center_projection = self._project_world_point(
+                    target.center,
+                    sensor_position=active_candidate.sensor_position,
+                    rotation=rotation,
                 )
-                continue
-            yolo_valid, yolo_matches, yolo_num_detections, yolo_annotated = self._validate_with_yolo(
-                rgb,
-                target.category_name,
-            )
-            if not yolo_valid:
-                scan_diagnostics["yolo_reject"] += 1
-                invalid_views.append(
-                    self._invalid_view_record(
-                        target=target,
-                        stage="render_validation",
-                        reason="yolo_reject",
-                        floor_position=candidate.floor_position,
-                        base_position=candidate.base_position,
-                        sensor_position=candidate.sensor_position,
-                        rotation=candidate.rotation,
-                        angle_deg=int(candidate.angle_deg),
-                        surface_distance=float(candidate.surface_distance),
-                        details={
-                            "iou": float(mask_iou),
-                            "frame_cov": float(visible_ratio),
-                            "yolo_num_detections": int(yolo_num_detections),
-                            "yolo_matched_detections": yolo_matches,
-                            "yolo_conf_threshold": float(self.args.yolo_conf_threshold),
-                        },
+                if center_projection is None:
+                    center_pixel = self._image_center_pixel()
+                else:
+                    center_pixel = (center_projection[0], center_projection[1])
+
+                entity_mask = self._entity_mask_from_aabb(
+                    target,
+                    active_candidate.sensor_position,
+                    rotation,
+                )
+                semantic_mask = self._semantic_instance_mask(semantic, target.semantic_id)
+                bbox = self._mask_bbox(entity_mask)
+                visible_ratio = self._mask_visible_ratio(entity_mask)
+                mask_iou = self._mask_iou(entity_mask, semantic_mask)
+                if mask_iou < float(self.args.min_iou):
+                    scan_diagnostics["iou_reject"] += 1
+                    invalid_views.append(
+                        self._invalid_view_record(
+                            target=target,
+                            stage="render_validation",
+                            reason="iou_reject",
+                            floor_position=active_candidate.floor_position,
+                            base_position=active_candidate.base_position,
+                            sensor_position=active_candidate.sensor_position,
+                            rotation=active_candidate.rotation,
+                            angle_deg=int(active_candidate.angle_deg),
+                            surface_distance=float(active_candidate.surface_distance),
+                            details={
+                                "iou": float(mask_iou),
+                                "min_iou": float(self.args.min_iou),
+                                "frame_cov": float(visible_ratio),
+                                "bbox": list(bbox) if bbox is not None else None,
+                                "retry_index": int(retry_index),
+                                "retry_radius": float(retry_radius),
+                                "retry_max_attempts": int(retry_max_attempts),
+                            },
+                        )
                     )
+                    continue
+                yolo_valid, yolo_matches, yolo_num_detections, yolo_annotated = self._validate_with_yolo(
+                    rgb,
+                    target.category_name,
                 )
-                continue
+                if not yolo_valid:
+                    scan_diagnostics["yolo_reject"] += 1
+                    invalid_views.append(
+                        self._invalid_view_record(
+                            target=target,
+                            stage="render_validation",
+                            reason="yolo_reject",
+                            floor_position=active_candidate.floor_position,
+                            base_position=active_candidate.base_position,
+                            sensor_position=active_candidate.sensor_position,
+                            rotation=active_candidate.rotation,
+                            angle_deg=int(active_candidate.angle_deg),
+                            surface_distance=float(active_candidate.surface_distance),
+                            details={
+                                "iou": float(mask_iou),
+                                "frame_cov": float(visible_ratio),
+                                "yolo_num_detections": int(yolo_num_detections),
+                                "yolo_matched_detections": yolo_matches,
+                                "yolo_conf_threshold": float(self.args.yolo_conf_threshold),
+                                "retry_index": int(retry_index),
+                                "retry_radius": float(retry_radius),
+                                "retry_max_attempts": int(retry_max_attempts),
+                            },
+                        )
+                    )
+                    continue
 
-            goal_name = self._goal_filename(
-                semantic_id=target.semantic_id,
-                sensor_position=candidate.sensor_position,
-                rotation=rotation,
-                object_center=target.center,
-                surface_distance=candidate.surface_distance,
-                frame_cov=visible_ratio,
-                iou=mask_iou,
-            )
-            yolo_name = f"yolo_{goal_name}"
+                goal_name = self._goal_filename(
+                    semantic_id=target.semantic_id,
+                    sensor_position=active_candidate.sensor_position,
+                    rotation=rotation,
+                    object_center=target.center,
+                    surface_distance=active_candidate.surface_distance,
+                    frame_cov=visible_ratio,
+                    iou=mask_iou,
+                )
+                yolo_name = f"yolo_{goal_name}"
 
-            goal_path = object_output_dir / goal_name
-            yolo_path = object_output_dir / yolo_name
-
-            Image.fromarray(rgb).save(goal_path)
-            if yolo_annotated is not None:
-                yolo_annotated.save(yolo_path)
-
-            goal_rel = goal_path.relative_to(self.output_root).as_posix()
-            yolo_rel = (
-                yolo_path.relative_to(self.output_root).as_posix()
-                if yolo_annotated is not None
-                else None
-            )
-            view_payload = {
-                "semantic_id": int(target.semantic_id),
-                "category": target.category_name,
-                "position": [round(float(v), 3) for v in candidate.sensor_position],
-                "agent_base_position": [round(float(v), 3) for v in candidate.base_position],
-                "floor_position": [round(float(v), 3) for v in candidate.floor_position],
-                "floor_index": candidate.floor_level_index,
-                "floor_y": round(float(candidate.floor_level_y), 3),
-                "object_center": [round(float(v), 3) for v in target.center],
-                "rotation": [round(float(v), 6) for v in quat_xyzw],
-                "object_center_pixel": [round(float(v), 3) for v in center_pixel],
-                "bbox": list(bbox) if bbox is not None else None,
-                "radius": round(candidate.surface_distance, 3),
-                "angle_deg": int(candidate.angle_deg),
-                "visible_ratio": round(visible_ratio, 3),
-                "frame_cov": round(100.0 * visible_ratio, 1),
-                "iou": round(100.0 * mask_iou, 1),
-                "edge_clearance": round(candidate.edge_clearance, 3),
-                "nearby_count": int(candidate.nearby_count),
-                "nearby_penalty": round(candidate.nearby_penalty, 3),
-                "sensor_clearance": round(candidate.sensor_clearance, 3),
-                "sensor_offset": round(candidate.sensor_offset, 3),
-                "yolo_num_detections": int(yolo_num_detections),
-                "yolo_matched_detections": yolo_matches,
-                "goal_image": goal_rel,
-                "yolo_image": yolo_rel,
-            }
-            views.append(view_payload)
-            scan_diagnostics["rendered_views"] = int(len(views))
+                goal_path = object_output_dir / goal_name
+                yolo_path = object_output_dir / yolo_name
+                save_images = bool(getattr(self.args, "save_images", True))
+                goal_rel = None
+                yolo_rel = None
+                if save_images:
+                    Image.fromarray(rgb).save(goal_path)
+                    if yolo_annotated is not None:
+                        yolo_annotated.save(yolo_path)
+                    goal_rel = goal_path.relative_to(self.output_root).as_posix()
+                    yolo_rel = (
+                        yolo_path.relative_to(self.output_root).as_posix()
+                        if yolo_annotated is not None
+                        else None
+                    )
+                view_payload = {
+                    "semantic_id": int(target.semantic_id),
+                    "category": target.category_name,
+                    "position": [round(float(v), 3) for v in active_candidate.sensor_position],
+                    "agent_base_position": [round(float(v), 3) for v in active_candidate.base_position],
+                    "floor_position": [round(float(v), 3) for v in active_candidate.floor_position],
+                    "floor_index": active_candidate.floor_level_index,
+                    "floor_y": round(float(active_candidate.floor_level_y), 3),
+                    "object_center": [round(float(v), 3) for v in target.center],
+                    "rotation": [round(float(v), 6) for v in quat_xyzw],
+                    "object_center_pixel": [round(float(v), 3) for v in center_pixel],
+                    "bbox": list(bbox) if bbox is not None else None,
+                    "radius": round(active_candidate.surface_distance, 3),
+                    "angle_deg": int(active_candidate.angle_deg),
+                    "visible_ratio": round(visible_ratio, 3),
+                    "frame_cov": round(100.0 * visible_ratio, 1),
+                    "iou": round(100.0 * mask_iou, 1),
+                    "edge_clearance": round(active_candidate.edge_clearance, 3),
+                    "nearby_count": int(active_candidate.nearby_count),
+                    "nearby_penalty": round(active_candidate.nearby_penalty, 3),
+                    "sensor_clearance": round(active_candidate.sensor_clearance, 3),
+                    "sensor_offset": round(active_candidate.sensor_offset, 3),
+                    "retry_index": int(retry_index),
+                    "yolo_num_detections": int(yolo_num_detections),
+                    "yolo_matched_detections": yolo_matches,
+                    "goal_image": goal_rel,
+                    "yolo_image": yolo_rel,
+                }
+                views.append(view_payload)
+                scan_diagnostics["rendered_views"] = int(len(views))
+                break
 
         self.logger.info(
             "%s %d (%s): %d valid views",
@@ -2499,8 +2640,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--yolo-model",
         type=Path,
-        default=None,
-        help="Optional local YOLO26/YOLO weights used to validate rendered views before saving",
+        default=Path("models/yolo26x.pt"),
+        help="YOLO weights used to validate rendered views before saving",
     )
     parser.add_argument(
         "--yolo-device",
@@ -2562,9 +2703,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional explicit output manifest path",
     )
+    parser.add_argument(
+        "--save-images",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Save rendered RGB/YOLO images to disk (default: save)",
+    )
     parser.add_argument("--width", type=int, default=512, help="RGB/semantic width")
     parser.add_argument("--height", type=int, default=512, help="RGB/semantic height")
     parser.add_argument("--hfov", type=float, default=90.0, help="Sensor horizontal FoV")
+    parser.add_argument(
+        "--horizontal-only-rotation",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Constrain render rotation to yaw-only (horizontal view) (default: yes)",
+    )
     parser.add_argument(
         "--sensor-height",
         type=float,

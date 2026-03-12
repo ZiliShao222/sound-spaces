@@ -40,6 +40,10 @@ class SemanticAudioGoalNavEpisode(NavigationEpisode):
     distractor_position_index: attr.ib(converter=int) = None
     offset: attr.ib(converter=int)
     duration: attr.ib(converter=int)
+    num_goals: Optional[int] = attr.ib(
+        default=None,
+        converter=lambda x: int(x) if x is not None else None,
+    )
 
     @property
     def goals_key(self) -> str:
@@ -81,6 +85,7 @@ class SemanticAudioGoal(NavigationGoal):
     Args:
         object_id: id that can be used to retrieve object from the semantic
         scene annotation
+        object_id_raw: original object id from semantic scene (optional)
         object_name: name of the object
         object_category: object category name usually similar to scene semantic
         categories
@@ -93,6 +98,7 @@ class SemanticAudioGoal(NavigationGoal):
     """
 
     object_id: str = attr.ib(default=None, validator=not_none_validator)
+    object_id_raw: Optional[str] = None
     object_name: Optional[str] = None
     object_category: Optional[str] = None
     room_id: Optional[str] = None
