@@ -47,12 +47,21 @@ def _build_named_action(action_name: str) -> Dict[str, str]:
 
 
 def _distance_to_current_goal(env: Any, episode: Any) -> Optional[float]:
+    task = _get_task(env)
+    if task is not None and hasattr(task, "_distance_to_goal_by_mode"):
+        try:
+            distance = task._distance_to_goal_by_mode(episode)
+            if distance is None:
+                return None
+            return float(distance)
+        except Exception:
+            pass
+
     goals = getattr(episode, "goals", None)
     if not isinstance(goals, list) or len(goals) == 0:
         return None
 
     goal = goals[0]
-    task = _get_task(env)
     if task is not None and hasattr(task, "_distance_to_goal"):
         try:
             distance = task._distance_to_goal(goal, episode)

@@ -994,24 +994,28 @@ def _build_trajectories(
             desired_image_min = desired_image_max
 
         # Rule by episode goal count:
-        # - 2 goals: exactly 1 text/image goal
-        # - 3 goals: allow 1~2 text/image goals
-        # - 4 goals: exactly 2 text/image goals (split as image + text)
+        # - goals >= 4: must include both image and text_description modalities
+        # - goals >= 3: must include at least one image/text_description modality
         # - others: fallback to CLI range config
+        required_min_image_goals = 0
         force_split_image_and_text = False
-        if int(goal_count) == 2:
-            desired_image_min = 1
-            desired_image_max = 1
-        elif int(goal_count) == 3:
-            desired_image_min = 1
-            desired_image_max = 2
-        elif int(goal_count) == 4:
-            desired_image_min = 2
-            desired_image_max = 2
+        if int(goal_count) >= 4:
+            required_min_image_goals = 2
             force_split_image_and_text = True
+        elif int(goal_count) >= 3:
+            required_min_image_goals = 1
+
+        desired_image_min = max(int(desired_image_min), int(required_min_image_goals))
+        desired_image_max = max(int(desired_image_max), int(required_min_image_goals))
 
         desired_image_min = min(desired_image_min, int(goal_count), int(total_image_records))
         desired_image_max = min(desired_image_max, int(goal_count), int(total_image_records))
+        if int(desired_image_min) < int(required_min_image_goals):
+            raise RuntimeError(
+                "Insufficient image-capable goals for modality constraints: "
+                f"goal_count={int(goal_count)}, required_min_image_goals={int(required_min_image_goals)}, "
+                f"available_image_capable_instances={int(total_image_records)}."
+            )
         if desired_image_max < desired_image_min:
             desired_image_max = desired_image_min
 
@@ -1080,6 +1084,20 @@ def _build_trajectories(
                 prefer_image_text_per_episode=bool(prefer_image_text_per_episode),
                 force_split_image_and_text=bool(force_split_image_and_text),
             )
+
+            if int(goal_count) >= 4:
+                if not (
+                    bool(modality_coverage.get("has_image_goal"))
+                    and bool(modality_coverage.get("has_text_description_goal"))
+                ):
+                    continue
+            elif int(goal_count) >= 3:
+                if not (
+                    bool(modality_coverage.get("has_image_goal"))
+                    or bool(modality_coverage.get("has_text_description_goal"))
+                ):
+                    continue
+
             for index, modality in enumerate(goal_modalities):
                 goal_inputs[index]["selected_non_audio_modality"] = str(modality)
 

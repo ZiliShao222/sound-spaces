@@ -200,6 +200,7 @@ class ImageNavDeterministicScanner:
         self.scene_path = self._resolve_scene_path(args.scene_name)
         self.scene_name = args.scene_name
         self.scene_id = self._scene_id_for_dataset(self.scene_path)
+        self.seed = int(getattr(args, "seed", 2026))
         self.target_category = (
             args.target_category.strip().lower()
             if args.target_category is not None and args.target_category.strip()
@@ -1513,7 +1514,9 @@ class ImageNavDeterministicScanner:
 
     def _candidate_rng(self, target: SemanticTarget) -> np.random.RandomState:
         """Return a deterministic RNG for candidate jitter per target."""
-        seed_payload = f"{self.scene_name}:{int(target.semantic_id)}".encode("utf-8")
+        seed_payload = (
+            f"{self.seed}:{self.scene_name}:{int(target.semantic_id)}".encode("utf-8")
+        )
         seed = zlib.crc32(seed_payload) & 0xFFFFFFFF
         return np.random.RandomState(seed)
 
@@ -2712,6 +2715,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=512, help="RGB/semantic width")
     parser.add_argument("--height", type=int, default=512, help="RGB/semantic height")
     parser.add_argument("--hfov", type=float, default=90.0, help="Sensor horizontal FoV")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=2026,
+        help="Random seed for deterministic candidate jitter",
+    )
     parser.add_argument(
         "--horizontal-only-rotation",
         default=True,

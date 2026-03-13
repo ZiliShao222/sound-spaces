@@ -1,0 +1,831 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import gzip
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import habitat
+from habitat.config import Config
+import numpy as np
+from PIL import Image
+import soundspaces  # noqa: F401 - register datasets/tasks/sims
+from habitat.utils.visualizations.utils import images_to_video
+
+from ss_baselines.av_nav.config.default import get_task_config
+from ss_baselines.common.omni_long_eval_policy import (
+    build_lifelong_eval_context,
+    build_lifelong_eval_policy,
+    list_lifelong_eval_policies,
+)
+from ss_baselines.common.utils import observations_to_image, images_to_video_with_audio
+
+
+DEFAULT_CONFIG = "configs/omni-long/mp3d/omni-long_semantic_audio.yaml"
+DEFAULT_TASK_TYPE = "OmniLongSemanticAudioNav"
+DEFAULT_EXP_NAME = "exp_eval_omni-long"
+DEFAULT_OUTPUT_PARENT_DIR = "results"
+
+
+def _is_vec3(value: Any) -> bool:
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) == 3
+        and all(isinstance(v, (int, float)) for v in value)
+    )
+
+
+def _is_quat4(value: Any) -> bool:
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) == 4
+        and all(isinstance(v, (int, float)) for v in value)
+    )
+
+
+def _load_dataset_payload(dataset_path: str) -> Dict[str, Any]:
+    p = Path(dataset_path)
+    if p.suffix.lower() == ".gz":
+        with gzip.open(p, "rt", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    else:
+        with open(p, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def _flatten_instances(raw_instances: Any) -> Dict[str, Dict[str, Any]]:
+    flattened: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(raw_instances, dict):
+        return flattened
+    for key, value in raw_instances.items():
+        if isinstance(value, dict) and "semantic_id" in value:
+            flattened[str(key)] = value
+            continue
+        if isinstance(value, dict):
+            for nested_key, nested_value in value.items():
+                if isinstance(nested_value, dict):
+                    flattened[str(nested_key)] = nested_value
+    return flattened
+
+
+def _parse_image_modality_index(modality: str) -> Optional[int]:
+    token = str(modality).strip().lower()
+    if token == "image":
+        return 0
+    if token.startswith("image_"):
+        suffix = token[len("image_") :]
+        if suffix.isdigit():
+            return int(suffix)
+    return None
+
+
+def _extract_text_description(instance_record: Dict[str, Any]) -> Optional[str]:
+    for key in ("text_description", "description", "text", "caption"):
+        value = instance_record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _extract_rgb_from_observations(observations: Dict[str, Any]) -> Optional[np.ndarray]:
+    for key in ("rgb", "RGB_SENSOR", "rgb_sensor"):
+        if key in observations:
+            candidate = observations[key]
+            arr = np.asarray(candidate)
+            if arr.ndim == 3:
+                if arr.shape[2] == 4:
+                    arr = arr[:, :, :3]
+                elif arr.shape[2] == 1:
+                    arr = np.repeat(arr, 3, axis=2)
+                if arr.dtype != np.uint8:
+                    arr = np.clip(arr, 0, 255).astype(np.uint8)
+                return arr
+    for value in observations.values():
+        arr = np.asarray(value)
+        if arr.ndim == 3 and arr.shape[2] in (3, 4):
+            if arr.shape[2] == 4:
+                arr = arr[:, :, :3]
+            if arr.dtype != np.uint8:
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+            return arr
+    return None
+
+
+def _render_reference_image(
+    env: habitat.Env,
+    instance_record: Dict[str, Any],
+    image_index: int,
+) -> Optional[np.ndarray]:
+    image_payload = instance_record.get("image")
+    if not isinstance(image_payload, dict):
+        return None
+    render_views = image_payload.get("render_views")
+    if not isinstance(render_views, list) or len(render_views) == 0:
+        return None
+    if image_index < 0 or image_index >= len(render_views):
+        return None
+
+    render_view = render_views[image_index]
+    if not isinstance(render_view, dict):
+        return None
+
+    position = render_view.get("agent_base_position")
+    if not _is_vec3(position):
+        position = render_view.get("position")
+    rotation = render_view.get("rotation")
+    if not _is_vec3(position) or not _is_quat4(rotation):
+        return None
+
+    try:
+        observations = env.sim.get_observations_at(
+            position=[float(v) for v in position],
+            rotation=[float(v) for v in rotation],
+            keep_agent_at_new_pose=False,
+        )
+    except Exception:
+        return None
+
+    if observations is None:
+        return None
+    return _extract_rgb_from_observations(observations)
+
+
+def _sound_id_for_goal(episode: Any, goal_index: int) -> Optional[str]:
+    sound_sources = getattr(episode, "sound_sources", None)
+    if isinstance(sound_sources, list) and 0 <= goal_index < len(sound_sources):
+        src = sound_sources[goal_index]
+        if isinstance(src, dict):
+            sid = src.get("sound_id")
+            if isinstance(sid, str) and sid.strip():
+                return sid.strip()
+    sid = getattr(episode, "sound_id", None)
+    if isinstance(sid, str) and sid.strip():
+        return sid.strip()
+    return None
+
+
+def _build_goal_prompt(
+    instance_key: str,
+    modality: str,
+    instance_record: Optional[Dict[str, Any]],
+    sound_id: Optional[str],
+    image_path: Optional[str],
+) -> str:
+    category = None
+    semantic_id = None
+    description = None
+    if isinstance(instance_record, dict):
+        category = instance_record.get("category")
+        semantic_id = instance_record.get("semantic_id")
+        description = _extract_text_description(instance_record)
+
+    prompt_parts: List[str] = [
+        f"instance_key={instance_key}",
+        f"modality={modality}",
+    ]
+    if category is not None:
+        prompt_parts.append(f"category={category}")
+    if semantic_id is not None:
+        prompt_parts.append(f"semantic_id={semantic_id}")
+    if sound_id:
+        prompt_parts.append(f"audio={sound_id}")
+
+    m = str(modality).strip().lower()
+    if m.startswith("image"):
+        if image_path:
+            prompt_parts.append(f"image_ref={image_path}")
+        else:
+            prompt_parts.append("image_ref=<missing>")
+    elif m in {"description", "text", "text_description"}:
+        if description:
+            prompt_parts.append(f"text={description}")
+        else:
+            prompt_parts.append("text=<missing>")
+
+    return " | ".join(prompt_parts)
+
+
+def _normalize_task_specs(raw_tasks: Any) -> List[Tuple[str, str]]:
+    specs: List[Tuple[str, str]] = []
+    if not isinstance(raw_tasks, list):
+        return specs
+    for item in raw_tasks:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            specs.append((str(item[0]), str(item[1])))
+            continue
+        if isinstance(item, dict):
+            instance_key = item.get("instance_key", item.get("goal", ""))
+            modality = item.get("modality", "object")
+            specs.append((str(instance_key), str(modality)))
+    return specs
+
+
+def _save_prompt_image_if_needed(
+    env: habitat.Env,
+    instance_record: Optional[Dict[str, Any]],
+    modality: str,
+    prompt_image_dir: Optional[Path],
+    episode_id: str,
+    goal_index: int,
+    instance_key: str,
+) -> Optional[str]:
+    if prompt_image_dir is None:
+        return None
+    if not isinstance(instance_record, dict):
+        return None
+
+    image_index = _parse_image_modality_index(modality)
+    if image_index is None:
+        return None
+
+    rgb = _render_reference_image(env, instance_record, image_index)
+    if rgb is None:
+        return None
+
+    prompt_image_dir.mkdir(parents=True, exist_ok=True)
+    file_path = prompt_image_dir / (
+        f"episode_{episode_id}_goal_{goal_index:02d}_{instance_key}_{modality}.png"
+    )
+    Image.fromarray(rgb).save(file_path)
+    return str(file_path)
+
+
+def _safe_json_load(raw: str, fallback: Any) -> Any:
+    token = str(raw).strip()
+    if not token:
+        return fallback
+    try:
+        return json.loads(token)
+    except Exception:
+        return fallback
+
+
+def _safe_yaml_or_json_load(path: Path) -> Dict[str, Any]:
+    if not path.is_file():
+        raise RuntimeError(f"Eval config not found: {path}")
+
+    if path.suffix.lower() == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        try:
+            import yaml
+        except Exception as exc:
+            raise RuntimeError(
+                "Reading YAML eval config requires PyYAML. Install with `pip install pyyaml`."
+            ) from exc
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise RuntimeError("Eval config root must be a mapping/object.")
+    return payload
+
+
+def _cfg_get(cfg: Dict[str, Any], path: str, default: Any = None) -> Any:
+    cur: Any = cfg
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return cur
+
+
+def _first_cfg_value(cfg: Dict[str, Any], *paths: str) -> Any:
+    for path in paths:
+        value = _cfg_get(cfg, path, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _set_arg_if_default(args: argparse.Namespace, name: str, default: Any, value: Any) -> None:
+    if value is None:
+        return
+    if getattr(args, name) == default:
+        setattr(args, name, value)
+
+
+def apply_eval_config(args: argparse.Namespace) -> argparse.Namespace:
+    if args.eval_config is None:
+        return args
+
+    eval_config_path = Path(args.eval_config).expanduser().resolve()
+    cfg = _safe_yaml_or_json_load(eval_config_path)
+
+    _set_arg_if_default(
+        args,
+        "exp_config",
+        DEFAULT_CONFIG,
+        _first_cfg_value(cfg, "habitat_config_path", "exp_config", "habitat.exp_config"),
+    )
+    _set_arg_if_default(
+        args,
+        "dataset_path",
+        None,
+        _first_cfg_value(cfg, "dataset_path", "test_data_dir", "dataset.path"),
+    )
+    _set_arg_if_default(
+        args,
+        "split",
+        "val",
+        _first_cfg_value(cfg, "split", "dataset.split"),
+    )
+    _set_arg_if_default(
+        args,
+        "scenes_dir",
+        None,
+        _first_cfg_value(cfg, "scene_data_path", "scenes_dir", "dataset.scenes_dir"),
+    )
+    _set_arg_if_default(
+        args,
+        "scene_dataset_config",
+        None,
+        _first_cfg_value(cfg, "scene_dataset_config_path", "scene_dataset_config", "simulator.scene_dataset_config"),
+    )
+    _set_arg_if_default(
+        args,
+        "task_type",
+        DEFAULT_TASK_TYPE,
+        _first_cfg_value(cfg, "task_type", "task.type"),
+    )
+    _set_arg_if_default(
+        args,
+        "goal_order_mode",
+        None,
+        _first_cfg_value(cfg, "goal_order_mode", "task.goal_order_mode"),
+    )
+    _set_arg_if_default(
+        args,
+        "scene",
+        None,
+        _first_cfg_value(cfg, "scene", "dataset.scene_filter"),
+    )
+    _set_arg_if_default(
+        args,
+        "num_episodes",
+        None,
+        _first_cfg_value(cfg, "num_episodes", "eval.num_episodes"),
+    )
+    _set_arg_if_default(
+        args,
+        "max_steps",
+        500,
+        _first_cfg_value(cfg, "max_steps", "eval.max_steps"),
+    )
+    _set_arg_if_default(
+        args,
+        "policy",
+        "distance_submit",
+        _first_cfg_value(cfg, "policy_name", "policy.name", "policy"),
+    )
+
+    if args.policy_kwargs == "{}":
+        policy_kwargs = _first_cfg_value(cfg, "policy_kwargs", "policy.kwargs")
+        if isinstance(policy_kwargs, dict):
+            args.policy_kwargs = json.dumps(policy_kwargs)
+        elif isinstance(policy_kwargs, str) and policy_kwargs.strip():
+            args.policy_kwargs = policy_kwargs
+
+    _set_arg_if_default(
+        args,
+        "submit_action_name",
+        "LIFELONG_SUBMIT",
+        _first_cfg_value(cfg, "submit_action_name", "policy.submit_action_name"),
+    )
+    _set_arg_if_default(
+        args,
+        "distance_submit_threshold",
+        1.0,
+        _first_cfg_value(cfg, "distance_submit_threshold", "policy.distance_submit_threshold"),
+    )
+    _set_arg_if_default(
+        args,
+        "seed",
+        0,
+        _first_cfg_value(cfg, "seed", "eval.seed"),
+    )
+    _set_arg_if_default(
+        args,
+        "print_every",
+        1,
+        _first_cfg_value(cfg, "print_every", "eval.print_every"),
+    )
+    _set_arg_if_default(
+        args,
+        "video",
+        True,
+        _first_cfg_value(cfg, "save_visualization", "video", "eval.video"),
+    )
+    _set_arg_if_default(
+        args,
+        "video_dir",
+        None,
+        _first_cfg_value(cfg, "video_dir", "eval.video_dir"),
+    )
+    _set_arg_if_default(
+        args,
+        "video_fps",
+        None,
+        _first_cfg_value(cfg, "video_fps", "eval.video_fps"),
+    )
+    _set_arg_if_default(
+        args,
+        "video_audio",
+        True,
+        _first_cfg_value(cfg, "video_audio", "eval.video_audio"),
+    )
+    _set_arg_if_default(
+        args,
+        "audio_active_threshold",
+        1e-6,
+        _first_cfg_value(cfg, "audio_active_threshold", "eval.audio_active_threshold"),
+    )
+    _set_arg_if_default(
+        args,
+        "video_audio_normalize",
+        True,
+        _first_cfg_value(cfg, "video_audio_normalize", "eval.video_audio_normalize"),
+    )
+    _set_arg_if_default(
+        args,
+        "video_audio_max_gain",
+        200.0,
+        _first_cfg_value(cfg, "video_audio_max_gain", "eval.video_audio_max_gain"),
+    )
+
+    if args.disable_content_scenes is False:
+        disable_content = _first_cfg_value(cfg, "disable_content_scenes", "dataset.disable_content_scenes")
+        if isinstance(disable_content, bool):
+            args.disable_content_scenes = disable_content
+
+    _set_arg_if_default(
+        args,
+        "exp_name",
+        DEFAULT_EXP_NAME,
+        _first_cfg_value(cfg, "exp_name", "eval.exp_name"),
+    )
+    _set_arg_if_default(
+        args,
+        "output_parent_dir",
+        DEFAULT_OUTPUT_PARENT_DIR,
+        _first_cfg_value(cfg, "output_parent_dir", "eval.output_parent_dir"),
+    )
+
+    if args.episode_log is None:
+        episode_log = _first_cfg_value(cfg, "episode_log", "eval.episode_log")
+        if isinstance(episode_log, str) and episode_log.strip():
+            args.episode_log = episode_log
+
+    if args.mean_log is None:
+        mean_log = _first_cfg_value(cfg, "mean_log", "eval.mean_log")
+        if isinstance(mean_log, str) and mean_log.strip():
+            args.mean_log = mean_log
+
+    if args.prompt_image_dir is None:
+        prompt_image_dir = _first_cfg_value(cfg, "prompt_image_dir", "eval.prompt_image_dir")
+        if isinstance(prompt_image_dir, str) and prompt_image_dir.strip():
+            args.prompt_image_dir = prompt_image_dir
+
+    print(f"Loaded eval config: {eval_config_path}")
+    return args
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Evaluate Full Modal Lifelong Semantic Audio task with pluggable policies.",
+    )
+    parser.add_argument(
+        "--eval-config",
+        type=str,
+        default=None,
+        help="Optional eval config file (.yaml/.yml/.json), goat-bench style supported.",
+    )
+    parser.add_argument(
+        "--exp-config",
+        type=str,
+        default=DEFAULT_CONFIG,
+        help="Task config path.",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help="Path to dataset .json.gz.",
+    )
+    parser.add_argument(
+        "--task-type",
+        type=str,
+        default=DEFAULT_TASK_TYPE,
+        help="Habitat TASK.TYPE to evaluate.",
+    )
+    parser.add_argument(
+        "--goal-order-mode",
+        type=str,
+        default=None,
+        choices=["ordered", "unordered"],
+        help="Override TASK.GOAL_ORDER_MODE.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="val",
+        help="Override DATASET.SPLIT.",
+    )
+    parser.add_argument(
+        "--scenes-dir",
+        type=str,
+        default=None,
+        help="Override DATASET.SCENES_DIR.",
+    )
+    parser.add_argument(
+        "--scene-dataset-config",
+        type=str,
+        default=None,
+        help="Override SIMULATOR.SCENE_DATASET.",
+    )
+    parser.add_argument(
+        "--disable-content-scenes",
+        action="store_true",
+        help="Disable per-scene content loading.",
+    )
+    parser.add_argument(
+        "--scene",
+        type=str,
+        default=None,
+        help="Optional scene filter by scene basename or parent dir.",
+    )
+    parser.add_argument(
+        "--num-episodes",
+        type=int,
+        default=None,
+        help="Number of episodes to evaluate (default: all).",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=500,
+        help="Step cap per episode.",
+    )
+    parser.add_argument(
+        "--policy",
+        type=str,
+        default="distance_submit",
+        help=(
+            "Policy name from registry or '<module>:<Class>'. "
+            f"Built-ins: {', '.join(list_lifelong_eval_policies())}"
+        ),
+    )
+    parser.add_argument(
+        "--policy-kwargs",
+        type=str,
+        default="{}",
+        help="JSON dict passed to policy constructor.",
+    )
+    parser.add_argument(
+        "--submit-action-name",
+        type=str,
+        default="LIFELONG_SUBMIT",
+        help="Action name used for submit.",
+    )
+    parser.add_argument(
+        "--distance-submit-threshold",
+        type=float,
+        default=1.0,
+        help="Used by built-in distance_submit policy.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Global random seed.",
+    )
+    parser.add_argument(
+        "--print-every",
+        type=int,
+        default=1,
+        help="Print every N episodes.",
+    )
+    parser.add_argument(
+        "--episode-log",
+        type=str,
+        default=None,
+        help="Optional jsonl file for per-episode output.",
+    )
+    parser.add_argument(
+        "--mean-log",
+        type=str,
+        default=None,
+        help="Optional json file for final mean metrics.",
+    )
+    parser.add_argument(
+        "--exp-name",
+        type=str,
+        default=DEFAULT_EXP_NAME,
+        help="Experiment name used in default log directory naming.",
+    )
+    parser.add_argument(
+        "--output-parent-dir",
+        type=str,
+        default=DEFAULT_OUTPUT_PARENT_DIR,
+        help="Parent directory for default log outputs.",
+    )
+    parser.add_argument(
+        "--video",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Save evaluation video per episode.",
+    )
+    parser.add_argument(
+        "--video-dir",
+        type=str,
+        default=None,
+        help="Directory for saved videos (default: <run_dir>/videos).",
+    )
+    parser.add_argument(
+        "--video-fps",
+        type=int,
+        default=None,
+        help="FPS for output videos (default: 1 / STEP_TIME).",
+    )
+    parser.add_argument(
+        "--video-audio",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Attach audiogoal waveform into saved video.",
+    )
+    parser.add_argument(
+        "--audio-active-threshold",
+        type=float,
+        default=1e-6,
+        help="Amplitude threshold used for audio activity diagnostics.",
+    )
+    parser.add_argument(
+        "--video-audio-normalize",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Normalize per-episode audiogoal before muxing into video.",
+    )
+    parser.add_argument(
+        "--video-audio-max-gain",
+        type=float,
+        default=200.0,
+        help="Max gain when normalizing audio for video export.",
+    )
+    parser.add_argument(
+        "--prompt-image-dir",
+        type=str,
+        default=None,
+        help="Optional directory for saved image-goal prompt references.",
+    )
+    return parser.parse_args()
+
+
+def build_config(args: argparse.Namespace) -> habitat.Config:
+    cfg = get_task_config(config_paths=[args.exp_config])
+    cfg.defrost()
+
+    cfg.DATASET.DATA_PATH = args.dataset_path
+    cfg.DATASET.SPLIT = args.split
+    if args.scenes_dir:
+        cfg.DATASET.SCENES_DIR = args.scenes_dir
+    if args.disable_content_scenes:
+        cfg.DATASET.CONTENT_SCENES = []
+
+    if args.scene_dataset_config:
+        cfg.SIMULATOR.SCENE_DATASET = args.scene_dataset_config
+
+    cfg.TASK.TYPE = args.task_type
+    if args.goal_order_mode is not None:
+        cfg.TASK.GOAL_ORDER_MODE = args.goal_order_mode
+    cfg.ENVIRONMENT.MAX_EPISODE_STEPS = int(args.max_steps)
+
+    # Ensure RGB+Depth are both enabled so video can include depth panel.
+    try:
+        default_agent_id = cfg.SIMULATOR.DEFAULT_AGENT_ID
+        agent_name = cfg.SIMULATOR.AGENTS[default_agent_id]
+        agent_cfg = getattr(cfg.SIMULATOR, agent_name)
+    except Exception:
+        agent_cfg = getattr(cfg.SIMULATOR, "AGENT_0")
+
+    agent_sensors = [str(sensor) for sensor in list(getattr(agent_cfg, "SENSORS", []))]
+    if "RGB_SENSOR" not in agent_sensors:
+        agent_sensors.append("RGB_SENSOR")
+    if "DEPTH_SENSOR" not in agent_sensors:
+        agent_sensors.append("DEPTH_SENSOR")
+    agent_cfg.SENSORS = agent_sensors
+
+    if hasattr(cfg.SIMULATOR, "RGB_SENSOR") and hasattr(cfg.SIMULATOR.RGB_SENSOR, "UUID"):
+        cfg.SIMULATOR.RGB_SENSOR.UUID = "rgb"
+    if hasattr(cfg.SIMULATOR, "DEPTH_SENSOR") and hasattr(cfg.SIMULATOR.DEPTH_SENSOR, "UUID"):
+        cfg.SIMULATOR.DEPTH_SENSOR.UUID = "depth"
+
+    if args.video_audio and "AUDIOGOAL_SENSOR" not in cfg.TASK.SENSORS:
+        cfg.TASK.SENSORS.append("AUDIOGOAL_SENSOR")
+    if hasattr(cfg.TASK, "AUDIOGOAL_SENSOR") and hasattr(cfg.TASK.AUDIOGOAL_SENSOR, "UUID"):
+        cfg.TASK.AUDIOGOAL_SENSOR.UUID = "audiogoal"
+
+    sensor_type_overrides = {
+        "AUDIOGOAL_SENSOR": "AudioGoalSensor",
+        "SPECTROGRAM_SENSOR": "SpectrogramSensor",
+        "CATEGORY": "Category",
+        "CATEGORY_BELIEF": "CategoryBelief",
+        "LOCATION_BELIEF": "LocationBelief",
+        "POSE_SENSOR": "PoseSensor",
+        "POINTGOAL_WITH_GPS_COMPASS_SENSOR": "PointGoalWithGPSCompassSensor",
+    }
+
+    normalized_sensors: List[str] = []
+    for sensor_name in list(cfg.TASK.SENSORS):
+        token = str(sensor_name)
+        if token not in normalized_sensors:
+            normalized_sensors.append(token)
+        if not hasattr(cfg.TASK, token):
+            cfg.TASK[token] = Config()
+        if hasattr(cfg.TASK[token], "TYPE") and str(getattr(cfg.TASK[token], "TYPE")):
+            continue
+        inferred_type = sensor_type_overrides.get(token)
+        if inferred_type is not None:
+            cfg.TASK[token].TYPE = inferred_type
+    cfg.TASK.SENSORS = normalized_sensors
+
+    if args.submit_action_name not in cfg.TASK.POSSIBLE_ACTIONS:
+        cfg.TASK.POSSIBLE_ACTIONS.append(args.submit_action_name)
+
+    if not hasattr(cfg.TASK, "ACTIONS"):
+        cfg.TASK.ACTIONS = Config()
+    if not hasattr(cfg.TASK.ACTIONS, args.submit_action_name):
+        cfg.TASK.ACTIONS[args.submit_action_name] = Config()
+    cfg.TASK.ACTIONS[args.submit_action_name].TYPE = "LifelongSubmitAction"
+
+    cfg.TASK.MEASUREMENTS = [
+        "DISTANCE_TO_GOAL",
+        "SUCCESS",
+        "SPL",
+        "SOFT_SPL",
+        "NUM_ACTION",
+        "LIFELONG_GOALS_FOUND",
+        "LIFELONG_GOAL_COMPLETION",
+    ]
+    if args.video:
+        cfg.TASK.MEASUREMENTS.extend(["TOP_DOWN_MAP", "COLLISIONS"])
+
+    if not hasattr(cfg.TASK, "LIFELONG_GOALS_FOUND"):
+        cfg.TASK.LIFELONG_GOALS_FOUND = Config()
+    cfg.TASK.LIFELONG_GOALS_FOUND.TYPE = "LifelongGoalsFound"
+
+    if not hasattr(cfg.TASK, "LIFELONG_GOAL_COMPLETION"):
+        cfg.TASK.LIFELONG_GOAL_COMPLETION = Config()
+    cfg.TASK.LIFELONG_GOAL_COMPLETION.TYPE = "LifelongGoalCompletion"
+
+    if not hasattr(cfg.TASK, "DISTANCE_TO_GOAL"):
+        cfg.TASK.DISTANCE_TO_GOAL = Config()
+    cfg.TASK.DISTANCE_TO_GOAL.TYPE = "OmniLongDistanceToGoal"
+
+    cfg.freeze()
+    return cfg
+
+
+def _scene_key(scene_id: str) -> str:
+    scene_base = os.path.basename(scene_id).split(".")[0]
+    scene_parent = os.path.basename(os.path.dirname(scene_id))
+    return scene_parent or scene_base
+
+
+def _prepare_episode_list(env: habitat.Env, args: argparse.Namespace) -> List[Any]:
+    episodes = list(env.episodes)
+    if args.scene:
+        episodes = [
+            ep
+            for ep in episodes
+            if _scene_key(ep.scene_id) == args.scene
+            or os.path.basename(ep.scene_id).split(".")[0] == args.scene
+        ]
+    episodes.sort(key=lambda ep: int(getattr(ep, "episode_id", 0)))
+    if args.num_episodes is not None and args.num_episodes >= 0:
+        episodes = episodes[: args.num_episodes]
+    return episodes
+
+
+def _build_policy(args: argparse.Namespace):
+    raw_kwargs = _safe_json_load(args.policy_kwargs, fallback={})
+    if not isinstance(raw_kwargs, dict):
+        raw_kwargs = {}
+
+    policy_kwargs: Dict[str, Any] = dict(raw_kwargs)
+    policy_kwargs.setdefault("seed", int(args.seed))
+    policy_kwargs.setdefault("submit_action_name", str(args.submit_action_name))
+    if str(args.policy).strip().lower() == "distance_submit":
+        policy_kwargs.setdefault("submit_distance", float(args.distance_submit_threshold))
+
+    return build_lifelong_eval_policy(args.policy, **policy_kwargs)
+
+

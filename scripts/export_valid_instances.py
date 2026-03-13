@@ -7,7 +7,10 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
+import random
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,6 +37,19 @@ def _load_imagenav_module() -> Any:
     )
     if spec is None or spec.loader is None:
         raise RuntimeError("Failed to load generate_imagenav_eval_dataset.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_description_module() -> Any:
+    module_path = Path(__file__).with_name("generate_instance_descriptions_qwen.py")
+    spec = importlib.util.spec_from_file_location(
+        "generate_instance_descriptions_qwen", module_path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Failed to load generate_instance_descriptions_qwen.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -124,6 +140,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=512, help="Sensor height")
     parser.add_argument("--hfov", type=float, default=90.0, help="Sensor HFOV")
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=2026,
+        help="Random seed for reproducible rendering candidates",
+    )
+    parser.add_argument(
         "--horizontal-only-rotation",
         default=True,
         action=argparse.BooleanOptionalAction,
@@ -131,9 +153,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--save-images",
-        default=False,
+        default=True,
         action=argparse.BooleanOptionalAction,
-        help="Save rendered RGB/YOLO images (default: no)",
+        help="Save rendered RGB/YOLO images (default: yes)",
     )
     parser.add_argument(
         "--yolo-model",
@@ -206,6 +228,66 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Include rejected instances with reasons",
     )
+    parser.add_argument(
+        "--generate-descriptions",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Generate English descriptions for instances with rendered images using VLM (default: yes).",
+    )
+    parser.add_argument(
+        "--description-api-key",
+        type=str,
+        default="sk-QgWdM03NkfNrFfMA576126F43fAa4b0eBb635d80C6D2Cc91",
+        help="VLM API key. If omitted, uses DASHSCOPE_API_KEY/QWEN_API_KEY/OPENAI_API_KEY.",
+    )
+    parser.add_argument(
+        "--description-api-base",
+        type=str,
+        default="https://api.vveai.com/v1",
+        help="OpenAI-compatible API base URL for description model.",
+    )
+    parser.add_argument(
+        "--description-model",
+        type=str,
+        default="qwen3-vl-plus",
+        help="VLM model name for description generation.",
+    )
+    parser.add_argument(
+        "--description-max-images",
+        type=int,
+        default=3,
+        help="Maximum number of views per instance sent to VLM.",
+    )
+    parser.add_argument(
+        "--description-retries",
+        type=int,
+        default=2,
+        help="Retry count when VLM output fails constraints.",
+    )
+    parser.add_argument(
+        "--description-timeout",
+        type=int,
+        default=120,
+        help="HTTP timeout (seconds) for VLM requests.",
+    )
+    parser.add_argument(
+        "--description-sleep",
+        type=float,
+        default=0.2,
+        help="Sleep seconds between VLM calls.",
+    )
+    parser.add_argument(
+        "--description-overwrite",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Overwrite existing description if present.",
+    )
+    parser.add_argument(
+        "--description-max-instances",
+        type=int,
+        default=None,
+        help="Optional cap for number of instances to generate descriptions for.",
+    )
     return parser.parse_args()
 
 
@@ -230,6 +312,7 @@ def _build_imagenav_args(
         width=args.width,
         height=args.height,
         hfov=args.hfov,
+        seed=int(args.seed),
         horizontal_only_rotation=args.horizontal_only_rotation,
         sensor_height=args.sensor_height,
         search_radius=1.0,
@@ -309,10 +392,162 @@ def _write_render_metadata(
     return object_views_json, invalid_views_json
 
 
+def _generate_descriptions_for_valid_instances(
+    valid_instances: Dict[str, Dict[str, Dict[str, Any]]],
+    *,
+    description_module: Any,
+    output_json_path: Path,
+    output_root: Path,
+    api_base: str,
+    api_key: str,
+    model: str,
+    max_images: int,
+    retries: int,
+    timeout: int,
+    sleep_seconds: float,
+    overwrite: bool,
+    max_instances: Optional[int],
+) -> Dict[str, Any]:
+    flat_instances: List[Tuple[str, str, Dict[str, Any]]] = []
+    for category, entries in valid_instances.items():
+        if not isinstance(entries, dict):
+            continue
+        for instance_key, instance_payload in entries.items():
+            if isinstance(instance_payload, dict):
+                flat_instances.append((category, str(instance_key), instance_payload))
+
+    flat_instances.sort(key=lambda item: (item[0], item[1]))
+    if isinstance(max_instances, int) and max_instances > 0:
+        flat_instances = flat_instances[:max_instances]
+
+    total = len(flat_instances)
+    stats: Dict[str, Any] = {
+        "enabled": True,
+        "model": model,
+        "api_base": api_base,
+        "processed": total,
+        "updated": 0,
+        "skipped_no_image": 0,
+        "skipped_existing": 0,
+        "failed": 0,
+    }
+
+    if total == 0:
+        return stats
+
+    print(
+        "Generating descriptions with {} for {} instances...".format(model, total)
+    )
+
+    for idx, (_, instance_key, instance_payload) in enumerate(flat_instances, start=1):
+        image_payload = instance_payload.get("image")
+        render_views = (
+            image_payload.get("render_views")
+            if isinstance(image_payload, dict)
+            else None
+        )
+        if not isinstance(render_views, list) or len(render_views) == 0:
+            stats["skipped_no_image"] += 1
+            continue
+
+        existing_description = instance_payload.get("description")
+        if (
+            not overwrite
+            and isinstance(existing_description, str)
+            and existing_description.strip()
+        ):
+            stats["skipped_existing"] += 1
+            continue
+
+        candidates = description_module._resolve_instance_image_candidates(
+            input_path=output_json_path,
+            output_root=output_root,
+            instance_key=instance_key,
+            max_images=max(1, int(max_images)),
+        )
+
+        if len(candidates) == 0:
+            instance_payload["description_meta"] = {
+                "status": "missing_images",
+                "model": model,
+            }
+            stats["failed"] += 1
+            print("[{}/{}] {}: missing image files".format(idx, total, instance_key))
+            continue
+
+        category_name = str(instance_payload.get("category", "object")).strip() or "object"
+        image_paths = [item[0] for item in candidates]
+        rel_paths = [item[1] for item in candidates]
+
+        try:
+            description, status = description_module._generate_description(
+                api_base=api_base,
+                api_key=api_key,
+                model=model,
+                category=category_name,
+                image_paths=image_paths,
+                timeout=max(1, int(timeout)),
+                retries=max(1, int(retries)),
+            )
+        except Exception as exc:
+            instance_payload["description_meta"] = {
+                "status": "api_error",
+                "model": model,
+                "error": str(exc),
+                "source_images": rel_paths,
+            }
+            stats["failed"] += 1
+            print("[{}/{}] {}: api_error {}".format(idx, total, instance_key, exc))
+            if sleep_seconds > 0:
+                time.sleep(float(sleep_seconds))
+            continue
+
+        if description is None:
+            instance_payload["description_meta"] = {
+                "status": status,
+                "model": model,
+                "source_images": rel_paths,
+            }
+            stats["failed"] += 1
+            print("[{}/{}] {}: invalid ({})".format(idx, total, instance_key, status))
+            if sleep_seconds > 0:
+                time.sleep(float(sleep_seconds))
+            continue
+
+        instance_payload["description"] = description
+        modalities = instance_payload.get("modalities")
+        if isinstance(modalities, list):
+            if "description" not in modalities:
+                modalities.append("description")
+        else:
+            instance_payload["modalities"] = ["description"]
+
+        instance_payload["description_meta"] = {
+            "status": "ok",
+            "model": model,
+            "word_count": description_module._word_count(description),
+            "source_images": rel_paths,
+            "num_source_views": len(rel_paths),
+        }
+        stats["updated"] += 1
+        print("[{}/{}] {}: {}".format(idx, total, instance_key, description))
+
+        if sleep_seconds > 0:
+            time.sleep(float(sleep_seconds))
+
+    return stats
+
+
 def main() -> None:
     args = parse_args()
+    random.seed(int(args.seed))
+    np.random.seed(int(args.seed))
     module = _load_multimodal_module()
     imagenav_module = _load_imagenav_module()
+
+    if args.generate_descriptions and not args.save_images:
+        print("Description generation enabled; forcing --save-images.")
+        args.save_images = True
 
     scene_dir = args.scene_dir.expanduser().resolve()
     scene_path = module._resolve_scene_path(scene_dir, args.scene_name)
@@ -468,6 +703,37 @@ def main() -> None:
         if image_scanner is not None:
             image_scanner.close()
 
+    description_summary: Optional[Dict[str, Any]] = None
+    if args.generate_descriptions:
+        description_module = _load_description_module()
+        description_api_key = (
+            args.description_api_key
+            or os.environ.get("DASHSCOPE_API_KEY")
+            or os.environ.get("QWEN_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+        )
+        if not description_api_key:
+            raise RuntimeError(
+                "Description generation enabled but API key is missing. "
+                "Provide --description-api-key or set DASHSCOPE_API_KEY/QWEN_API_KEY/OPENAI_API_KEY."
+            )
+
+        description_summary = _generate_descriptions_for_valid_instances(
+            valid_instances,
+            description_module=description_module,
+            output_json_path=output_path,
+            output_root=output_root,
+            api_base=str(args.description_api_base),
+            api_key=str(description_api_key),
+            model=str(args.description_model),
+            max_images=int(args.description_max_images),
+            retries=int(args.description_retries),
+            timeout=int(args.description_timeout),
+            sleep_seconds=float(args.description_sleep),
+            overwrite=bool(args.description_overwrite),
+            max_instances=args.description_max_instances,
+        )
+
     category_counts: Dict[str, int] = {
         category: len(entries) for category, entries in valid_instances.items()
     }
@@ -492,6 +758,9 @@ def main() -> None:
         ],
         "instances": valid_instances,
     }
+
+    if description_summary is not None:
+        payload["description_generation"] = description_summary
 
     if args.include_rejections:
         payload["footprint_rejections"] = [

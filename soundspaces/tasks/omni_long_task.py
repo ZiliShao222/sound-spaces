@@ -164,6 +164,9 @@ class OmniLongNavigationTask(NavigationTask):
         self._completed_goal_indices: List[int] = []
         self._current_goal_index: Optional[int] = None
         self._current_task_token: Optional[List[str]] = None
+        self._submit_count: int = 0
+        self._submit_limit: int = max(0, int(len(self._all_goals)) - 1)
+        self._submit_rejected_count: int = 0
 
         if self._all_goals:
             if self._mode == "ordered":
@@ -186,6 +189,22 @@ class OmniLongNavigationTask(NavigationTask):
     def current_task_token(self) -> Optional[List[str]]:
         return self._current_task_token
 
+    @property
+    def submit_count(self) -> int:
+        return int(self._submit_count)
+
+    @property
+    def submit_limit(self) -> int:
+        return int(self._submit_limit)
+
+    @property
+    def submit_rejected_count(self) -> int:
+        return int(self._submit_rejected_count)
+
+    @property
+    def remaining_submit_quota(self) -> int:
+        return int(max(0, self._submit_limit - self._submit_count))
+
     def _check_episode_is_active(
         self,
         *args: Any,
@@ -198,6 +217,10 @@ class OmniLongNavigationTask(NavigationTask):
             return False
         if getattr(self, "is_submit_called", False):
             self.is_submit_called = False  # type: ignore
+            if self._submit_count >= self._submit_limit:
+                self._submit_rejected_count += 1
+                return True
+            self._submit_count += 1
             return self._handle_submit(episode)
         return True
 
@@ -243,6 +266,29 @@ class OmniLongNavigationTask(NavigationTask):
         else:
             targets = [goal.position]
         return self._sim.geodesic_distance(current_position, targets, episode)
+
+    def _distance_to_goal_by_mode(self, episode: Episode) -> Optional[float]:
+        if not self._all_goals:
+            return 0.0
+
+        if self._mode == "ordered":
+            submit_count = int(getattr(self, "submit_count", 0))
+            goal_index = min(max(0, submit_count), len(self._all_goals) - 1)
+            goal = self._all_goals[goal_index]
+            return self._distance_to_goal(goal, episode)
+
+        if not self._remaining_goal_indices:
+            return 0.0
+
+        best_distance: Optional[float] = None
+        for goal_index in sorted(self._remaining_goal_indices):
+            goal = self._all_goals[goal_index]
+            distance = self._distance_to_goal(goal, episode)
+            if distance is None:
+                continue
+            if best_distance is None or float(distance) < float(best_distance):
+                best_distance = float(distance)
+        return best_distance
 
     def _match_submitted_unordered_goal(
         self,
@@ -323,6 +369,40 @@ class OmniLongNavigationTask(NavigationTask):
                 self._sim.set_active_goal(goal.position, sound_id=sound_id)
             except Exception:
                 pass
+
+
+@registry.register_measure
+class OmniLongDistanceToGoal(Measure):
+    cls_uuid: str = "distance_to_goal"
+
+    def __init__(self, *args: Any, sim: Simulator, config: Config, **kwargs: Any):
+        self._sim = sim
+        self._config = config
+        super().__init__()
+
+    def _get_uuid(self, *args: Any, **kwargs: Any):
+        return self.cls_uuid
+
+    def reset_metric(self, *args: Any, episode, task: EmbodiedTask, **kwargs: Any):
+        self.update_metric(episode=episode, task=task)
+
+    def update_metric(self, *args: Any, episode, task: EmbodiedTask, **kwargs: Any):
+        if hasattr(task, "_distance_to_goal_by_mode"):
+            distance = task._distance_to_goal_by_mode(episode)
+            self._metric = float(distance) if distance is not None else float("inf")
+            return
+
+        goals = getattr(episode, "goals", ())
+        if not goals:
+            self._metric = 0.0
+            return
+
+        current_position = self._sim.get_agent_state().position
+        self._metric = self._sim.geodesic_distance(
+            current_position,
+            [goals[0].position],
+            episode,
+        )
 
 
 @registry.register_measure
