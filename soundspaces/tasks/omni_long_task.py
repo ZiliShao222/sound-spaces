@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional, Sequence, Set, Type
+from typing import Any, Dict, List, Optional, Sequence, Type
 
 import attr
+import numpy as np
 
 from habitat.config import Config
 from habitat.core.dataset import Episode
@@ -24,38 +25,97 @@ def _optional_float(value: Any) -> Optional[float]:
 
 
 def _normalize_order_mode(value: Any) -> str:
-    mode = str(value or "ordered").strip().lower()
-    if mode not in {"ordered", "unordered"}:
+    if isinstance(value, bool):
+        return "ordered" if value else "unordered"
+
+    if value is None:
         return "ordered"
-    return mode
+
+    mode = str(value).strip().lower()
+    if mode in {"ordered", "order", "true", "1", "yes", "y"}:
+        return "ordered"
+    if mode in {"unordered", "unorder", "false", "0", "no", "n"}:
+        return "unordered"
+    return "ordered"
 
 
-def _normalize_task_specs(raw_tasks: Any, goal_count: int) -> List[List[str]]:
-    specs: List[List[str]] = []
-    if isinstance(raw_tasks, list):
-        for idx, item in enumerate(raw_tasks):
-            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                specs.append([str(item[0]), str(item[1])])
-                continue
-            if isinstance(item, dict):
-                instance_key = item.get("instance_key", item.get("goal", idx))
-                modality = item.get("modality", "object")
-                specs.append([str(instance_key), str(modality)])
-                continue
-            specs.append([str(idx), "object"])
+def _optional_order_mode(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return _normalize_order_mode(value)
 
-    if goal_count <= 0:
-        return specs
 
-    while len(specs) < goal_count:
-        specs.append([str(len(specs)), "object"])
-    return specs[:goal_count]
+def _resolve_goal_order_mode(
+    episode: Episode,
+    task: Optional[EmbodiedTask] = None,
+    default: Optional[str] = None,
+) -> str:
+    episode_mode = getattr(episode, "goal_order_mode", None)
+    if episode_mode is not None:
+        return _normalize_order_mode(episode_mode)
+
+    if task is not None:
+        task_config = getattr(task, "_config", None)
+        config_mode = getattr(task_config, "GOAL_ORDER_MODE", None)
+        if config_mode is not None:
+            return _normalize_order_mode(config_mode)
+
+        task_mode = getattr(task, "_mode", None)
+        if task_mode is not None:
+            return _normalize_order_mode(task_mode)
+
+    if default is not None:
+        return _normalize_order_mode(default)
+    return "ordered"
 
 
 def _goal_success_distance(task_config: Config) -> float:
     success_cfg = getattr(task_config, "SUCCESS", None)
     value = getattr(success_cfg, "SUCCESS_DISTANCE", 1.0)
     return float(value)
+
+
+def _episode_reference_distance(episode: Episode, task: EmbodiedTask) -> float:
+    mode = _resolve_goal_order_mode(episode, task=task)
+    if mode == "unordered":
+        distance = getattr(episode, "unordered_total_geodesic_distance", None)
+    else:
+        distance = getattr(episode, "ordered_total_geodesic_distance", None)
+
+    try:
+        distance_value = float(distance)
+    except Exception:
+        distance_value = 0.0
+
+    if distance_value > 1e-6:
+        return distance_value
+
+    info = getattr(episode, "info", None)
+    if isinstance(info, dict):
+        try:
+            fallback = float(info.get("geodesic_distance", 0.0))
+        except Exception:
+            fallback = 0.0
+        if fallback > 1e-6:
+            return fallback
+
+    return 1e-6
+
+
+def _task_goal_completion(task: EmbodiedTask) -> float:
+    goal_states = tuple(getattr(task, "_goals_map", {}).values())
+    total = int(len(goal_states))
+    if total <= 0:
+        return 0.0
+    found = sum(1 for goal_state in goal_states if bool(goal_state.get("found", False)))
+    return float(found) / float(total)
+
+
+def _task_strict_success(task: EmbodiedTask) -> float:
+    goal_states = tuple(getattr(task, "_goals_map", {}).values())
+    if not goal_states:
+        return 1.0
+    return 1.0 if all(bool(goal_state.get("found", False)) for goal_state in goal_states) else 0.0
 
 
 @attr.s(auto_attribs=True, kw_only=True)
@@ -76,7 +136,7 @@ class OmniLongEpisode(NavigationEpisode):
         converter=lambda x: int(x) if x is not None else None,
     )
     tasks: Optional[List[List[str]]] = None
-    goal_order_mode: str = attr.ib(default="ordered", converter=_normalize_order_mode)
+    goal_order_mode: Optional[str] = attr.ib(default=None, converter=_optional_order_mode)
     ordered_total_geodesic_distance: Optional[float] = attr.ib(
         default=None,
         converter=_optional_float,
@@ -153,41 +213,32 @@ class OmniLongNavigationTask(NavigationTask):
 
     def reset(self, episode: Episode):
         self._all_goals: List[SemanticAudioGoal] = list(getattr(episode, "goals", []) or [])
-        self._task_specs: List[List[str]] = _normalize_task_specs(
-            getattr(episode, "tasks", None),
-            len(self._all_goals),
-        )
-        self._mode = _normalize_order_mode(
-            getattr(episode, "goal_order_mode", getattr(self._config, "GOAL_ORDER_MODE", "ordered"))
-        )
-        self._remaining_goal_indices: Set[int] = set(range(len(self._all_goals)))
-        self._completed_goal_indices: List[int] = []
-        self._current_goal_index: Optional[int] = None
-        self._current_task_token: Optional[List[str]] = None
+        self._mode = _resolve_goal_order_mode(episode, task=self)
         self._submit_count: int = 0
         self._submit_limit: int = max(0, int(len(self._all_goals)) - 1)
-        self._submit_rejected_count: int = 0
-
-        if self._all_goals:
-            if self._mode == "ordered":
-                self._set_active_goal_index(episode, 0, apply_to_sim=False)
-            else:
-                start_idx = self._select_unordered_active_index(episode)
-                self._set_active_goal_index(episode, start_idx, apply_to_sim=False)
+        self._goals_map = self._build_goals_map(getattr(episode, "tasks", None))
+        self._refresh_episode_goals(episode, apply_to_sim=False)
 
         return super().reset(episode)
 
     @property
-    def completed_goal_indices(self) -> Sequence[int]:
-        return tuple(self._completed_goal_indices)
+    def all_goals(self) -> Sequence[SemanticAudioGoal]:
+        return tuple(self._all_goals)
 
     @property
-    def remaining_goal_indices(self) -> Sequence[int]:
-        return tuple(sorted(self._remaining_goal_indices))
+    def goal_state_map(self) -> Dict[str, Dict[str, Any]]:
+        return {
+            goal_key: {
+                "goal_index": int(goal_state["goal_index"]),
+                "descriptor": goal_state["descriptor"],
+                "found": bool(goal_state["found"]),
+            }
+            for goal_key, goal_state in self._goals_map.items()
+        }
 
     @property
-    def current_task_token(self) -> Optional[List[str]]:
-        return self._current_task_token
+    def order_enforced(self) -> bool:
+        return bool(self._mode == "ordered")
 
     @property
     def submit_count(self) -> int:
@@ -196,14 +247,6 @@ class OmniLongNavigationTask(NavigationTask):
     @property
     def submit_limit(self) -> int:
         return int(self._submit_limit)
-
-    @property
-    def submit_rejected_count(self) -> int:
-        return int(self._submit_rejected_count)
-
-    @property
-    def remaining_submit_quota(self) -> int:
-        return int(max(0, self._submit_limit - self._submit_count))
 
     def _check_episode_is_active(
         self,
@@ -214,48 +257,32 @@ class OmniLongNavigationTask(NavigationTask):
         **kwargs: Any,
     ) -> bool:
         if getattr(self, "is_stop_called", False):
+            self.is_stop_called = False  # type: ignore
+            self._handle_stop(episode)
             return False
         if getattr(self, "is_submit_called", False):
             self.is_submit_called = False  # type: ignore
             if self._submit_count >= self._submit_limit:
-                self._submit_rejected_count += 1
-                return True
+                self._handle_stop(episode)
+                return False
             self._submit_count += 1
             return self._handle_submit(episode)
         return True
 
     def _handle_submit(self, episode: Episode) -> bool:
-        if not self._all_goals:
+        goal_state = self._match_goal_state(episode)
+        if goal_state is None:
             return True
-        if not self._remaining_goal_indices:
+        self._mark_goal_found(goal_state)
+        if all(bool(state["found"]) for state in self._goals_map.values()):
             return False
-
-        success_distance = _goal_success_distance(self._config)
-
-        if self._mode == "ordered":
-            goal_index = self._current_goal_index
-            if goal_index is None or goal_index not in self._remaining_goal_indices:
-                return bool(self._remaining_goal_indices)
-            current_goal = self._all_goals[goal_index]
-            distance = self._distance_to_goal(current_goal, episode)
-            if distance is None or float(distance) >= success_distance:
-                return True
-            self._mark_goal_completed(goal_index)
-            if not self._remaining_goal_indices:
-                return False
-            next_index = min(self._remaining_goal_indices)
-            self._set_active_goal_index(episode, next_index, apply_to_sim=True)
-            return True
-
-        goal_index = self._match_submitted_unordered_goal(episode, success_distance)
-        if goal_index is None:
-            return True
-        self._mark_goal_completed(goal_index)
-        if not self._remaining_goal_indices:
-            return False
-        next_index = self._select_unordered_active_index(episode)
-        self._set_active_goal_index(episode, next_index, apply_to_sim=True)
+        self._refresh_episode_goals(episode, apply_to_sim=True)
         return True
+
+    def _handle_stop(self, episode: Episode) -> None:
+        goal_state = self._match_goal_state(episode)
+        if goal_state is not None:
+            self._mark_goal_found(goal_state)
 
     def _distance_to_goal(self, goal: SemanticAudioGoal, episode: Episode) -> Optional[float]:
         current_position = self._sim.get_agent_state().position
@@ -272,80 +299,98 @@ class OmniLongNavigationTask(NavigationTask):
             return 0.0
 
         if self._mode == "ordered":
-            submit_count = int(getattr(self, "submit_count", 0))
-            goal_index = min(max(0, submit_count), len(self._all_goals) - 1)
-            goal = self._all_goals[goal_index]
-            return self._distance_to_goal(goal, episode)
+            active_goal_state = self._ordered_active_goal_state()
+            if active_goal_state is None:
+                return 0.0
+            return self._distance_to_goal(active_goal_state["goal"], episode)
 
-        if not self._remaining_goal_indices:
+        if all(bool(goal_state["found"]) for goal_state in self._goals_map.values()):
             return 0.0
 
         best_distance: Optional[float] = None
-        for goal_index in sorted(self._remaining_goal_indices):
-            goal = self._all_goals[goal_index]
-            distance = self._distance_to_goal(goal, episode)
+        for goal_state in self._iter_unfound_goal_states():
+            distance = self._distance_to_goal(goal_state["goal"], episode)
             if distance is None:
                 continue
             if best_distance is None or float(distance) < float(best_distance):
                 best_distance = float(distance)
         return best_distance
 
-    def _match_submitted_unordered_goal(
-        self,
-        episode: Episode,
-        success_distance: float,
-    ) -> Optional[int]:
-        winner_index: Optional[int] = None
+    def _build_goals_map(self, raw_tasks: Any) -> Dict[str, Dict[str, Any]]:
+        goals_map: Dict[str, Dict[str, Any]] = {}
+        for goal_index, goal in enumerate(self._all_goals):
+            descriptor: Any = int(goal_index)
+            if isinstance(raw_tasks, list) and goal_index < len(raw_tasks):
+                raw_goal = raw_tasks[goal_index]
+                if isinstance(raw_goal, (list, tuple)) and len(raw_goal) >= 2:
+                    descriptor = (str(raw_goal[0]), str(raw_goal[1]))
+                elif isinstance(raw_goal, dict):
+                    descriptor = (
+                        str(raw_goal.get("instance_key", raw_goal.get("goal", goal_index))),
+                        str(raw_goal.get("modality", "object")),
+                    )
+
+            goal_key = "goal_{:03d}".format(int(goal_index))
+            goals_map[goal_key] = {
+                "goal_index": int(goal_index),
+                "goal": goal,
+                "descriptor": descriptor,
+                "found": False,
+            }
+        return goals_map
+
+    def _iter_unfound_goal_states(self):
+        for goal_state in self._goals_map.values():
+            if not bool(goal_state["found"]):
+                yield goal_state
+
+    def _ordered_active_goal_state(self):
+        for goal_state in self._iter_unfound_goal_states():
+            return goal_state
+        return None
+
+    def _match_goal_state(self, episode: Episode):
+        if not self._goals_map:
+            return None
+
+        success_distance = _goal_success_distance(self._config)
+        if self._mode == "ordered":
+            active_goal_state = self._ordered_active_goal_state()
+            if active_goal_state is None:
+                return None
+            distance = self._distance_to_goal(active_goal_state["goal"], episode)
+            if distance is None or float(distance) >= success_distance:
+                return None
+            return active_goal_state
+
+        winner_state = None
         winner_distance: Optional[float] = None
-        for goal_index in sorted(self._remaining_goal_indices):
-            goal = self._all_goals[goal_index]
-            distance = self._distance_to_goal(goal, episode)
+        for goal_state in self._iter_unfound_goal_states():
+            distance = self._distance_to_goal(goal_state["goal"], episode)
             if distance is None:
                 continue
             if float(distance) >= success_distance:
                 continue
             if winner_distance is None or float(distance) < winner_distance:
                 winner_distance = float(distance)
-                winner_index = goal_index
-        return winner_index
+                winner_state = goal_state
+        return winner_state
 
-    def _select_unordered_active_index(self, episode: Episode) -> Optional[int]:
-        if not self._remaining_goal_indices:
-            return None
-        current_position = self._sim.get_agent_state().position
-        best_index: Optional[int] = None
-        best_distance: Optional[float] = None
-        for goal_index in sorted(self._remaining_goal_indices):
-            goal = self._all_goals[goal_index]
-            distance = self._sim.geodesic_distance(current_position, [goal.position], episode)
-            if best_distance is None or float(distance) < best_distance:
-                best_distance = float(distance)
-                best_index = goal_index
-        return best_index
+    def _mark_goal_found(self, goal_state: Dict[str, Any]) -> None:
+        goal_state["found"] = True
 
-    def _mark_goal_completed(self, goal_index: int) -> None:
-        if goal_index in self._remaining_goal_indices:
-            self._remaining_goal_indices.remove(goal_index)
-        if goal_index not in self._completed_goal_indices:
-            self._completed_goal_indices.append(goal_index)
-
-    def _set_active_goal_index(
-        self,
-        episode: Episode,
-        goal_index: Optional[int],
-        apply_to_sim: bool,
-    ) -> None:
-        self._current_goal_index = goal_index
-        if goal_index is None:
-            self._current_task_token = None
+    def _refresh_episode_goals(self, episode: Episode, apply_to_sim: bool) -> None:
+        if self._mode != "ordered":
+            episode.goals = list(self._all_goals)
             return
 
-        episode.goals = [self._all_goals[goal_index]]
-        if goal_index < len(self._task_specs):
-            self._current_task_token = list(self._task_specs[goal_index])
-        else:
-            self._current_task_token = [str(goal_index), "object"]
+        active_goal_state = self._ordered_active_goal_state()
+        if active_goal_state is None:
+            episode.goals = list(self._all_goals)
+            return
 
+        goal_index = int(active_goal_state["goal_index"])
+        episode.goals = [active_goal_state["goal"]]
         if apply_to_sim:
             self._apply_goal_to_sim(episode, goal_index)
 
@@ -372,40 +417,6 @@ class OmniLongNavigationTask(NavigationTask):
 
 
 @registry.register_measure
-class OmniLongDistanceToGoal(Measure):
-    cls_uuid: str = "distance_to_goal"
-
-    def __init__(self, *args: Any, sim: Simulator, config: Config, **kwargs: Any):
-        self._sim = sim
-        self._config = config
-        super().__init__()
-
-    def _get_uuid(self, *args: Any, **kwargs: Any):
-        return self.cls_uuid
-
-    def reset_metric(self, *args: Any, episode, task: EmbodiedTask, **kwargs: Any):
-        self.update_metric(episode=episode, task=task)
-
-    def update_metric(self, *args: Any, episode, task: EmbodiedTask, **kwargs: Any):
-        if hasattr(task, "_distance_to_goal_by_mode"):
-            distance = task._distance_to_goal_by_mode(episode)
-            self._metric = float(distance) if distance is not None else float("inf")
-            return
-
-        goals = getattr(episode, "goals", ())
-        if not goals:
-            self._metric = 0.0
-            return
-
-        current_position = self._sim.get_agent_state().position
-        self._metric = self._sim.geodesic_distance(
-            current_position,
-            [goals[0].position],
-            episode,
-        )
-
-
-@registry.register_measure
 class LifelongGoalsFound(Measure):
     def __init__(self, *args: Any, sim: Simulator, config: Config, **kwargs: Any):
         self._sim = sim
@@ -419,8 +430,10 @@ class LifelongGoalsFound(Measure):
         self.update_metric(episode=episode, task=task)
 
     def update_metric(self, *args: Any, episode, task: EmbodiedTask, **kwargs: Any):
-        done = getattr(task, "completed_goal_indices", ())
-        self._metric = int(len(done))
+        goal_states = tuple(getattr(task, "_goals_map", {}).values())
+        self._metric = int(
+            sum(1 for goal_state in goal_states if bool(goal_state.get("found", False)))
+        )
 
 
 @registry.register_measure
@@ -437,13 +450,7 @@ class LifelongGoalCompletion(Measure):
         self.update_metric(episode=episode, task=task)
 
     def update_metric(self, *args: Any, episode, task: EmbodiedTask, **kwargs: Any):
-        done = getattr(task, "completed_goal_indices", ())
-        all_goals = getattr(task, "_all_goals", ())
-        total = int(len(all_goals))
-        if total <= 0:
-            self._metric = 0.0
-            return
-        self._metric = float(len(done)) / float(total)
+        self._metric = _task_goal_completion(task)
 
 
 @registry.register_measure
@@ -460,8 +467,72 @@ class LifelongTaskSuccess(Measure):
         self.update_metric(episode=episode, task=task)
 
     def update_metric(self, *args: Any, episode, task: EmbodiedTask, **kwargs: Any):
-        remaining = getattr(task, "remaining_goal_indices", ())
-        self._metric = 1.0 if len(remaining) == 0 else 0.0
+        self._metric = _task_strict_success(task)
+
+
+@registry.register_measure
+class OmniLongSuccess(Measure):
+    def __init__(self, *args: Any, sim: Simulator, config: Config, **kwargs: Any):
+        self._sim = sim
+        self._config = config
+        super().__init__()
+
+    def _get_uuid(self, *args: Any, **kwargs: Any):
+        return "success"
+
+    def reset_metric(self, *args: Any, episode, task: EmbodiedTask, **kwargs: Any):
+        self.update_metric(episode=episode, task=task)
+
+    def update_metric(self, *args: Any, episode, task: EmbodiedTask, **kwargs: Any):
+        self._metric = _task_goal_completion(task)
+
+
+@registry.register_measure
+class OmniLongSPL(Measure):
+    def __init__(self, *args: Any, sim: Simulator, config: Config, **kwargs: Any):
+        self._sim = sim
+        self._config = config
+        self._previous_position: Optional[np.ndarray] = None
+        self._agent_episode_distance: float = 0.0
+        self._reference_distance: float = 1e-6
+        super().__init__()
+
+    def _get_uuid(self, *args: Any, **kwargs: Any):
+        return "spl"
+
+    def reset_metric(self, *args: Any, episode, task: EmbodiedTask, **kwargs: Any):
+        self._previous_position = np.array(self._sim.get_agent_state().position, dtype=np.float32)
+        self._agent_episode_distance = 0.0
+        self._reference_distance = _episode_reference_distance(episode, task)
+        self.update_metric(episode=episode, task=task)
+
+    def _update_path_length(self) -> None:
+        current_position = np.array(self._sim.get_agent_state().position, dtype=np.float32)
+        if self._previous_position is not None:
+            self._agent_episode_distance += float(
+                np.linalg.norm(current_position - self._previous_position, ord=2)
+            )
+        self._previous_position = current_position
+
+    def _success_value(self, task: EmbodiedTask) -> float:
+        return _task_strict_success(task)
+
+    def update_metric(self, *args: Any, episode, task: EmbodiedTask, **kwargs: Any):
+        self._update_path_length()
+        success_value = self._success_value(task)
+        self._metric = float(success_value) * (
+            self._reference_distance
+            / max(self._reference_distance, float(self._agent_episode_distance))
+        )
+
+
+@registry.register_measure
+class OmniLongSoftSPL(OmniLongSPL):
+    def _get_uuid(self, *args: Any, **kwargs: Any):
+        return "softspl"
+
+    def _success_value(self, task: EmbodiedTask) -> float:
+        return _task_goal_completion(task)
 
 
 @registry.register_task_action

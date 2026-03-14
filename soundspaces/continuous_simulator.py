@@ -928,18 +928,28 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
         return True
 
     def geodesic_distance(self, position_a, position_bs, episode=None):
+        requested_ends = np.array(
+            [self._snap_to_navmesh(p) for p in position_bs]
+        )
         use_cache = (
             episode is not None
             and episode._shortest_path_cache is not None
             and len(position_bs) == 1
         )
-        if not use_cache:
-            path = habitat_sim.MultiGoalShortestPath()
-            path.requested_ends = np.array(
-                [self._snap_to_navmesh(p) for p in position_bs]
+        if use_cache:
+            cached_path = episode._shortest_path_cache
+            cached_ends = getattr(cached_path, "requested_ends", None)
+            use_cache = (
+                cached_ends is not None
+                and np.shape(cached_ends) == np.shape(requested_ends)
+                and np.allclose(cached_ends, requested_ends)
             )
-        else:
+
+        if use_cache:
             path = episode._shortest_path_cache
+        else:
+            path = habitat_sim.MultiGoalShortestPath()
+            path.requested_ends = requested_ends
 
         path.requested_start = self._snap_to_navmesh(position_a)
 

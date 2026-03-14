@@ -6,7 +6,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import habitat
 import numpy as np
@@ -16,18 +16,67 @@ from habitat.utils.visualizations.utils import images_to_video
 from ss_baselines.common.omni_long_eval_policy import build_lifelong_eval_context
 from ss_baselines.common.utils import observations_to_image, images_to_video_with_audio
 from soundspaces.tasks.omni_long_eval_utils import (
-    _build_goal_prompt,
+    _build_goal_input_payload,
     _build_policy,
+    _episode_goal_count,
+    _format_goal_input_summary,
+    _format_episode_metrics,
     _flatten_instances,
     _load_dataset_payload,
     _normalize_task_specs,
     _prepare_episode_list,
-    _save_prompt_image_if_needed,
-    _sound_id_for_goal,
+    _save_goal_input_image_if_needed,
+    _summarize_goal_input_payload,
     apply_eval_config,
     build_config,
     parse_args,
 )
+
+
+WEIGHTED_METRIC_NAMES = ("success", "spl", "softspl")
+RUNNING_MEAN_METRIC_NAMES = ("na",)
+
+
+def _spl_diagnostics(env: habitat.Env) -> Tuple[Optional[float], Optional[float]]:
+    task = getattr(env, "_task", None)
+    if task is None:
+        task = getattr(env, "task", None)
+
+    measurements = getattr(task, "measurements", None)
+    measures = getattr(measurements, "measures", None)
+    if not isinstance(measures, dict):
+        return None, None
+
+    spl_measure = measures.get("spl")
+    if spl_measure is None:
+        for measure in measures.values():
+            if hasattr(measure, "_agent_episode_distance") or hasattr(measure, "_reference_distance"):
+                spl_measure = measure
+                break
+    if spl_measure is None:
+        return None, None
+
+    agent_episode_distance_m: Optional[float] = None
+    reference_distance_m: Optional[float] = None
+    try:
+        agent_episode_distance_m = float(getattr(spl_measure, "_agent_episode_distance"))
+    except Exception:
+        pass
+    try:
+        reference_distance_m = float(getattr(spl_measure, "_reference_distance"))
+    except Exception:
+        pass
+    return agent_episode_distance_m, reference_distance_m
+
+
+def _is_submit_action(action: Any, submit_action_name: str) -> bool:
+    action_name = str(submit_action_name).strip().upper()
+    if isinstance(action, dict):
+        value = action.get("action")
+        return isinstance(value, str) and value.strip().upper() == action_name
+    if isinstance(action, str):
+        return action.strip().upper() == action_name
+    return False
 
 def main() -> None:
     args = parse_args()
@@ -39,15 +88,15 @@ def main() -> None:
         )
 
     cfg = build_config(args)
+    max_steps = int(cfg.ENVIRONMENT.MAX_EPISODE_STEPS)
+    dataset_payload = _load_dataset_payload(str(args.dataset_path))
+    instance_index = _flatten_instances(dataset_payload.get("instances", {}))
 
     print("dataset_path_in_use={}".format(cfg.DATASET.DATA_PATH))
     print("task_type_in_use={}".format(cfg.TASK.TYPE))
     if hasattr(cfg.TASK, "GOAL_ORDER_MODE"):
         print("goal_order_mode_in_use={}".format(cfg.TASK.GOAL_ORDER_MODE))
-
-    dataset_payload = _load_dataset_payload(str(cfg.DATASET.DATA_PATH))
-    instance_index = _flatten_instances(dataset_payload.get("instances"))
-    print("instance_count_in_dataset={}".format(len(instance_index)))
+    print("max_episode_steps_in_use={}".format(max_steps))
 
     env = habitat.Env(config=cfg)
     policy = _build_policy(args)
@@ -79,8 +128,17 @@ def main() -> None:
         os.makedirs(str(args.video_dir), exist_ok=True)
     os.makedirs(str(args.prompt_image_dir), exist_ok=True)
     prompt_image_dir = Path(args.prompt_image_dir)
+    if args.video_dir is not None:
+        metric_log_dir = str(Path(args.video_dir).resolve().parent / "logs")
+    else:
+        metric_log_dir = os.path.join(run_base_dir, "logs")
+    os.makedirs(metric_log_dir, exist_ok=True)
+    episode_metric_txt = os.path.join(metric_log_dir, "episode_metrics.txt")
+    running_metric_txt = os.path.join(metric_log_dir, "running_weighted_mean.txt")
 
     episode_writer = open(args.episode_log, "w", encoding="utf-8")
+    episode_metric_writer = open(episode_metric_txt, "w", encoding="utf-8")
+    running_metric_writer = open(running_metric_txt, "w", encoding="utf-8")
 
     episodes = _prepare_episode_list(env, args)
     if not episodes:
@@ -93,6 +151,8 @@ def main() -> None:
     ordered_episode_ids = sorted(episodes_by_id.keys())
 
     sum_metrics: Dict[str, float] = {}
+    weighted_metric_sums = {name: 0.0 for name in WEIGHTED_METRIC_NAMES}
+    total_goal_weight = 0.0
     episodes_done = 0
     episodes_truncated = 0
 
@@ -102,41 +162,40 @@ def main() -> None:
             env.current_episode = target_episode
             observations = env.reset()
             episode = env.current_episode
-            policy.reset(env=env, episode=episode, observations=observations)
 
             episode_id_text = str(getattr(episode, "episode_id", ""))
             goal_specs = _normalize_task_specs(getattr(episode, "tasks", None))
             goal_summary = [f"{instance_key}:{modality}" for instance_key, modality in goal_specs]
 
-            prompt_entries: List[Dict[str, Any]] = []
+            goal_payloads: List[Dict[str, Any]] = []
+            goal_input_summaries: List[Dict[str, Any]] = []
             for goal_idx, (instance_key, modality) in enumerate(goal_specs):
                 instance_record = instance_index.get(instance_key)
-                sound_id = _sound_id_for_goal(episode, goal_idx)
-                image_path = _save_prompt_image_if_needed(
+                goal_payload = _build_goal_input_payload(
                     env=env,
-                    instance_record=instance_record,
+                    instance_key=instance_key,
                     modality=modality,
+                    instance_record=instance_record,
+                )
+                goal_payloads.append(goal_payload)
+                goal_input_summary = _summarize_goal_input_payload(goal_idx, goal_payload)
+                image_path = _save_goal_input_image_if_needed(
+                    payload=goal_payload,
                     prompt_image_dir=prompt_image_dir,
                     episode_id=episode_id_text,
                     goal_index=goal_idx,
                     instance_key=instance_key,
-                )
-                prompt_text = _build_goal_prompt(
-                    instance_key=instance_key,
                     modality=modality,
-                    instance_record=instance_record,
-                    sound_id=sound_id,
-                    image_path=image_path,
                 )
-                prompt_entries.append(
-                    {
-                        "goal_index": int(goal_idx),
-                        "instance_key": instance_key,
-                        "modality": modality,
-                        "prompt": prompt_text,
-                        "image_path": image_path,
-                    }
-                )
+                if image_path is not None:
+                    goal_input_summary["image_path"] = image_path
+                goal_input_summaries.append(goal_input_summary)
+
+            if hasattr(policy, "set_episode_goal_payloads"):
+                policy.set_episode_goal_payloads(goal_payloads)
+            else:
+                setattr(policy, "_episode_goal_payloads", tuple(goal_payloads))
+            policy.reset(env=env, episode=episode, observations=observations)
 
             print(
                 "[episode {idx}] id={eid} goals={goals}".format(
@@ -145,30 +204,15 @@ def main() -> None:
                     goals=goal_summary,
                 )
             )
-            for prompt_entry in prompt_entries:
-                image_tag = prompt_entry.get("image_path") or "<none>"
+            for goal_input_summary in goal_input_summaries:
                 print(
-                    "  [goal {gi}] prompt={prompt} image_saved={img}".format(
-                        gi=prompt_entry["goal_index"],
-                        prompt=prompt_entry["prompt"],
-                        img=image_tag,
+                    "  [goal {gi}] input={payload}".format(
+                        gi=goal_input_summary["goal_index"],
+                        payload=_format_goal_input_summary(goal_input_summary),
                     )
                 )
 
             task = getattr(env, "_task", None)
-            last_task_token = getattr(task, "current_task_token", None)
-            print(
-                "  [audio_state] active_sound_idx={idx} active_sound={sound}".format(
-                    idx=getattr(env.sim, "_active_sound_idx", None),
-                    sound=getattr(env.sim, "_current_sound", None),
-                )
-            )
-            schedule = getattr(episode, "sound_source_schedule", None)
-            if isinstance(schedule, list) and len(schedule) >= 2 and str(schedule[0]).lower() == "round_robin":
-                print(
-                    "  [audio_note] round_robin schedule rotates source every {} simulator steps; "
-                    "active sound may differ from current goal token.".format(schedule[1])
-                )
 
             done = False
             step_idx = 0
@@ -178,13 +222,8 @@ def main() -> None:
             audio_rms_acc = 0.0
             audio_active_steps = 0
 
-            while not done and step_idx < args.max_steps:
-                context = build_lifelong_eval_context(
-                    env=env,
-                    episode=episode,
-                    episode_index=episode_index,
-                    step_index=step_idx,
-                )
+            while not done and step_idx < max_steps:
+                context = build_lifelong_eval_context(step_idx)
                 action = policy.act(
                     env=env,
                     episode=episode,
@@ -222,20 +261,6 @@ def main() -> None:
                     done=done,
                     info=None,
                 )
-
-                if task is not None:
-                    current_task_token = getattr(task, "current_task_token", None)
-                    if current_task_token != last_task_token:
-                        print(
-                            "  [goal_switch] step={step} from={src} to={dst} active_sound_idx={idx} active_sound={sound}".format(
-                                step=step_idx,
-                                src=last_task_token,
-                                dst=current_task_token,
-                                idx=getattr(env.sim, "_active_sound_idx", None),
-                                sound=getattr(env.sim, "_current_sound", None),
-                            )
-                        )
-                        last_task_token = current_task_token
                 step_idx += 1
 
             if not done:
@@ -246,7 +271,7 @@ def main() -> None:
                 audio_mean_rms = audio_rms_acc / float(audio_frame_count) if audio_frame_count > 0 else 0.0
                 print(
                     "  [audio_diag] frames={frames} active_frames={active} peak_max={peak:.6f} mean_rms={rms:.6f} "
-                    "offset={offset} duration={duration} schedule={schedule} end_active_sound={sound}".format(
+                    "offset={offset} duration={duration} schedule={schedule}".format(
                         frames=audio_frame_count,
                         active=audio_active_steps,
                         peak=audio_peak_max,
@@ -254,7 +279,6 @@ def main() -> None:
                         offset=getattr(episode, "offset", None),
                         duration=getattr(episode, "duration", None),
                         schedule=getattr(episode, "sound_source_schedule", None),
-                        sound=getattr(env.sim, "_current_sound", None),
                     )
                 )
                 if audio_active_steps == 0:
@@ -267,8 +291,41 @@ def main() -> None:
                 for key, value in env.get_metrics().items()
                 if isinstance(value, (int, float))
             }
+            metrics = _format_episode_metrics(
+                metrics,
+                _episode_goal_count(episode, goal_specs),
+            )
+            agent_episode_distance_m, reference_distance_m = _spl_diagnostics(env)
+            if agent_episode_distance_m is not None or reference_distance_m is not None:
+                print(
+                    "  [path_diag] agent_episode_distance_m={agent} reference_distance_m={ref}".format(
+                        agent=(
+                            "{:.3f}".format(agent_episode_distance_m)
+                            if agent_episode_distance_m is not None
+                            else "<unknown>"
+                        ),
+                        ref=(
+                            "{:.3f}".format(reference_distance_m)
+                            if reference_distance_m is not None
+                            else "<unknown>"
+                        ),
+                    )
+                )
+            goal_weight = float(metrics.get("num_goals", 1.0))
             for key, value in metrics.items():
                 sum_metrics[key] = sum_metrics.get(key, 0.0) + float(value)
+            total_goal_weight += goal_weight
+            for key in WEIGHTED_METRIC_NAMES:
+                weighted_metric_sums[key] += float(metrics.get(key, 0.0)) * goal_weight
+            running_weighted_mean = {
+                key: (weighted_metric_sums[key] / total_goal_weight if total_goal_weight > 0 else 0.0)
+                for key in WEIGHTED_METRIC_NAMES
+            }
+            episodes_seen = episodes_done + 1
+            running_logged_metrics = dict(running_weighted_mean)
+            for key in RUNNING_MEAN_METRIC_NAMES:
+                if key in sum_metrics:
+                    running_logged_metrics[key] = sum_metrics[key] / float(episodes_seen)
 
             task = getattr(env, "_task", None)
             row = {
@@ -277,22 +334,44 @@ def main() -> None:
                 "scene_id": str(getattr(episode, "scene_id", "")),
                 "steps": int(step_idx),
                 "truncated": bool(not done),
+                "agent_episode_distance_m": agent_episode_distance_m,
+                "reference_distance_m": reference_distance_m,
                 "metrics": metrics,
                 "goal_specs": goal_summary,
-                "goal_prompts": prompt_entries,
-                "goal_order_mode": str(getattr(episode, "goal_order_mode", getattr(cfg.TASK, "GOAL_ORDER_MODE", "ordered"))),
-                "completed_goal_indices": list(getattr(task, "completed_goal_indices", ())),
-                "remaining_goal_indices": list(getattr(task, "remaining_goal_indices", ())),
-                "current_task_token": getattr(task, "current_task_token", None),
+                "goal_inputs": goal_input_summaries,
+                "goal_order_mode": str(getattr(task, "_mode", getattr(cfg.TASK, "GOAL_ORDER_MODE", "ordered"))),
+                "goal_state_map": getattr(task, "goal_state_map", {}),
                 "submit_count": int(getattr(task, "submit_count", 0)),
                 "submit_limit": int(getattr(task, "submit_limit", 0)),
-                "submit_rejected_count": int(getattr(task, "submit_rejected_count", 0)),
-                "remaining_submit_quota": int(getattr(task, "remaining_submit_quota", 0)),
-                "active_sound_idx": getattr(env.sim, "_active_sound_idx", None),
-                "active_sound": getattr(env.sim, "_current_sound", None),
             }
             episode_writer.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
             episode_writer.flush()
+            episode_metric_writer.write(
+                "[episode {idx}] id={eid} agent_episode_distance_m={agent} reference_distance_m={ref} metrics={metrics}\n".format(
+                    idx=episode_index,
+                    eid=row["episode_id"],
+                    agent=(
+                        "{:.3f}".format(agent_episode_distance_m)
+                        if agent_episode_distance_m is not None
+                        else "<unknown>"
+                    ),
+                    ref=(
+                        "{:.3f}".format(reference_distance_m)
+                        if reference_distance_m is not None
+                        else "<unknown>"
+                    ),
+                    metrics=json.dumps(metrics, sort_keys=True),
+                )
+            )
+            episode_metric_writer.flush()
+            running_metric_writer.write(
+                "[episode {idx}] id={eid} weighted_mean={metrics}\n".format(
+                    idx=episode_index,
+                    eid=row["episode_id"],
+                    metrics=json.dumps(running_logged_metrics, sort_keys=True),
+                )
+            )
+            running_metric_writer.flush()
 
             episodes_done += 1
             if episode_index % max(1, args.print_every) == 0:
@@ -352,6 +431,8 @@ def main() -> None:
 
     finally:
         episode_writer.close()
+        episode_metric_writer.close()
+        running_metric_writer.close()
         try:
             policy.close()
         finally:
@@ -379,6 +460,8 @@ def main() -> None:
     print("Mean metrics: {}".format(json.dumps(mean_metrics, sort_keys=True)))
     print("Episode log: {}".format(args.episode_log))
     print("Mean log: {}".format(args.mean_log))
+    print("Episode metric txt: {}".format(episode_metric_txt))
+    print("Running mean txt: {}".format(running_metric_txt))
 
 
 if __name__ == "__main__":

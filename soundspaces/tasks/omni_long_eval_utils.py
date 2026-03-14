@@ -172,45 +172,121 @@ def _sound_id_for_goal(episode: Any, goal_index: int) -> Optional[str]:
     return None
 
 
-def _build_goal_prompt(
+def _normalize_goal_input_modality(modality: str) -> str:
+    token = str(modality).strip().lower()
+    if token.startswith("image"):
+        return "image"
+    if token in {"description", "text", "text_description"}:
+        return "description"
+    return "object"
+
+
+def _fallback_object_category(instance_key: str) -> str:
+    token = str(instance_key).strip()
+    if "_" in token:
+        prefix, suffix = token.rsplit("_", 1)
+        if suffix.isdigit() and prefix:
+            return prefix
+    return token or "object"
+
+
+def _build_goal_input_payload(
+    env: habitat.Env,
     instance_key: str,
     modality: str,
     instance_record: Optional[Dict[str, Any]],
-    sound_id: Optional[str],
-    image_path: Optional[str],
-) -> str:
+) -> Dict[str, Any]:
+    normalized_modality = _normalize_goal_input_modality(modality)
+
+    if normalized_modality == "image":
+        image_index = _parse_image_modality_index(modality)
+        rgb = None
+        if isinstance(instance_record, dict):
+            rgb = _render_reference_image(
+                env,
+                instance_record,
+                0 if image_index is None else int(image_index),
+            )
+        return {
+            "modality": "image",
+            "image": np.asarray(rgb, dtype=np.uint8).copy() if rgb is not None else None,
+        }
+
+    if normalized_modality == "description":
+        description = None
+        if isinstance(instance_record, dict):
+            description = _extract_text_description(instance_record)
+        return {
+            "modality": "description",
+            "text": str(description).strip() if isinstance(description, str) else "",
+        }
+
     category = None
-    semantic_id = None
-    description = None
     if isinstance(instance_record, dict):
         category = instance_record.get("category")
-        semantic_id = instance_record.get("semantic_id")
-        description = _extract_text_description(instance_record)
+    if not isinstance(category, str) or not category.strip():
+        category = _fallback_object_category(instance_key)
+    return {
+        "modality": "object",
+        "category": str(category).strip(),
+    }
 
-    prompt_parts: List[str] = [
-        f"instance_key={instance_key}",
-        f"modality={modality}",
-    ]
-    if category is not None:
-        prompt_parts.append(f"category={category}")
-    if semantic_id is not None:
-        prompt_parts.append(f"semantic_id={semantic_id}")
-    if sound_id:
-        prompt_parts.append(f"audio={sound_id}")
 
-    m = str(modality).strip().lower()
-    if m.startswith("image"):
-        if image_path:
-            prompt_parts.append(f"image_ref={image_path}")
-        else:
-            prompt_parts.append("image_ref=<missing>")
-    elif m in {"description", "text", "text_description"}:
-        if description:
-            prompt_parts.append(f"text={description}")
-        else:
-            prompt_parts.append("text=<missing>")
+def _save_goal_input_image_if_needed(
+    payload: Dict[str, Any],
+    prompt_image_dir: Optional[Path],
+    episode_id: str,
+    goal_index: int,
+    instance_key: str,
+    modality: str,
+) -> Optional[str]:
+    if prompt_image_dir is None:
+        return None
 
-    return " | ".join(prompt_parts)
+    image = payload.get("image")
+    if not isinstance(image, np.ndarray):
+        return None
+
+    prompt_image_dir.mkdir(parents=True, exist_ok=True)
+    file_path = prompt_image_dir / (
+        f"episode_{episode_id}_goal_{goal_index:02d}_{instance_key}_{modality}.png"
+    )
+    Image.fromarray(np.asarray(image, dtype=np.uint8)).save(file_path)
+    return str(file_path)
+
+
+def _summarize_goal_input_payload(goal_index: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    modality = str(payload.get("modality", "object"))
+    summary: Dict[str, Any] = {
+        "goal_index": int(goal_index),
+        "modality": modality,
+    }
+    if modality == "image":
+        image = payload.get("image")
+        summary["image_shape"] = list(image.shape) if isinstance(image, np.ndarray) else None
+        summary["image_path"] = None
+        return summary
+    if modality == "description":
+        summary["text"] = str(payload.get("text", ""))
+        return summary
+    summary["category"] = str(payload.get("category", ""))
+    return summary
+
+
+def _format_goal_input_summary(summary: Dict[str, Any]) -> str:
+    modality = str(summary.get("modality", "object"))
+    if modality == "image":
+        return "modality=image | image_shape={shape} | image_path={path}".format(
+            shape=summary.get("image_shape", None),
+            path=summary.get("image_path", None),
+        )
+    if modality == "description":
+        return "modality=description | text={text}".format(
+            text=summary.get("text", "")
+        )
+    return "modality=object | category={category}".format(
+        category=summary.get("category", "")
+    )
 
 
 def _normalize_task_specs(raw_tasks: Any) -> List[Tuple[str, str]]:
@@ -228,34 +304,42 @@ def _normalize_task_specs(raw_tasks: Any) -> List[Tuple[str, str]]:
     return specs
 
 
-def _save_prompt_image_if_needed(
-    env: habitat.Env,
-    instance_record: Optional[Dict[str, Any]],
-    modality: str,
-    prompt_image_dir: Optional[Path],
-    episode_id: str,
-    goal_index: int,
-    instance_key: str,
-) -> Optional[str]:
-    if prompt_image_dir is None:
-        return None
-    if not isinstance(instance_record, dict):
-        return None
+def _episode_goal_count(episode: Any, goal_specs: List[Tuple[str, str]]) -> int:
+    raw_count = getattr(episode, "num_goals", None)
+    try:
+        goal_count = int(raw_count)
+    except Exception:
+        goal_count = int(len(goal_specs))
+    if goal_count <= 0:
+        goal_count = int(len(goal_specs))
+    return max(1, goal_count)
 
-    image_index = _parse_image_modality_index(modality)
-    if image_index is None:
-        return None
 
-    rgb = _render_reference_image(env, instance_record, image_index)
-    if rgb is None:
-        return None
-
-    prompt_image_dir.mkdir(parents=True, exist_ok=True)
-    file_path = prompt_image_dir / (
-        f"episode_{episode_id}_goal_{goal_index:02d}_{instance_key}_{modality}.png"
-    )
-    Image.fromarray(rgb).save(file_path)
-    return str(file_path)
+def _format_episode_metrics(metrics: Dict[str, Any], num_goals: int) -> Dict[str, float]:
+    formatted: Dict[str, float] = {}
+    for key, value in metrics.items():
+        token = str(key)
+        if token == "lifelong_goal_completion":
+            numeric_value = float(value)
+            if np.isfinite(numeric_value):
+                formatted["success"] = numeric_value
+            continue
+        if token == "lifelong_goals_found":
+            numeric_value = float(value)
+            if np.isfinite(numeric_value):
+                formatted["found_goals"] = numeric_value
+            continue
+        if token == "success":
+            continue
+        try:
+            numeric_value = float(value)
+        except Exception:
+            continue
+        if not np.isfinite(numeric_value):
+            continue
+        formatted[token] = numeric_value
+    formatted["num_goals"] = float(max(1, int(num_goals)))
+    return formatted
 
 
 def _safe_json_load(raw: str, fallback: Any) -> Any:
@@ -374,12 +458,6 @@ def apply_eval_config(args: argparse.Namespace) -> argparse.Namespace:
         "num_episodes",
         None,
         _first_cfg_value(cfg, "num_episodes", "eval.num_episodes"),
-    )
-    _set_arg_if_default(
-        args,
-        "max_steps",
-        500,
-        _first_cfg_value(cfg, "max_steps", "eval.max_steps"),
     )
     _set_arg_if_default(
         args,
@@ -570,12 +648,6 @@ def parse_args() -> argparse.Namespace:
         help="Number of episodes to evaluate (default: all).",
     )
     parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=500,
-        help="Step cap per episode.",
-    )
-    parser.add_argument(
         "--policy",
         type=str,
         default="distance_submit",
@@ -706,8 +778,6 @@ def build_config(args: argparse.Namespace) -> habitat.Config:
     cfg.TASK.TYPE = args.task_type
     if args.goal_order_mode is not None:
         cfg.TASK.GOAL_ORDER_MODE = args.goal_order_mode
-    cfg.ENVIRONMENT.MAX_EPISODE_STEPS = int(args.max_steps)
-
     # Ensure RGB+Depth are both enabled so video can include depth panel.
     try:
         default_agent_id = cfg.SIMULATOR.DEFAULT_AGENT_ID
@@ -767,7 +837,6 @@ def build_config(args: argparse.Namespace) -> habitat.Config:
     cfg.TASK.ACTIONS[args.submit_action_name].TYPE = "LifelongSubmitAction"
 
     cfg.TASK.MEASUREMENTS = [
-        "DISTANCE_TO_GOAL",
         "SUCCESS",
         "SPL",
         "SOFT_SPL",
@@ -786,9 +855,17 @@ def build_config(args: argparse.Namespace) -> habitat.Config:
         cfg.TASK.LIFELONG_GOAL_COMPLETION = Config()
     cfg.TASK.LIFELONG_GOAL_COMPLETION.TYPE = "LifelongGoalCompletion"
 
-    if not hasattr(cfg.TASK, "DISTANCE_TO_GOAL"):
-        cfg.TASK.DISTANCE_TO_GOAL = Config()
-    cfg.TASK.DISTANCE_TO_GOAL.TYPE = "OmniLongDistanceToGoal"
+    if not hasattr(cfg.TASK, "SUCCESS"):
+        cfg.TASK.SUCCESS = Config()
+    cfg.TASK.SUCCESS.TYPE = "OmniLongSuccess"
+
+    if not hasattr(cfg.TASK, "SPL"):
+        cfg.TASK.SPL = Config()
+    cfg.TASK.SPL.TYPE = "OmniLongSPL"
+
+    if not hasattr(cfg.TASK, "SOFT_SPL"):
+        cfg.TASK.SOFT_SPL = Config()
+    cfg.TASK.SOFT_SPL.TYPE = "OmniLongSoftSPL"
 
     cfg.freeze()
     return cfg
@@ -823,9 +900,9 @@ def _build_policy(args: argparse.Namespace):
     policy_kwargs: Dict[str, Any] = dict(raw_kwargs)
     policy_kwargs.setdefault("seed", int(args.seed))
     policy_kwargs.setdefault("submit_action_name", str(args.submit_action_name))
-    if str(args.policy).strip().lower() == "distance_submit":
+    if str(args.policy).strip().lower() in {"distance_submit", "oracle", "oracle_shortest_submit"}:
         policy_kwargs.setdefault("submit_distance", float(args.distance_submit_threshold))
+    if str(args.policy).strip().lower() in {"oracle", "oracle_shortest_submit"}:
+        policy_kwargs.setdefault("goal_order_mode", args.goal_order_mode)
 
     return build_lifelong_eval_policy(args.policy, **policy_kwargs)
-
-
