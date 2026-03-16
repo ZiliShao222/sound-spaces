@@ -534,6 +534,14 @@ class ImageNavDeterministicScanner:
                     f"(num_detections={yolo_num}, matches={yolo_matches})"
                 )
             return "yolo validation failed"
+        if reason == "target_coverage_reject":
+            coverage = _fmt(details.get("target_detection_coverage"))
+            min_coverage = _fmt(details.get("min_target_detection_coverage"))
+            if coverage and min_coverage:
+                return (
+                    "target_detection_coverage="
+                    f"{coverage} < min_target_detection_coverage={min_coverage}"
+                )
         return None
 
     def _build_yolo_aliases(self, alias_path: Optional[Path]) -> Dict[str, List[str]]:
@@ -631,6 +639,7 @@ class ImageNavDeterministicScanner:
             "angle_deg": view["angle_deg"],
             "frame_cov": view["frame_cov"],
             "iou": view["iou"],
+            "target_detection_coverage": view.get("target_detection_coverage"),
             "yolo_num_detections": int(view.get("yolo_num_detections", 0)),
             "yolo_matched_detections": list(view.get("yolo_matched_detections", [])),
         }
@@ -716,8 +725,6 @@ class ImageNavDeterministicScanner:
             object_output_dir.mkdir(parents=True, exist_ok=True)
 
             target_views, invalid_views = self._scan_target(target, object_output_dir)
-            if len(target_views) > 3:
-                target_views = target_views[:3]
             pose_only_views = [self._pose_only_view(view) for view in target_views]
             all_views.extend(pose_only_views)
             object_views_json = object_output_dir / "views.json"
@@ -800,10 +807,17 @@ class ImageNavDeterministicScanner:
                     "hfov": float(self.args.hfov),
                     "sensor_height": float(self.args.sensor_height),
                 },
-                "scanner": "deterministic_open_floor_search",
+                "scanner": "deterministic_uniform_floor_grid_scan",
+                "viewpoint_sampling_mode": str(
+                    getattr(self.args, "viewpoint_sampling_mode", "uniform_floor_grid")
+                ),
+                "uniform_grid_step": float(getattr(self.args, "uniform_grid_step", 0.3)),
                 "search_radius": float(self.args.search_radius),
                 "min_surface_offset": float(self.args.min_surface_offset),
                 "min_iou": float(self.args.min_iou),
+                "min_target_detection_coverage": float(
+                    self.args.min_target_detection_coverage
+                ),
                 "yolo_validation_enabled": bool(self.yolo_model is not None),
                 "yolo_model": (
                     str(self.args.yolo_model.expanduser().resolve())
@@ -820,6 +834,10 @@ class ImageNavDeterministicScanner:
                 "min_edge_clearance": float(self.args.min_edge_clearance),
                 "nearby_object_radius": float(self.args.nearby_object_radius),
                 "max_viewpoints": int(self.args.max_viewpoints),
+                "max_saved_views": int(getattr(self.args, "max_saved_views", 4)),
+                "min_final_view_angle_sep": int(
+                    getattr(self.args, "min_final_view_angle_sep", 35)
+                ),
                 "min_sensor_offset": float(self.args.min_sensor_offset),
                 "max_sensor_offset": float(self.args.max_sensor_offset),
                 "sensor_offset_step": float(self.args.sensor_offset_step),
@@ -1531,7 +1549,7 @@ class ImageNavDeterministicScanner:
         return int(round(angle_deg)) % 360
 
     def _build_navmesh_ring_candidates(self, target: SemanticTarget) -> np.ndarray:
-        """Build ring-based floor candidates with radial and angular jitter."""
+        """Build ring-based fallback floor candidates with radial and angular jitter."""
         floor_y = self._target_floor_y(target)
         floor_level = self._nearest_floor_level(floor_y)
         candidates: List[np.ndarray] = []
@@ -1569,6 +1587,69 @@ class ImageNavDeterministicScanner:
         _, unique_indices = np.unique(rounded, axis=0, return_index=True)
         return np.array(candidates, dtype=np.float32)[np.sort(unique_indices)]
 
+    def _floor_navmesh_vertices(
+        self,
+        floor_level: Optional[FloorLevel],
+    ) -> np.ndarray:
+        """Return unique navmesh vertices that belong to one dominant floor band."""
+        vertices = np.array(self.navmesh_vertices, dtype=np.float32)
+        if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+        if floor_level is None:
+            return vertices
+        mask = np.abs(vertices[:, 1] - float(floor_level.y)) <= float(
+            self.args.floor_height_tolerance
+        )
+        return vertices[mask]
+
+    def _build_uniform_navmesh_candidates(self, target: SemanticTarget) -> np.ndarray:
+        """Build uniform grid candidates across the target floor's navigable region."""
+        floor_y = self._target_floor_y(target)
+        floor_level = self._nearest_floor_level(floor_y)
+        floor_vertices = self._floor_navmesh_vertices(floor_level)
+        if len(floor_vertices) == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        grid_step = max(0.2, float(getattr(self.args, "uniform_grid_step", 0.3)))
+        max_surface_offset = float(self.args.search_radius)
+        half_size_x = 0.5 * float(target.sizes[0])
+        half_size_z = 0.5 * float(target.sizes[2])
+        min_x = max(
+            float(np.min(floor_vertices[:, 0])),
+            float(target.center[0]) - half_size_x - max_surface_offset,
+        )
+        max_x = min(
+            float(np.max(floor_vertices[:, 0])),
+            float(target.center[0]) + half_size_x + max_surface_offset,
+        )
+        min_z = max(
+            float(np.min(floor_vertices[:, 2])),
+            float(target.center[2]) - half_size_z - max_surface_offset,
+        )
+        max_z = min(
+            float(np.max(floor_vertices[:, 2])),
+            float(target.center[2]) + half_size_z + max_surface_offset,
+        )
+
+        if max_x < min_x or max_z < min_z:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        xs = np.arange(min_x, max_x + 0.5 * grid_step, grid_step, dtype=np.float32)
+        zs = np.arange(min_z, max_z + 0.5 * grid_step, grid_step, dtype=np.float32)
+        candidates: List[np.ndarray] = []
+        for x_value in xs.tolist():
+            for z_value in zs.tolist():
+                probe = np.array([x_value, floor_y, z_value], dtype=np.float32)
+                snapped = self._snap_to_floor_navmesh(probe, floor_level=floor_level)
+                if snapped is not None:
+                    candidates.append(snapped)
+
+        if not candidates:
+            return np.zeros((0, 3), dtype=np.float32)
+        rounded = np.round(np.array(candidates, dtype=np.float32), 3)
+        _, unique_indices = np.unique(rounded, axis=0, return_index=True)
+        return np.array(candidates, dtype=np.float32)[np.sort(unique_indices)]
+
     def _rank_floor_candidates(
         self,
         target: SemanticTarget,
@@ -1596,10 +1677,20 @@ class ImageNavDeterministicScanner:
         candidate_arrays: List[np.ndarray] = []
         candidate_sources: List[str] = []
 
-        ring_candidates = self._build_navmesh_ring_candidates(target)
-        if len(ring_candidates) > 0:
-            candidate_arrays.append(ring_candidates)
-            candidate_sources.extend(["ring_candidate"] * len(ring_candidates))
+        sampling_mode = str(
+            getattr(self.args, "viewpoint_sampling_mode", "uniform_floor_grid")
+        ).strip().lower()
+        if sampling_mode == "uniform_floor_grid":
+            uniform_candidates = self._build_uniform_navmesh_candidates(target)
+            if len(uniform_candidates) > 0:
+                candidate_arrays.append(uniform_candidates)
+                candidate_sources.extend(["uniform_floor_grid"] * len(uniform_candidates))
+
+        if not candidate_arrays:
+            ring_candidates = self._build_navmesh_ring_candidates(target)
+            if len(ring_candidates) > 0:
+                candidate_arrays.append(ring_candidates)
+                candidate_sources.extend(["ring_candidate"] * len(ring_candidates))
 
         if candidate_arrays:
             raw_candidates = np.concatenate(candidate_arrays, axis=0)
@@ -1622,21 +1713,31 @@ class ImageNavDeterministicScanner:
         dist_2d = np.linalg.norm(delta_xz, axis=1)
         min_distance = float(target.horizontal_radius) + float(self.args.min_surface_offset)
         max_distance = float(target.horizontal_radius) + float(self.args.search_radius)
+        enforce_max_distance = True
         diagnostics["min_center_distance"] = round(min_distance, 3)
         diagnostics["max_center_distance"] = round(max_distance, 3)
 
         y_diff = np.abs(raw_candidates[:, 1] - floor_y)
         diagnostics["y_mismatch"] = int(np.sum(y_diff > floor_tolerance))
-        diagnostics["too_far"] = int(np.sum(dist_2d > max_distance))
+        diagnostics["too_far"] = int(np.sum(dist_2d > max_distance)) if enforce_max_distance else 0
         diagnostics["too_near"] = int(np.sum(dist_2d < min_distance))
         valid_mask = (
             y_diff <= floor_tolerance
         ) & (
-            dist_2d <= max_distance
+            (dist_2d <= max_distance) if enforce_max_distance else np.ones_like(dist_2d, dtype=bool)
         ) & (
             dist_2d >= min_distance
         )
         diagnostics["valid_mask_pass"] = int(np.sum(valid_mask))
+        preferred_surface_distance = min(
+            float(self.args.search_radius),
+            max(
+                float(self.args.min_surface_offset),
+                0.5 * (
+                    float(self.args.min_surface_offset) + float(self.args.search_radius)
+                ),
+            ),
+        )
 
         ranked: List[Dict[str, Any]] = []
 
@@ -1669,7 +1770,7 @@ class ImageNavDeterministicScanner:
                     )
                 )
                 continue
-            if point_dist > max_distance:
+            if enforce_max_distance and point_dist > max_distance:
                 invalid_views.append(
                     self._invalid_view_record(
                         target=target,
@@ -1697,6 +1798,10 @@ class ImageNavDeterministicScanner:
                     )
                 )
                 continue
+            nearby_count, nearby_penalty = self._nearby_object_stats_2d(
+                point,
+                target_id=target.semantic_id,
+            )
             if not self._is_valid_floor_navmesh_point(point, floor_level=floor_level):
                 diagnostics["invalid_floor_navmesh"] += 1
                 is_navigable = None
@@ -1746,22 +1851,32 @@ class ImageNavDeterministicScanner:
                     )
                 )
                 continue
+            surface_distance = max(0.0, float(point_dist) - float(target.horizontal_radius))
+            candidate_score = (
+                3.0 * float(edge_clearance)
+                - 0.75 * abs(surface_distance - preferred_surface_distance)
+                - 0.35 * float(nearby_penalty)
+                - 0.05 * float(nearby_count)
+            )
             ranked.append(
                 {
                     "floor_position": np.array(point, dtype=np.float32),
                     "edge_clearance": float(edge_clearance),
-                    "nearby_count": 0,
-                    "nearby_penalty": 0.0,
-                    "surface_distance": max(0.0, float(point_dist) - float(target.horizontal_radius)),
+                    "nearby_count": int(nearby_count),
+                    "nearby_penalty": float(nearby_penalty),
+                    "surface_distance": surface_distance,
                     "angle_deg": self._estimate_angle_deg(point, target),
                     "candidate_source": point_source,
+                    "candidate_score": float(candidate_score),
                 }
             )
 
         ranked.sort(
             key=lambda item: (
+                -item["candidate_score"],
                 -item["edge_clearance"],
-                -item["surface_distance"],
+                item["surface_distance"],
+                item["nearby_penalty"],
                 item["angle_deg"],
             )
         )
@@ -1838,6 +1953,173 @@ class ImageNavDeterministicScanner:
             if dist_2d < float(self.args.min_viewpoint_separation):
                 return False
         return True
+
+    def _passes_floor_candidate_spacing(
+        self,
+        floor_stats: Dict[str, Any],
+        selected: Sequence[Dict[str, Any]],
+    ) -> bool:
+        """Reject floor candidates that collapse to nearly identical standing points."""
+        min_spacing = max(
+            0.35,
+            0.5 * float(getattr(self.args, "uniform_grid_step", 0.3)),
+        )
+        for chosen in selected:
+            dist_2d = float(
+                np.linalg.norm(
+                    (floor_stats["floor_position"] - chosen["floor_position"])[[0, 2]]
+                )
+            )
+            if dist_2d < min_spacing:
+                return False
+        return True
+
+    def _select_floor_candidates(
+        self,
+        ranked_floor_candidates: List[Dict[str, Any]],
+        max_candidates: int,
+    ) -> List[Dict[str, Any]]:
+        """Round-robin angular bins to keep broad coverage before rendering."""
+        if max_candidates <= 0 or not ranked_floor_candidates:
+            return []
+        if len(ranked_floor_candidates) <= max_candidates:
+            return list(ranked_floor_candidates)
+
+        angle_bin_deg = max(10, int(round(360.0 / max(1, max_candidates))))
+        angle_bins: Dict[int, List[Dict[str, Any]]] = {}
+        for floor_stats in ranked_floor_candidates:
+            angle_bin = int(floor_stats["angle_deg"] // angle_bin_deg)
+            angle_bins.setdefault(angle_bin, []).append(floor_stats)
+
+        for floor_bin in angle_bins.values():
+            floor_bin.sort(
+                key=lambda item: (
+                    -item.get("candidate_score", 0.0),
+                    -item.get("edge_clearance", 0.0),
+                    item.get("surface_distance", 0.0),
+                )
+            )
+
+        active_bins = sorted(
+            angle_bins.keys(),
+            key=lambda angle_bin: (
+                -angle_bins[angle_bin][0].get("candidate_score", 0.0),
+                angle_bin,
+            ),
+        )
+        selected: List[Dict[str, Any]] = []
+        while active_bins and len(selected) < max_candidates:
+            next_active_bins: List[int] = []
+            progress = False
+            for angle_bin in active_bins:
+                bin_candidates = angle_bins[angle_bin]
+                while bin_candidates:
+                    candidate = bin_candidates.pop(0)
+                    if self._passes_floor_candidate_spacing(candidate, selected):
+                        selected.append(candidate)
+                        progress = True
+                        break
+                if bin_candidates:
+                    next_active_bins.append(angle_bin)
+                if len(selected) >= max_candidates:
+                    break
+            if not progress:
+                break
+            active_bins = next_active_bins
+
+        if len(selected) >= max_candidates:
+            return selected[:max_candidates]
+
+        for floor_stats in ranked_floor_candidates:
+            if len(selected) >= max_candidates:
+                break
+            if any(
+                np.array_equal(floor_stats["floor_position"], chosen["floor_position"])
+                for chosen in selected
+            ):
+                continue
+            if self._passes_floor_candidate_spacing(floor_stats, selected):
+                selected.append(floor_stats)
+
+        return selected[:max_candidates]
+
+    def _view_quality_score(self, view: Dict[str, Any]) -> float:
+        """Score one rendered view by visibility and detector agreement."""
+        return (
+            0.50 * float(view.get("target_detection_coverage", 0.0))
+            + 0.30 * float(view.get("iou", 0.0))
+            + 0.20 * float(view.get("frame_cov", 0.0))
+            - 2.5 * float(view.get("retry_index", 0))
+        )
+
+    def _min_selected_angle_diff(
+        self,
+        view: Dict[str, Any],
+        selected: Sequence[Dict[str, Any]],
+    ) -> float:
+        """Return the smallest angular difference to already selected views."""
+        if not selected:
+            return 180.0
+        candidate_angle = int(view.get("angle_deg", 0))
+        min_angle_diff = 180.0
+        for chosen in selected:
+            chosen_angle = int(chosen.get("angle_deg", 0))
+            angle_diff = abs(candidate_angle - chosen_angle) % 360
+            angle_diff = min(angle_diff, 360 - angle_diff)
+            min_angle_diff = min(min_angle_diff, float(angle_diff))
+        return float(min_angle_diff)
+
+    def _select_final_views(
+        self,
+        views: List[Dict[str, Any]],
+        max_saved_views: int,
+    ) -> List[Dict[str, Any]]:
+        """Keep only a few high-quality rendered views with strong diversity."""
+        if max_saved_views <= 0 or not views:
+            return []
+        remaining = sorted(views, key=self._view_quality_score, reverse=True)
+        selected: List[Dict[str, Any]] = []
+        min_final_view_angle_sep = int(
+            getattr(self.args, "min_final_view_angle_sep", 35)
+        )
+        while remaining and len(selected) < max_saved_views:
+            best_index = None
+            best_score = None
+            for index, view in enumerate(remaining):
+                quality_score = self._view_quality_score(view)
+                min_angle_diff = self._min_selected_angle_diff(view, selected)
+                if selected and min_angle_diff < float(min_final_view_angle_sep):
+                    continue
+                if best_score is None or quality_score > best_score:
+                    best_score = quality_score
+                    best_index = index
+            if best_index is None:
+                break
+            selected.append(remaining.pop(best_index))
+        return selected
+
+    def _cleanup_unselected_view_images(
+        self,
+        views: Sequence[Dict[str, Any]],
+        selected_views: Sequence[Dict[str, Any]],
+    ) -> None:
+        """Remove rendered files that are not part of the final saved subset."""
+        if not bool(getattr(self.args, "save_images", True)):
+            return
+        selected_ids = {id(view) for view in selected_views}
+        for view in views:
+            if id(view) in selected_ids:
+                continue
+            for key in ("goal_image", "yolo_image"):
+                relative_path = view.get(key)
+                if not isinstance(relative_path, str) or not relative_path:
+                    continue
+                file_path = self.output_root / relative_path
+                try:
+                    if file_path.exists():
+                        file_path.unlink()
+                except OSError:
+                    continue
 
     def _direction_adjustments(self) -> List[float]:
         """Return radial forward/backward adjustments along one sampling direction."""
@@ -2099,6 +2381,39 @@ class ImageNavDeterministicScanner:
         intersection_sum = int(np.count_nonzero(intersection))
         return float(intersection_sum) / float(union_sum)
 
+    def _target_detection_coverage(
+        self,
+        semantic_mask: np.ndarray,
+        matched_detections: Sequence[Dict[str, Any]],
+    ) -> float:
+        """Measure how much of the target semantic mask is covered by matched YOLO boxes."""
+        semantic_mask_bool = semantic_mask.astype(bool, copy=False)
+        semantic_area = int(np.count_nonzero(semantic_mask_bool))
+        if semantic_area <= 0:
+            return 0.0
+
+        height, width = semantic_mask_bool.shape[:2]
+        best_coverage = 0.0
+        for detection in matched_detections:
+            bbox = detection.get("bbox_xyxy")
+            if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+                continue
+
+            try:
+                x1 = max(0, min(width, int(np.floor(float(bbox[0])))))
+                y1 = max(0, min(height, int(np.floor(float(bbox[1])))))
+                x2 = max(0, min(width, int(np.ceil(float(bbox[2])))))
+                y2 = max(0, min(height, int(np.ceil(float(bbox[3])))))
+            except Exception:
+                continue
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            covered_area = int(np.count_nonzero(semantic_mask_bool[y1:y2, x1:x2]))
+            best_coverage = max(best_coverage, float(covered_area) / float(semantic_area))
+        return float(best_coverage)
+
     def _mask_to_image(self, mask: np.ndarray) -> Image.Image:
         """Convert a boolean entity mask into a plain binary image."""
         return Image.fromarray(mask.astype(np.uint8) * 255)
@@ -2277,7 +2592,7 @@ class ImageNavDeterministicScanner:
         target: SemanticTarget,
         object_output_dir: Path,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Select up to three dominant-floor viewpoints around a target and render them."""
+        """Render many floor-grid candidates and keep a small diverse high-quality subset."""
         views: List[Dict[str, Any]] = []
         observe_failures = 0
         selected_candidates: List[ViewpointCandidate] = []
@@ -2293,12 +2608,15 @@ class ImageNavDeterministicScanner:
             "observe_failures": 0,
             "iou_reject": 0,
             "yolo_reject": 0,
+            "target_coverage_reject": 0,
             "rendered_views": 0,
         }
-        max_viewpoints = min(int(self.args.max_viewpoints), 3)
-        for floor_stats in ranked_floor_candidates:
-            if len(selected_candidates) >= max_viewpoints:
-                break
+        max_viewpoints = max(1, int(self.args.max_viewpoints))
+        chosen_floor_candidates = self._select_floor_candidates(
+            ranked_floor_candidates,
+            max_viewpoints,
+        )
+        for floor_stats in chosen_floor_candidates:
             candidate = self._select_sensor_pose(
                 floor_position=floor_stats["floor_position"],
                 target=target,
@@ -2317,53 +2635,6 @@ class ImageNavDeterministicScanner:
                         candidate_source=floor_stats.get("candidate_source"),
                         details={
                             "edge_clearance": float(floor_stats["edge_clearance"]),
-                        },
-                    )
-                )
-                continue
-            if not self._is_diverse_viewpoint(candidate, selected_candidates):
-                scan_diagnostics["diversity_reject"] += 1
-                min_angle_diff = None
-                min_separation = None
-                for chosen in selected_candidates:
-                    angle_diff = abs(candidate.angle_deg - chosen.angle_deg) % 360
-                    angle_diff = min(angle_diff, 360 - angle_diff)
-                    dist_2d = float(
-                        np.linalg.norm(
-                            (candidate.floor_position - chosen.floor_position)[[0, 2]]
-                        )
-                    )
-                    min_angle_diff = (
-                        angle_diff
-                        if min_angle_diff is None
-                        else min(min_angle_diff, angle_diff)
-                    )
-                    min_separation = (
-                        dist_2d
-                        if min_separation is None
-                        else min(min_separation, dist_2d)
-                    )
-                invalid_views.append(
-                    self._invalid_view_record(
-                        target=target,
-                        stage="selection",
-                        reason="diversity_reject",
-                        floor_position=candidate.floor_position,
-                        base_position=candidate.base_position,
-                        sensor_position=candidate.sensor_position,
-                        rotation=candidate.rotation,
-                        angle_deg=int(candidate.angle_deg),
-                        surface_distance=float(candidate.surface_distance),
-                        candidate_source=floor_stats.get("candidate_source"),
-                        details={
-                            "edge_clearance": float(candidate.edge_clearance),
-                            "sensor_clearance": float(candidate.sensor_clearance),
-                            "min_angle_diff": min_angle_diff,
-                            "min_angle_threshold": float(self.args.min_viewpoint_angle_sep),
-                            "min_separation": min_separation,
-                            "min_separation_threshold": float(
-                                self.args.min_viewpoint_separation
-                            ),
                         },
                     )
                 )
@@ -2513,6 +2784,40 @@ class ImageNavDeterministicScanner:
                     )
                     continue
 
+                target_detection_coverage = self._target_detection_coverage(
+                    semantic_mask,
+                    yolo_matches,
+                )
+                if target_detection_coverage < float(self.args.min_target_detection_coverage):
+                    scan_diagnostics["target_coverage_reject"] += 1
+                    invalid_views.append(
+                        self._invalid_view_record(
+                            target=target,
+                            stage="render_validation",
+                            reason="target_coverage_reject",
+                            floor_position=active_candidate.floor_position,
+                            base_position=active_candidate.base_position,
+                            sensor_position=active_candidate.sensor_position,
+                            rotation=active_candidate.rotation,
+                            angle_deg=int(active_candidate.angle_deg),
+                            surface_distance=float(active_candidate.surface_distance),
+                            details={
+                                "target_detection_coverage": float(target_detection_coverage),
+                                "min_target_detection_coverage": float(
+                                    self.args.min_target_detection_coverage
+                                ),
+                                "iou": float(mask_iou),
+                                "frame_cov": float(visible_ratio),
+                                "yolo_num_detections": int(yolo_num_detections),
+                                "yolo_matched_detections": yolo_matches,
+                                "retry_index": int(retry_index),
+                                "retry_radius": float(retry_radius),
+                                "retry_max_attempts": int(retry_max_attempts),
+                            },
+                        )
+                    )
+                    continue
+
                 goal_name = self._goal_filename(
                     semantic_id=target.semantic_id,
                     sensor_position=active_candidate.sensor_position,
@@ -2556,6 +2861,10 @@ class ImageNavDeterministicScanner:
                     "visible_ratio": round(visible_ratio, 3),
                     "frame_cov": round(100.0 * visible_ratio, 1),
                     "iou": round(100.0 * mask_iou, 1),
+                    "target_detection_coverage": round(
+                        100.0 * target_detection_coverage,
+                        1,
+                    ),
                     "edge_clearance": round(active_candidate.edge_clearance, 3),
                     "nearby_count": int(active_candidate.nearby_count),
                     "nearby_penalty": round(active_candidate.nearby_penalty, 3),
@@ -2571,6 +2880,11 @@ class ImageNavDeterministicScanner:
                 scan_diagnostics["rendered_views"] = int(len(views))
                 break
 
+        max_saved_views = max(1, int(getattr(self.args, "max_saved_views", 4)))
+        selected_views = self._select_final_views(views, max_saved_views)
+        self._cleanup_unselected_view_images(views, selected_views)
+        views = selected_views
+
         self.logger.info(
             "%s %d (%s): %d valid views",
             self.target_label,
@@ -2583,7 +2897,7 @@ class ImageNavDeterministicScanner:
                 (
                     "%s %d rejects | raw=%d y_mismatch=%d too_near=%d too_far=%d "
                     "valid_mask=%d invalid_floor=%d edge=%d ranked_floor=%d "
-                    "sensor_pose_none=%d diversity=%d selected=%d observe=%d iou=%d yolo=%d "
+                    "sensor_pose_none=%d diversity=%d selected=%d observe=%d iou=%d yolo=%d coverage=%d "
                     "floor_index=%s floor_y=%.3f center_dist=[%.3f, %.3f]"
                 ),
                 self.target_label,
@@ -2602,6 +2916,7 @@ class ImageNavDeterministicScanner:
                 int(scan_diagnostics["observe_failures"]),
                 int(scan_diagnostics["iou_reject"]),
                 int(scan_diagnostics["yolo_reject"]),
+                int(scan_diagnostics["target_coverage_reject"]),
                 str(scan_diagnostics["target_floor_index"]),
                 float(scan_diagnostics["target_floor_y"]),
                 float(scan_diagnostics["min_center_distance"]),
@@ -2614,8 +2929,8 @@ def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for deterministic semantic-target scanning."""
     parser = argparse.ArgumentParser(
         description=(
-            "Select up to three open floor viewpoints near each semantic target, "
-            "lift the sensor by 1.25-1.5m, and export RGB/annotated/semantic views."
+            "Uniformly sample standable floor viewpoints around each semantic target, "
+            "render candidate views, and save a small diverse high-quality subset."
         )
     )
     parser.add_argument(
@@ -2742,7 +3057,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-surface-offset",
         type=float,
-        default=0.5,
+        default=0.35,
         help="Minimum 2D offset from the target surface to a floor viewpoint",
     )
     parser.add_argument(
@@ -2782,6 +3097,12 @@ def parse_args() -> argparse.Namespace:
         help="Reject rendered views whose geometry-vs-semantic IoU is below this threshold",
     )
     parser.add_argument(
+        "--min-target-detection-coverage",
+        type=float,
+        default=0.1,
+        help="Reject rendered views when matched YOLO boxes cover too little of the target semantic region.",
+    )
+    parser.add_argument(
         "--max-floor-levels",
         type=int,
         default=3,
@@ -2802,8 +3123,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-viewpoints",
         type=int,
-        default=3,
-        help="Maximum number of rendered viewpoints per target",
+        default=24,
+        help="Maximum number of candidate viewpoints rendered per target",
+    )
+    parser.add_argument(
+        "--max-saved-views",
+        type=int,
+        default=4,
+        help="Maximum number of final high-quality views saved per target",
+    )
+    parser.add_argument(
+        "--min-final-view-angle-sep",
+        type=int,
+        default=35,
+        help="Minimum angular separation required between saved views",
+    )
+    parser.add_argument(
+        "--uniform-grid-step",
+        type=float,
+        default=0.3,
+        help="Grid spacing used when uniformly sampling standable floor viewpoints",
     )
     parser.add_argument(
         "--min-sensor-offset",
@@ -2838,13 +3177,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-viewpoint-angle-sep",
         type=int,
-        default=45,
+        default=30,
         help="Minimum angular separation between selected viewpoints around one target",
     )
     parser.add_argument(
         "--min-viewpoint-separation",
         type=float,
-        default=0.75,
+        default=0.45,
         help="Minimum 2D separation between selected floor viewpoints",
     )
     parser.add_argument(

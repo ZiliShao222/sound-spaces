@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import attr
 
 from habitat.config import Config
-from habitat.core.dataset import Dataset
+from habitat.core.dataset import ALL_SCENES_MASK, Dataset
 from habitat.core.registry import registry
 from habitat.core.simulator import AgentState, ShortestPathPoint
 
@@ -18,6 +18,7 @@ from soundspaces.tasks.omni_long_task import OmniLongEpisode
 from soundspaces.tasks.semantic_audionav_task import ObjectViewLocation, SemanticAudioGoal
 
 
+CONTENT_SCENES_PATH_FIELD = "content_scenes_path"
 DEFAULT_SCENE_PATH_PREFIX = "data/scene_dataset/"
 
 
@@ -171,10 +172,62 @@ def _coerce_int(value: Any, default: int = 0) -> int:
 @registry.register_dataset(name="OmniLongNav")
 class OmniLongNavDataset(Dataset):
     episodes: List[OmniLongEpisode]
+    content_scenes_path: str = "{data_path}/content/{scene}.json.gz"
+
+    @staticmethod
+    def check_config_paths_exist(config: Config) -> bool:
+        dataset_path = OmniLongNavDataset._resolve_dataset_path(config)
+        return os.path.exists(dataset_path) and os.path.exists(config.SCENES_DIR)
+
+    @classmethod
+    def get_scenes_to_load(cls, config: Config) -> List[str]:
+        dataset_path = cls._resolve_dataset_path(config)
+        if not cls.check_config_paths_exist(config):
+            raise FileNotFoundError(f"Could not find dataset file `{dataset_path}`")
+
+        dataset_dir = os.path.dirname(dataset_path)
+        cfg = config.clone()
+        cfg.defrost()
+        cfg.CONTENT_SCENES = []
+        dataset = cls(cfg)
+
+        has_individual_scene_files = os.path.exists(
+            dataset.content_scenes_path.split("{scene}")[0].format(
+                data_path=dataset_dir
+            )
+        )
+        if has_individual_scene_files:
+            return cls._get_scenes_from_folder(
+                content_scenes_path=dataset.content_scenes_path,
+                dataset_dir=dataset_dir,
+            )
+
+        cfg.CONTENT_SCENES = [ALL_SCENES_MASK]
+        dataset = cls(cfg)
+        return list(map(cls.scene_from_scene_path, dataset.scene_ids))
+
+    @staticmethod
+    def _get_scenes_from_folder(
+        content_scenes_path: str, dataset_dir: str
+    ) -> List[str]:
+        scenes: List[str] = []
+        content_dir = content_scenes_path.split("{scene}")[0]
+        scene_dataset_ext = content_scenes_path.split("{scene}")[1]
+        content_dir = content_dir.format(data_path=dataset_dir)
+        if not os.path.exists(content_dir):
+            return scenes
+
+        for filename in os.listdir(content_dir):
+            if filename.endswith(scene_dataset_ext):
+                scene = filename[: -len(scene_dataset_ext)]
+                scenes.append(scene)
+        scenes.sort()
+        return scenes
 
     def __init__(self, config: Optional[Config] = None) -> None:
         self.episodes = []
         self._config = config
+        self.instances_by_scene: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
         if config is None:
             return
@@ -182,6 +235,35 @@ class OmniLongNavDataset(Dataset):
         dataset_path = self._resolve_dataset_path(config)
         with gzip.open(dataset_path, "rt") as handle:
             self.from_json(handle.read(), scenes_dir=config.SCENES_DIR, scene_filename=dataset_path)
+
+        dataset_dir = os.path.dirname(dataset_path)
+        has_individual_scene_files = os.path.exists(
+            self.content_scenes_path.split("{scene}")[0].format(
+                data_path=dataset_dir
+            )
+        )
+        if has_individual_scene_files:
+            scenes = list(getattr(config, "CONTENT_SCENES", []))
+            if ALL_SCENES_MASK in scenes:
+                scenes = self._get_scenes_from_folder(
+                    content_scenes_path=self.content_scenes_path,
+                    dataset_dir=dataset_dir,
+                )
+
+            for scene in scenes:
+                scene_filename = self.content_scenes_path.format(
+                    data_path=dataset_dir, scene=scene
+                )
+                with gzip.open(scene_filename, "rt") as handle:
+                    self.from_json(
+                        handle.read(),
+                        scenes_dir=config.SCENES_DIR,
+                        scene_filename=scene_filename,
+                    )
+        else:
+            self.episodes = list(
+                filter(self.build_content_scenes_filter(config), self.episodes)
+            )
 
     @staticmethod
     def _resolve_dataset_path(config: Config) -> str:
@@ -220,11 +302,12 @@ class OmniLongNavDataset(Dataset):
             aligned_task_specs: List[List[str]] = []
             for spec in task_specs:
                 instance_key = str(spec[0])
+                modality = str(spec[1])
                 record = instances.get(instance_key)
                 if not isinstance(record, dict):
                     continue
                 goal_dicts.append(_build_goal_dict_from_instance(instance_key, record))
-                aligned_task_specs.append([str(spec[0]), str(spec[1])])
+                aligned_task_specs.append([instance_key, modality])
             task_specs = aligned_task_specs
 
         if not goal_dicts and isinstance(raw_goals, list) and raw_goals and isinstance(raw_goals[0], dict):
@@ -249,6 +332,9 @@ class OmniLongNavDataset(Dataset):
         deserialized = json.loads(json_str)
         if not isinstance(deserialized, dict):
             return
+
+        if CONTENT_SCENES_PATH_FIELD in deserialized:
+            self.content_scenes_path = deserialized[CONTENT_SCENES_PATH_FIELD]
 
         raw_episodes = deserialized.get("episodes")
         if not isinstance(raw_episodes, list) or len(raw_episodes) == 0:
@@ -335,6 +421,8 @@ class OmniLongNavDataset(Dataset):
                 if not os.path.isabs(scene_id):
                     scene_id = os.path.join(scenes_dir, scene_id)
                 episode.scene_id = scene_id
+
+            self.instances_by_scene[str(episode.scene_id)] = instances
 
             for goal_idx, goal in enumerate(episode.goals):
                 if isinstance(goal, SemanticAudioGoal):

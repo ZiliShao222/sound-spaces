@@ -30,6 +30,7 @@ from ss_baselines.common.env_utils import construct_envs
 from ss_baselines.common.environments import get_env_class
 from ss_baselines.common.rollout_storage import RolloutStorage
 from ss_baselines.common.tensorboard_utils import TensorboardWriter
+from ss_baselines.common.wandb_utils import WandbRun
 from ss_baselines.common.utils import (
     batch_obs,
     generate_video,
@@ -257,6 +258,7 @@ class PPOTrainer(BaseRLTrainer):
             self.envs.observation_spaces[0],
             self.envs.action_spaces[0],
             ppo_cfg.hidden_size,
+            num_recurrent_layers=self.actor_critic.net.num_recurrent_layers,
         )
         rollouts.to(self.device)
 
@@ -295,105 +297,131 @@ class PPOTrainer(BaseRLTrainer):
             lr_lambda=lambda x: linear_decay(x, self.config.NUM_UPDATES),
         )
 
-        with TensorboardWriter(
-            self.config.TENSORBOARD_DIR, flush_secs=self.flush_secs
-        ) as writer:
-            for update in range(self.config.NUM_UPDATES):
-                if ppo_cfg.use_linear_lr_decay:
-                    lr_scheduler.step()
+        wandb_run = WandbRun(self.config, run_type="train")
 
-                if ppo_cfg.use_linear_clip_decay:
-                    self.agent.clip_param = ppo_cfg.clip_param * linear_decay(
-                        update, self.config.NUM_UPDATES
-                    )
+        try:
+            with TensorboardWriter(
+                self.config.TENSORBOARD_DIR, flush_secs=self.flush_secs
+            ) as writer:
+                for update in range(self.config.NUM_UPDATES):
+                    if ppo_cfg.use_linear_lr_decay:
+                        lr_scheduler.step()
 
-                for step in tqdm(range(ppo_cfg.num_steps)):
-                    delta_pth_time, delta_env_time, delta_steps = self._collect_rollout_step(
-                        rollouts,
-                        current_episode_reward,
-                        current_episode_step,
-                        episode_rewards,
-                        episode_spls,
-                        episode_counts,
-                        episode_steps
+                    if ppo_cfg.use_linear_clip_decay:
+                        self.agent.clip_param = ppo_cfg.clip_param * linear_decay(
+                            update, self.config.NUM_UPDATES
+                        )
+
+                    for step in tqdm(range(ppo_cfg.num_steps)):
+                        delta_pth_time, delta_env_time, delta_steps = self._collect_rollout_step(
+                            rollouts,
+                            current_episode_reward,
+                            current_episode_step,
+                            episode_rewards,
+                            episode_spls,
+                            episode_counts,
+                            episode_steps
+                        )
+                        pth_time += delta_pth_time
+                        env_time += delta_env_time
+                        count_steps += delta_steps
+
+                    delta_pth_time, value_loss, action_loss, dist_entropy = self._update_agent(
+                        ppo_cfg, rollouts
                     )
                     pth_time += delta_pth_time
-                    env_time += delta_env_time
-                    count_steps += delta_steps
 
-                delta_pth_time, value_loss, action_loss, dist_entropy = self._update_agent(
-                    ppo_cfg, rollouts
-                )
-                pth_time += delta_pth_time
+                    window_episode_reward.append(episode_rewards.clone())
+                    window_episode_spl.append(episode_spls.clone())
+                    window_episode_step.append(episode_steps.clone())
+                    window_episode_counts.append(episode_counts.clone())
 
-                window_episode_reward.append(episode_rewards.clone())
-                window_episode_spl.append(episode_spls.clone())
-                window_episode_step.append(episode_steps.clone())
-                window_episode_counts.append(episode_counts.clone())
-
-                losses = [value_loss, action_loss, dist_entropy]
-                stats = zip(
-                    ["count", "reward", "step", 'spl'],
-                    [window_episode_counts, window_episode_reward, window_episode_step, window_episode_spl],
-                )
-                deltas = {
-                    k: (
-                        (v[-1] - v[0]).sum().item()
-                        if len(v) > 1
-                        else v[0].sum().item()
+                    stats = zip(
+                        ["count", "reward", "step", 'spl'],
+                        [window_episode_counts, window_episode_reward, window_episode_step, window_episode_spl],
                     )
-                    for k, v in stats
-                }
-                deltas["count"] = max(deltas["count"], 1.0)
-
-                # this reward is averaged over all the episodes happened during window_size updates
-                # approximately number of steps is window_size * num_steps
-                if update % 10 == 0:
-                    writer.add_scalar("Environment/Reward", deltas["reward"] / deltas["count"], count_steps)
-                    writer.add_scalar("Environment/SPL", deltas["spl"] / deltas["count"], count_steps)
-                    writer.add_scalar("Environment/Episode_length", deltas["step"] / deltas["count"], count_steps)
-                    writer.add_scalar('Policy/Value_Loss', value_loss, count_steps)
-                    writer.add_scalar('Policy/Action_Loss', action_loss, count_steps)
-                    writer.add_scalar('Policy/Entropy', dist_entropy, count_steps)
-                    writer.add_scalar('Policy/Learning_Rate', lr_scheduler.get_lr()[0], count_steps)
-
-                # log stats
-                if update > 0 and update % self.config.LOG_INTERVAL == 0:
-                    logger.info(
-                        "update: {}\tfps: {:.3f}\t".format(
-                            update, count_steps / (time.time() - t_start)
+                    deltas = {
+                        k: (
+                            (v[-1] - v[0]).sum().item()
+                            if len(v) > 1
+                            else v[0].sum().item()
                         )
-                    )
+                        for k, v in stats
+                    }
+                    deltas["count"] = max(deltas["count"], 1.0)
 
-                    logger.info(
-                        "update: {}\tenv-time: {:.3f}s\tpth-time: {:.3f}s\t"
-                        "frames: {}".format(
-                            update, env_time, pth_time, count_steps
-                        )
-                    )
+                    if update % 10 == 0:
+                        reward_mean = deltas["reward"] / deltas["count"]
+                        spl_mean = deltas["spl"] / deltas["count"]
+                        episode_length_mean = deltas["step"] / deltas["count"]
+                        learning_rate = lr_scheduler.get_lr()[0]
 
-                    window_rewards = (
-                        window_episode_reward[-1] - window_episode_reward[0]
-                    ).sum()
-                    window_counts = (
-                        window_episode_counts[-1] - window_episode_counts[0]
-                    ).sum()
+                        writer.add_scalar("Environment/Reward", reward_mean, count_steps)
+                        writer.add_scalar("Environment/SPL", spl_mean, count_steps)
+                        writer.add_scalar("Environment/Episode_length", episode_length_mean, count_steps)
+                        writer.add_scalar('Policy/Value_Loss', value_loss, count_steps)
+                        writer.add_scalar('Policy/Action_Loss', action_loss, count_steps)
+                        writer.add_scalar('Policy/Entropy', dist_entropy, count_steps)
+                        writer.add_scalar('Policy/Learning_Rate', learning_rate, count_steps)
 
-                    if window_counts > 0:
+                        wandb_payload = {
+                            "train/update": update,
+                            "train/steps": count_steps,
+                            "train/fps": count_steps / max(time.time() - t_start, 1e-6),
+                            "train/env_time": env_time,
+                            "train/pth_time": pth_time,
+                            "train/window_episode_count": deltas["count"],
+                        }
+                        if not getattr(self.config.WANDB, "SYNC_TENSORBOARD", True):
+                            wandb_payload.update(
+                                {
+                                    "Environment/Reward": reward_mean,
+                                    "Environment/SPL": spl_mean,
+                                    "Environment/Episode_length": episode_length_mean,
+                                    "Policy/Value_Loss": value_loss,
+                                    "Policy/Action_Loss": action_loss,
+                                    "Policy/Entropy": dist_entropy,
+                                    "Policy/Learning_Rate": learning_rate,
+                                }
+                            )
+                        wandb_run.log(wandb_payload, step=count_steps)
+
+                    if update > 0 and update % self.config.LOG_INTERVAL == 0:
                         logger.info(
-                            "Average window size {} reward: {:3f}".format(
-                                len(window_episode_reward),
-                                (window_rewards / window_counts).item(),
+                            "update: {}\tfps: {:.3f}\t".format(
+                                update, count_steps / (time.time() - t_start)
                             )
                         )
-                    else:
-                        logger.info("No episodes finish in current window")
 
-                # checkpoint model
-                if update % self.config.CHECKPOINT_INTERVAL == 0:
-                    self.save_checkpoint(f"ckpt.{count_checkpoints}.pth")
-                    count_checkpoints += 1
+                        logger.info(
+                            "update: {}\tenv-time: {:.3f}s\tpth-time: {:.3f}s\t"
+                            "frames: {}".format(
+                                update, env_time, pth_time, count_steps
+                            )
+                        )
 
+                        window_rewards = (
+                            window_episode_reward[-1] - window_episode_reward[0]
+                        ).sum()
+                        window_counts = (
+                            window_episode_counts[-1] - window_episode_counts[0]
+                        ).sum()
+
+                        if window_counts > 0:
+                            logger.info(
+                                "Average window size {} reward: {:3f}".format(
+                                    len(window_episode_reward),
+                                    (window_rewards / window_counts).item(),
+                                )
+                            )
+                        else:
+                            logger.info("No episodes finish in current window")
+
+                    if update % self.config.CHECKPOINT_INTERVAL == 0:
+                        self.save_checkpoint(f"ckpt.{count_checkpoints}.pth")
+                        count_checkpoints += 1
+        finally:
+            wandb_run.finish()
             self.envs.close()
 
     def _eval_checkpoint(
@@ -489,8 +517,8 @@ class PPOTrainer(BaseRLTrainer):
         )
 
         test_recurrent_hidden_states = torch.zeros(
-            self.actor_critic.net.num_recurrent_layers,
             self.config.NUM_PROCESSES,
+            self.actor_critic.net.num_recurrent_layers,
             ppo_cfg.hidden_size,
             device=self.device,
         )

@@ -61,39 +61,10 @@ def _sim_action_to_named_action(action: Any) -> Any:
 
 
 def _distance_to_current_goal(env: Any, episode: Any) -> Optional[float]:
-    task = _get_task(env)
-    if task is not None and hasattr(task, "_distance_to_goal_by_mode"):
-        try:
-            distance = task._distance_to_goal_by_mode(episode)
-            if distance is None:
-                return None
-            return float(distance)
-        except Exception:
-            pass
-
     goals = getattr(episode, "goals", None)
     if not isinstance(goals, list) or len(goals) == 0:
         return None
-
-    goal = goals[0]
-    if task is not None and hasattr(task, "_distance_to_goal"):
-        try:
-            distance = task._distance_to_goal(goal, episode)
-            if distance is None:
-                return None
-            return float(distance)
-        except Exception:
-            pass
-
-    try:
-        goal_pos = getattr(goal, "position", None)
-        if goal_pos is None:
-            return None
-        current_pos = env.sim.get_agent_state().position
-        distance = env.sim.geodesic_distance(current_pos, [goal_pos], episode)
-        return float(distance)
-    except Exception:
-        return None
+    return _distance_to_specific_goal(env, episode, goals[0])
 
 
 def _distance_to_specific_goal(env: Any, episode: Any, goal: Any) -> Optional[float]:
@@ -157,41 +128,28 @@ def _navigation_goal(
     episode: Any,
     policy: Optional["LifelongEvalPolicy"] = None,
 ) -> Tuple[Optional[int], Optional[Any]]:
-    task = _get_task(env)
-    episode_goals = getattr(episode, "goals", None)
-    goals = getattr(task, "all_goals", None) if task is not None else None
-    if not goals and isinstance(episode_goals, list):
-        goals = tuple(episode_goals)
+    goals = tuple(getattr(policy, "_episode_goals", ())) if policy is not None else ()
+    if not goals:
+        episode_goals = getattr(episode, "goals", None)
+        if isinstance(episode_goals, list):
+            goals = tuple(episode_goals)
 
     if not goals:
         return None, None
 
-    goal_state_map = getattr(task, "goal_state_map", None)
-    if not isinstance(goal_state_map, dict):
-        if isinstance(episode_goals, list) and episode_goals:
-            return 0, episode_goals[0]
-        return None, None
-
     order_enforced = _order_enforced(env, policy=policy)
-    first_unfound: Optional[Tuple[int, Any]] = None
+    if order_enforced:
+        goal_index = int(getattr(policy, "_ordered_goal_index", 0)) if policy is not None else 0
+        if goal_index < 0 or goal_index >= len(goals):
+            return None, None
+        return goal_index, goals[goal_index]
+
+    completed_goal_indices = set(getattr(policy, "_submitted_goal_indices", ())) if policy is not None else set()
     winner: Optional[Tuple[int, Any]] = None
     winner_distance: Optional[float] = None
-    for goal_state in goal_state_map.values():
-        try:
-            if bool(goal_state.get("found", False)):
-                continue
-            goal_index = int(goal_state["goal_index"])
-        except Exception:
+    for goal_index, goal in enumerate(goals):
+        if goal_index in completed_goal_indices:
             continue
-        if goal_index < 0 or goal_index >= len(goals):
-            continue
-
-        goal = goals[goal_index]
-        if first_unfound is None:
-            first_unfound = (goal_index, goal)
-            if order_enforced:
-                return first_unfound
-
         distance = _distance_to_specific_goal(env, episode, goal)
         if distance is None:
             continue
@@ -201,27 +159,13 @@ def _navigation_goal(
 
     if winner is not None:
         return winner
-    if first_unfound is not None:
-        return first_unfound
     return None, None
 
 
-def _goal_signature(env: Any, goal_index: Optional[int], goal: Any) -> Tuple[Any, Any, Tuple[int, ...]]:
-    task = _get_task(env)
-    remaining_goal_indices: List[int] = []
-    goal_state_map = getattr(task, "goal_state_map", None) if task is not None else None
-    if isinstance(goal_state_map, dict):
-        for goal_state in goal_state_map.values():
-            try:
-                if bool(goal_state.get("found", False)):
-                    continue
-                remaining_goal_indices.append(int(goal_state["goal_index"]))
-            except Exception:
-                continue
+def _goal_signature(goal_index: Optional[int], goal: Any) -> Tuple[Any, Any]:
     return (
         int(goal_index) if goal_index is not None else None,
         getattr(goal, "object_id", None),
-        tuple(remaining_goal_indices),
     )
 
 
@@ -322,16 +266,10 @@ def _task_success_distance(env: Any, default: float = 1.0) -> float:
 @dataclass
 class LifelongEvalContext:
     step_index: int
+    goal_payloads: Tuple[Dict[str, Any], ...] = ()
 
 
 class LifelongEvalPolicy:
-    def set_episode_goal_payloads(self, goal_payloads: Sequence[Dict[str, Any]]) -> None:
-        self._episode_goal_payloads = tuple(goal_payloads)
-
-    @property
-    def episode_goal_payloads(self) -> Sequence[Dict[str, Any]]:
-        return tuple(getattr(self, "_episode_goal_payloads", ()))
-
     def reset(self, *, env: Any, episode: Any, observations: Dict[str, Any]) -> None:
         return None
 
@@ -537,7 +475,7 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
         self._follower: Optional[ShortestPathFollower] = None
         self._goal_signature: Optional[Any] = None
 
-    def reset(self, *, env: Any, episode: Any, observations: Dict[str, Any]) -> None:
+    def _reset_follower(self, env: Any) -> None:
         self._follower = ShortestPathFollower(
             sim=env.sim,
             goal_radius=self._follower_goal_radius,
@@ -545,6 +483,30 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
             stop_on_error=self._stop_on_error,
         )
         self._goal_signature = None
+
+    def _mark_goal_submitted(self, env: Any, goal_index: Optional[int]) -> None:
+        if goal_index is None:
+            return
+        if _order_enforced(env, policy=self):
+            if int(goal_index) == int(self._ordered_goal_index):
+                self._ordered_goal_index = min(
+                    int(self._ordered_goal_index) + 1,
+                    max(len(self._episode_goals) - 1, 0),
+                )
+        else:
+            self._submitted_goal_indices.add(int(goal_index))
+        self._goal_signature = None
+
+    def reset(self, *, env: Any, episode: Any, observations: Dict[str, Any]) -> None:
+        self._reset_follower(env)
+        task = _get_task(env)
+        goals = getattr(task, "all_goals", None) if task is not None else None
+        if not goals:
+            episode_goals = getattr(episode, "goals", None)
+            goals = tuple(episode_goals) if isinstance(episode_goals, list) else ()
+        self._episode_goals = tuple(goals)
+        self._ordered_goal_index = 0
+        self._submitted_goal_indices = set()
 
     def _reached_goal(
         self,
@@ -572,48 +534,8 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
         if goal is None:
             return _build_named_action(self._stop_action_name)
 
-        if context.step_index == 0:
-            task = _get_task(env)
-            goal_state_map = getattr(task, "goal_state_map", None) if task is not None else None
-            all_goals = getattr(task, "all_goals", None) if task is not None else None
-            if not all_goals:
-                episode_goals = getattr(episode, "goals", None)
-                all_goals = tuple(episode_goals) if isinstance(episode_goals, list) else ()
-            if isinstance(goal_state_map, dict):
-                distance_debug: List[str] = []
-                for goal_state in goal_state_map.values():
-                    try:
-                        if bool(goal_state.get("found", False)):
-                            continue
-                        debug_goal_index = int(goal_state["goal_index"])
-                    except Exception:
-                        continue
-                    if debug_goal_index < 0 or debug_goal_index >= len(all_goals):
-                        continue
-                    debug_distance = _distance_to_specific_goal(
-                        env,
-                        episode,
-                        all_goals[debug_goal_index],
-                    )
-                    distance_debug.append(
-                        "goal_{idx}={dist}".format(
-                            idx=debug_goal_index,
-                            dist=(
-                                "{:.3f}".format(float(debug_distance))
-                                if debug_distance is not None
-                                else "<none>"
-                            ),
-                        )
-                    )
-                print(
-                    "[oracle_goal_debug] mode={mode} distances=[{distances}] selected_goal_index={selected}".format(
-                        mode=("ordered" if _order_enforced(env, policy=self) else "unordered"),
-                        distances=", ".join(distance_debug),
-                        selected=goal_index,
-                    )
-                )
-
         if self._reached_goal(env, episode, goal):
+            self._mark_goal_submitted(env, goal_index)
             return _build_named_action(self._submit_action_name)
 
         target_positions = _goal_target_positions(goal, self._follow_view_points)
@@ -621,11 +543,11 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
         if target_position is None:
             return _build_named_action(self._stop_action_name)
 
-        goal_signature = _goal_signature(env, goal_index, goal)
+        goal_signature = _goal_signature(goal_index, goal)
         if self._follower is None:
-            self.reset(env=env, episode=episode, observations=observations)
+            self._reset_follower(env)
         elif goal_signature != self._goal_signature:
-            self.reset(env=env, episode=episode, observations=observations)
+            self._reset_follower(env)
 
         assert self._follower is not None
         self._goal_signature = goal_signature
@@ -634,8 +556,9 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
             return _heading_fallback_action(env, target_position)
         if int(action) == int(HabitatSimActions.STOP):
             if self._reached_goal(env, episode, goal):
+                self._mark_goal_submitted(env, goal_index)
                 return _build_named_action(self._submit_action_name)
-            self.reset(env=env, episode=episode, observations=observations)
+            self._reset_follower(env)
             assert self._follower is not None
             self._goal_signature = goal_signature
             retry_action = self._follower.get_next_action(target_position)
@@ -645,7 +568,11 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
         return _sim_action_to_named_action(action)
 
 
-def build_lifelong_eval_context(step_index: int) -> LifelongEvalContext:
+def build_lifelong_eval_context(
+    step_index: int,
+    goal_payloads: Optional[Sequence[Dict[str, Any]]] = None,
+) -> LifelongEvalContext:
     return LifelongEvalContext(
         step_index=int(step_index),
+        goal_payloads=tuple(goal_payloads or ()),
     )

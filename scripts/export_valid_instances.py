@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from tqdm import tqdm
 
 
 def _load_multimodal_module() -> Any:
@@ -133,7 +134,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--exp-config",
         type=Path,
-        default=Path("configs/semantic_audionav/av_nav/mp3d/semantic_audiogoal.yaml"),
+        default=Path("configs/omni-long/mp3d/omni-long_semantic_audio.yaml"),
         help="Habitat task config used to instantiate simulator",
     )
     parser.add_argument("--width", type=int, default=512, help="Sensor width")
@@ -142,7 +143,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seed",
         type=int,
-        default=2026,
+        default=0,
         help="Random seed for reproducible rendering candidates",
     )
     parser.add_argument(
@@ -188,6 +189,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum YOLO detections per rendered image",
     )
     parser.add_argument(
+        "--min-target-detection-coverage",
+        type=float,
+        default=0.1,
+        help="Minimum fraction of the target semantic region that must be covered by a matched YOLO box.",
+    )
+    parser.add_argument(
         "--yolo-aliases-json",
         type=Path,
         default=None,
@@ -222,6 +229,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.25,
         help="Max xz snap distance when validating object footprint navigability",
+    )
+    parser.add_argument(
+        "--filter-instances",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Apply object-level filtering before export (default: yes). Disable to export all scene objects.",
     )
     parser.add_argument(
         "--include-rejections",
@@ -313,26 +326,31 @@ def _build_imagenav_args(
         height=args.height,
         hfov=args.hfov,
         seed=int(args.seed),
+        viewpoint_sampling_mode="uniform_floor_grid",
+        uniform_grid_step=0.3,
         horizontal_only_rotation=args.horizontal_only_rotation,
         sensor_height=args.sensor_height,
         search_radius=1.0,
-        min_surface_offset=0.5,
+        min_surface_offset=0.35,
         candidate_angle_step=30,
         radial_step=0.15,
         radial_step_jitter=0.05,
         angle_jitter=10.0,
         min_edge_clearance=0.1,
         min_iou=0.2,
+        min_target_detection_coverage=float(args.min_target_detection_coverage),
         max_floor_levels=args.max_floor_levels,
         floor_level_tolerance=args.floor_level_tolerance,
         nearby_object_radius=3.0,
-        max_viewpoints=3,
+        max_viewpoints=24,
+        max_saved_views=3,
+        min_final_view_angle_sep=35,
         min_sensor_offset=1.25,
         max_sensor_offset=1.5,
         sensor_offset_step=0.125,
         floor_height_tolerance=0.25,
-        min_viewpoint_angle_sep=45,
-        min_viewpoint_separation=0.75,
+        min_viewpoint_angle_sep=30,
+        min_viewpoint_separation=0.45,
         max_snap_distance=0.5,
         object_clearance=0.1,
         position_adjust_max=0.25,
@@ -439,7 +457,15 @@ def _generate_descriptions_for_valid_instances(
         "Generating descriptions with {} for {} instances...".format(model, total)
     )
 
-    for idx, (_, instance_key, instance_payload) in enumerate(flat_instances, start=1):
+    progress_bar = tqdm(
+        flat_instances,
+        total=total,
+        desc="Descriptions",
+        unit="instance",
+        dynamic_ncols=True,
+    )
+
+    for idx, (_, instance_key, instance_payload) in enumerate(progress_bar, start=1):
         image_payload = instance_payload.get("image")
         render_views = (
             image_payload.get("render_views")
@@ -472,7 +498,7 @@ def _generate_descriptions_for_valid_instances(
                 "model": model,
             }
             stats["failed"] += 1
-            print("[{}/{}] {}: missing image files".format(idx, total, instance_key))
+            tqdm.write("[{}/{}] {}: missing image files".format(idx, total, instance_key))
             continue
 
         category_name = str(instance_payload.get("category", "object")).strip() or "object"
@@ -497,7 +523,7 @@ def _generate_descriptions_for_valid_instances(
                 "source_images": rel_paths,
             }
             stats["failed"] += 1
-            print("[{}/{}] {}: api_error {}".format(idx, total, instance_key, exc))
+            tqdm.write("[{}/{}] {}: api_error {}".format(idx, total, instance_key, exc))
             if sleep_seconds > 0:
                 time.sleep(float(sleep_seconds))
             continue
@@ -509,7 +535,7 @@ def _generate_descriptions_for_valid_instances(
                 "source_images": rel_paths,
             }
             stats["failed"] += 1
-            print("[{}/{}] {}: invalid ({})".format(idx, total, instance_key, status))
+            tqdm.write("[{}/{}] {}: invalid ({})".format(idx, total, instance_key, status))
             if sleep_seconds > 0:
                 time.sleep(float(sleep_seconds))
             continue
@@ -530,10 +556,12 @@ def _generate_descriptions_for_valid_instances(
             "num_source_views": len(rel_paths),
         }
         stats["updated"] += 1
-        print("[{}/{}] {}: {}".format(idx, total, instance_key, description))
+        tqdm.write("[{}/{}] {}: {}".format(idx, total, instance_key, description))
 
         if sleep_seconds > 0:
             time.sleep(float(sleep_seconds))
+
+    progress_bar.close()
 
     return stats
 
@@ -588,25 +616,36 @@ def main() -> None:
         ]
 
         scene_objects = module._collect_scene_objects(image_scanner.sim)
-        accessible_objects, footprint_rejections = module._filter_accessible_objects(
-            scene_objects,
-            pathfinder=image_scanner.pathfinder,
-            snap_distance=float(args.footprint_snap_distance),
-            floor_levels=dominant_floors,
-            floor_height_tolerance=float(args.floor_height_tolerance),
-        )
+        if args.filter_instances:
+            accessible_objects, footprint_rejections = module._filter_accessible_objects(
+                scene_objects,
+                pathfinder=image_scanner.pathfinder,
+                snap_distance=float(args.footprint_snap_distance),
+                floor_levels=dominant_floors,
+                floor_height_tolerance=float(args.floor_height_tolerance),
+            )
+        else:
+            accessible_objects = list(scene_objects)
+            footprint_rejections = {}
 
         valid_instances: Dict[str, Dict[str, Dict[str, Any]]] = {}
         no_image_instances: List[Dict[str, Any]] = []
         projection_rejections: List[Dict[str, Any]] = []
-        for obj in accessible_objects:
+        object_progress = tqdm(
+            accessible_objects,
+            total=len(accessible_objects),
+            desc=f"Exporting {args.scene_name}",
+            unit="object",
+            dynamic_ncols=True,
+        )
+        for obj in object_progress:
             nav_pos, nav_reason = module._project_goal_to_navmesh(
                 obj.center,
                 image_scanner.pathfinder,
                 dominant_floors,
                 float(args.floor_height_tolerance),
             )
-            if nav_pos is None:
+            if nav_pos is None and args.filter_instances:
                 projection_rejections.append(
                     {
                         "semantic_id": int(obj.semantic_id),
@@ -615,7 +654,10 @@ def main() -> None:
                     }
                 )
                 continue
-            floor_index, floor_y, floor_delta = _nearest_floor(dominant_floors, nav_pos[1])
+            if nav_pos is not None:
+                floor_index, floor_y, floor_delta = _nearest_floor(dominant_floors, nav_pos[1])
+            else:
+                floor_index, floor_y, floor_delta = None, None, None
             category_bucket = valid_instances.setdefault(obj.category, {})
             key = f"{obj.category}_{int(obj.semantic_id)}"
             instance_payload = {
@@ -626,13 +668,15 @@ def main() -> None:
                 "bbox_min": _round_list(obj.aabb_min),
                 "bbox_max": _round_list(obj.aabb_max),
                 "horizontal_radius": round(float(obj.horizontal_radius), 3),
-                "nav_position": _round_list(nav_pos),
+                "nav_position": _round_list(nav_pos) if nav_pos is not None else None,
                 "nav_floor_index": floor_index,
                 "nav_floor_y": round(float(floor_y), 3) if floor_y is not None else None,
                 "nav_floor_delta": round(float(floor_delta), 3)
                 if floor_delta is not None
                 else None,
             }
+            if nav_reason != "ok":
+                instance_payload["nav_projection_reason"] = nav_reason
 
             target_key = (_normalize_category_key(obj.category), int(obj.semantic_id))
             render_target = target_lookup.get(target_key)
@@ -656,8 +700,6 @@ def main() -> None:
             target_views, invalid_views = image_scanner._scan_target(
                 render_target, object_output_dir
             )
-            if len(target_views) > 3:
-                target_views = target_views[:3]
             object_views_json, invalid_views_json = _write_render_metadata(
                 image_scanner,
                 render_target,
@@ -699,6 +741,10 @@ def main() -> None:
                 )
 
             category_bucket[key] = instance_payload
+            object_progress.set_postfix(
+                valid=sum(len(entries) for entries in valid_instances.values()),
+                no_image=len(no_image_instances),
+            )
     finally:
         if image_scanner is not None:
             image_scanner.close()

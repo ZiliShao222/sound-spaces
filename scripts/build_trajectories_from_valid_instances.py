@@ -26,7 +26,7 @@ from itertools import permutations
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
+from tqdm import tqdm
 import numpy as np
 
 
@@ -983,301 +983,317 @@ def _build_trajectories(
     trajectories: List[Dict[str, Any]] = []
     goal_count_hist: Counter = Counter()
 
-    for trajectory_index in range(int(num_trajectories)):
+    for trajectory_index in tqdm(range(int(num_trajectories)), desc="generating trajectories"):
         goal_count = rng.randint(int(min_goals), int(effective_max_goals))
-        best_payload: Optional[Dict[str, Any]] = None
-        best_null_count: Optional[int] = None
+        while True:
+            best_payload: Optional[Dict[str, Any]] = None
+            best_null_count: Optional[int] = None
 
-        desired_image_min = max(0, int(min_image_goals_per_episode))
-        desired_image_max = max(0, int(max_image_goals_per_episode))
-        if desired_image_min > desired_image_max:
-            desired_image_min = desired_image_max
+            desired_image_min = max(0, int(min_image_goals_per_episode))
+            desired_image_max = max(0, int(max_image_goals_per_episode))
+            if desired_image_min > desired_image_max:
+                desired_image_min = desired_image_max
 
-        # Rule by episode goal count:
-        # - goals >= 4: must include both image and text_description modalities
-        # - goals >= 3: must include at least one image/text_description modality
-        # - others: fallback to CLI range config
-        required_min_image_goals = 0
-        force_split_image_and_text = False
-        if int(goal_count) >= 4:
-            required_min_image_goals = 2
-            force_split_image_and_text = True
-        elif int(goal_count) >= 3:
-            required_min_image_goals = 1
+            required_min_image_goals = 0
+            force_split_image_and_text = False
+            if int(total_image_records) < 2:
+                desired_image_min = 0
+            else:
+                # Rule by episode goal count:
+                # - goals >= 4: must include both image and text_description modalities
+                # - goals >= 3: must include at least one image/text_description modality
+                # - others: fallback to CLI range config
+                if int(goal_count) >= 4:
+                    required_min_image_goals = 2
+                    force_split_image_and_text = True
+                elif int(goal_count) >= 3:
+                    required_min_image_goals = 1
 
-        desired_image_min = max(int(desired_image_min), int(required_min_image_goals))
-        desired_image_max = max(int(desired_image_max), int(required_min_image_goals))
+            desired_image_min = max(int(desired_image_min), int(required_min_image_goals))
+            desired_image_max = max(int(desired_image_max), int(required_min_image_goals))
 
-        desired_image_min = min(desired_image_min, int(goal_count), int(total_image_records))
-        desired_image_max = min(desired_image_max, int(goal_count), int(total_image_records))
-        if int(desired_image_min) < int(required_min_image_goals):
-            raise RuntimeError(
-                "Insufficient image-capable goals for modality constraints: "
-                f"goal_count={int(goal_count)}, required_min_image_goals={int(required_min_image_goals)}, "
-                f"available_image_capable_instances={int(total_image_records)}."
-            )
-        if desired_image_max < desired_image_min:
-            desired_image_max = desired_image_min
+            desired_image_min = min(desired_image_min, int(goal_count), int(total_image_records))
+            desired_image_max = min(desired_image_max, int(goal_count), int(total_image_records))
+            if int(desired_image_min) < int(required_min_image_goals):
+                if int(goal_count) > 2:
+                    goal_count -= 1
+                    continue
+                raise RuntimeError(
+                    "Insufficient image-capable goals for modality constraints: "
+                    f"goal_count={int(goal_count)}, required_min_image_goals={int(required_min_image_goals)}, "
+                    f"available_image_capable_instances={int(total_image_records)}."
+                )
+            if desired_image_max < desired_image_min:
+                desired_image_max = desired_image_min
 
-        if int(desired_image_max) >= int(desired_image_min):
-            desired_image_goals = rng.randint(int(desired_image_min), int(desired_image_max))
-        else:
-            desired_image_goals = int(desired_image_min)
+            if int(desired_image_max) >= int(desired_image_min):
+                desired_image_goals = rng.randint(int(desired_image_min), int(desired_image_max))
+            else:
+                desired_image_goals = int(desired_image_min)
 
-        for attempt_idx in range(max(1, int(distance_max_attempts))):
-            active_usage_counter: Optional[Counter] = None
-            active_explore_ratio = 1.0
-            if bool(balance_instance_coverage):
-                active_usage_counter = instance_usage_counter
-                if int(distance_max_attempts) <= 1:
-                    active_explore_ratio = float(coverage_explore_ratio)
-                else:
-                    # Early attempts prioritize coverage; late attempts relax to improve feasibility.
-                    relax_threshold = int(max(1, round(0.7 * int(distance_max_attempts))))
-                    if int(attempt_idx) < relax_threshold:
+            for attempt_idx in range(max(1, int(distance_max_attempts))):
+                active_usage_counter: Optional[Counter] = None
+                active_explore_ratio = 1.0
+                if bool(balance_instance_coverage):
+                    active_usage_counter = instance_usage_counter
+                    if int(distance_max_attempts) <= 1:
                         active_explore_ratio = float(coverage_explore_ratio)
                     else:
-                        active_explore_ratio = 1.0
+                        relax_threshold = int(max(1, round(0.7 * int(distance_max_attempts))))
+                        if int(attempt_idx) < relax_threshold:
+                            active_explore_ratio = float(coverage_explore_ratio)
+                        else:
+                            active_explore_ratio = 1.0
 
-            sampled_records = _sample_goals_for_trajectory(
-                records=records,
-                grouped_by_category=grouped_by_category,
-                num_goals=goal_count,
-                rng=rng,
-                unique_categories=unique_categories,
-                instance_usage_counter=active_usage_counter,
-                coverage_explore_ratio=float(active_explore_ratio),
-            )
-
-            adjusted_records = _enforce_image_goal_quota(
-                sampled_records=sampled_records,
-                all_records=records,
-                desired_image_goals=int(desired_image_goals),
-                unique_categories=bool(unique_categories),
-                instance_usage_counter=active_usage_counter,
-                rng=rng,
-            )
-            if adjusted_records is None:
-                continue
-            sampled_records = adjusted_records
-
-            goal_instance_keys = [str(record["instance_key"]) for record in sampled_records]
-            goal_categories = [str(record["category"]) for record in sampled_records]
-            goal_inputs: List[Dict[str, Any]] = []
-            goal_sound_ids: List[str] = []
-            for record in sampled_records:
-                instance_key = str(record["instance_key"])
-                full_record = instance_lookup.get(instance_key, {})
-                goal_input, sound_id = _build_goal_input_entry(
-                    record=record,
-                    instance_record=full_record,
-                    scene_split=scene_split,
+                sampled_records = _sample_goals_for_trajectory(
+                    records=records,
+                    grouped_by_category=grouped_by_category,
+                    num_goals=goal_count,
                     rng=rng,
-                    view_strategy=str(goal_image_view_strategy),
+                    unique_categories=unique_categories,
+                    instance_usage_counter=active_usage_counter,
+                    coverage_explore_ratio=float(active_explore_ratio),
                 )
-                goal_inputs.append(goal_input)
-                goal_sound_ids.append(sound_id)
 
-            goal_modalities, modality_coverage = _assign_goal_modalities(
-                goal_inputs=goal_inputs,
-                rng=rng,
-                prefer_image_text_per_episode=bool(prefer_image_text_per_episode),
-                force_split_image_and_text=bool(force_split_image_and_text),
-            )
-
-            if int(goal_count) >= 4:
-                if not (
-                    bool(modality_coverage.get("has_image_goal"))
-                    and bool(modality_coverage.get("has_text_description_goal"))
-                ):
+                adjusted_records = _enforce_image_goal_quota(
+                    sampled_records=sampled_records,
+                    all_records=records,
+                    desired_image_goals=int(desired_image_goals),
+                    unique_categories=bool(unique_categories),
+                    instance_usage_counter=active_usage_counter,
+                    rng=rng,
+                )
+                if adjusted_records is None:
                     continue
-            elif int(goal_count) >= 3:
-                if not (
-                    bool(modality_coverage.get("has_image_goal"))
-                    or bool(modality_coverage.get("has_text_description_goal"))
-                ):
-                    continue
+                sampled_records = adjusted_records
 
-            for index, modality in enumerate(goal_modalities):
-                goal_inputs[index]["selected_non_audio_modality"] = str(modality)
-
-            goal_tasks: List[List[Any]] = []
-            for record, goal_input, modality in zip(
-                sampled_records,
-                goal_inputs,
-                goal_modalities,
-            ):
-                task_instance_key = str(record.get("instance_key"))
-                semantic_id = record.get("semantic_id")
-                if not isinstance(semantic_id, int):
-                    inferred = _infer_semantic_id(
-                        str(record.get("instance_key")),
-                        semantic_id,
+                goal_instance_keys = [str(record["instance_key"]) for record in sampled_records]
+                goal_categories = [str(record["category"]) for record in sampled_records]
+                goal_inputs: List[Dict[str, Any]] = []
+                goal_sound_ids: List[str] = []
+                for record in sampled_records:
+                    instance_key = str(record["instance_key"])
+                    full_record = instance_lookup.get(instance_key, {})
+                    goal_input, sound_id = _build_goal_input_entry(
+                        record=record,
+                        instance_record=full_record,
+                        scene_split=scene_split,
+                        rng=rng,
+                        view_strategy=str(goal_image_view_strategy),
                     )
-                    if inferred is None:
-                        raise RuntimeError(
-                            "Failed to infer semantic_id for goal record: "
-                            f"{record.get('instance_key')}"
-                        )
-                    semantic_id = int(inferred)
+                    goal_inputs.append(goal_input)
+                    goal_sound_ids.append(sound_id)
 
-                goal_tasks.append(
-                    [
-                        task_instance_key,
-                        _to_task_modality_token(goal_input, str(modality)),
-                    ]
+                goal_modalities, modality_coverage = _assign_goal_modalities(
+                    goal_inputs=goal_inputs,
+                    rng=rng,
+                    prefer_image_text_per_episode=bool(prefer_image_text_per_episode),
+                    force_split_image_and_text=bool(force_split_image_and_text),
                 )
 
-            start_state = start_sampler(rng) if start_sampler is not None else None
+                if int(total_image_records) >= 2:
+                    if int(goal_count) >= 4:
+                        if not (
+                            bool(modality_coverage.get("has_image_goal"))
+                            and bool(modality_coverage.get("has_text_description_goal"))
+                        ):
+                            continue
+                    elif int(goal_count) >= 3:
+                        if not (
+                            bool(modality_coverage.get("has_image_goal"))
+                            or bool(modality_coverage.get("has_text_description_goal"))
+                        ):
+                            continue
 
-            distance_matrix: Optional[List[List[Optional[float]]]] = None
-            ordered_total_geodesic_distance: Optional[float] = None
-            unordered_total_geodesic_distance: Optional[float] = None
-            if (
-                start_goal_distance_fn is not None
-                and isinstance(start_state, dict)
-                and _is_vec3(start_state.get("position"))
-            ):
-                start_position = [float(v) for v in start_state["position"]]
-                n_goals = int(len(sampled_records))
-                distance_matrix = [
-                    [None for _ in range(n_goals + 1)] for _ in range(n_goals + 1)
-                ]
-                for idx in range(n_goals + 1):
-                    distance_matrix[idx][idx] = 0.0
+                for index, modality in enumerate(goal_modalities):
+                    goal_inputs[index]["selected_non_audio_modality"] = str(modality)
 
-                for goal_idx, goal_record in enumerate(sampled_records):
-                    distance = start_goal_distance_fn(start_position, goal_record)
-                    distance_matrix[0][goal_idx + 1] = distance
-                    distance_matrix[goal_idx + 1][0] = distance
+                goal_tasks: List[List[Any]] = []
+                for record, goal_input, modality in zip(
+                    sampled_records,
+                    goal_inputs,
+                    goal_modalities,
+                ):
+                    task_instance_key = str(record.get("instance_key"))
+                    semantic_id = record.get("semantic_id")
+                    if not isinstance(semantic_id, int):
+                        inferred = _infer_semantic_id(
+                            str(record.get("instance_key")),
+                            semantic_id,
+                        )
+                        if inferred is None:
+                            raise RuntimeError(
+                                "Failed to infer semantic_id for goal record: "
+                                f"{record.get('instance_key')}"
+                            )
+                        semantic_id = int(inferred)
 
-                if goal_pair_distance_fn is not None:
+                    goal_tasks.append(
+                        [
+                            task_instance_key,
+                            _to_task_modality_token(goal_input, str(modality)),
+                        ]
+                    )
+
+                start_state = start_sampler(rng) if start_sampler is not None else None
+
+                distance_matrix: Optional[List[List[Optional[float]]]] = None
+                ordered_total_geodesic_distance: Optional[float] = None
+                unordered_total_geodesic_distance: Optional[float] = None
+                if (
+                    start_goal_distance_fn is not None
+                    and isinstance(start_state, dict)
+                    and _is_vec3(start_state.get("position"))
+                ):
+                    start_position = [float(v) for v in start_state["position"]]
+                    n_goals = int(len(sampled_records))
+                    distance_matrix = [
+                        [None for _ in range(n_goals + 1)] for _ in range(n_goals + 1)
+                    ]
+                    for idx in range(n_goals + 1):
+                        distance_matrix[idx][idx] = 0.0
+
+                    for goal_idx, goal_record in enumerate(sampled_records):
+                        distance = start_goal_distance_fn(start_position, goal_record)
+                        distance_matrix[0][goal_idx + 1] = distance
+                        distance_matrix[goal_idx + 1][0] = distance
+
+                    if goal_pair_distance_fn is not None:
+                        for idx in range(n_goals):
+                            for jdx in range(idx + 1, n_goals):
+                                pair_distance = goal_pair_distance_fn(
+                                    sampled_records[idx],
+                                    sampled_records[jdx],
+                                )
+                                distance_matrix[idx + 1][jdx + 1] = pair_distance
+                                distance_matrix[jdx + 1][idx + 1] = pair_distance
+
+                    (
+                        ordered_total_geodesic_distance,
+                        unordered_total_geodesic_distance,
+                    ) = _compute_total_geodesic_distances_from_matrix(distance_matrix)
+
+                start_position_payload = [0.0, 0.0, 0.0]
+                start_rotation_payload = [0.0, 0.0, 0.0, 1.0]
+                if isinstance(start_state, dict):
+                    if _is_vec3(start_state.get("position")):
+                        start_position_payload = [
+                            float(v) for v in start_state.get("position", start_position_payload)
+                        ]
+                    if isinstance(start_state.get("rotation"), list) and len(start_state.get("rotation")) == 4:
+                        start_rotation_payload = [
+                            float(v) for v in start_state.get("rotation", start_rotation_payload)
+                        ]
+
+                trajectory_payload: Dict[str, Any] = {
+                    "episode_id": str(trajectory_index),
+                    "scene_id": str(episode_scene_id),
+                    "start_position": start_position_payload,
+                    "start_rotation": start_rotation_payload,
+                    "num_goals": int(goal_count),
+                    "goals": goal_tasks,
+                    "ordered_total_geodesic_distance": ordered_total_geodesic_distance,
+                    "unordered_total_geodesic_distance": unordered_total_geodesic_distance,
+                    "object_category": goal_categories[0] if goal_categories else None,
+                    "sound_id": goal_sound_ids[0] if goal_sound_ids else None,
+                    "offset": str(
+                        rng.randint(int(audio_offset_min), int(audio_offset_max))
+                    ),
+                    "duration": str(int(audio_duration)),
+                    "sound_sources": [
+                        {"sound_id": sound_id} for sound_id in goal_sound_ids
+                    ],
+                    "sound_source_schedule": [
+                        str(audio_schedule),
+                        int(audio_duration),
+                    ],
+                    "goal_instance_keys": goal_instance_keys,
+                }
+                distance_constraints_checked = bool(start_goal_distance_fn is not None)
+                valid_distances = True
+                if distance_constraints_checked:
+                    if distance_matrix is None:
+                        valid_distances = False
+                    else:
+                        n_goals = int(len(sampled_records))
+                        for goal_idx in range(n_goals):
+                            distance = distance_matrix[0][goal_idx + 1]
+                            if distance is None or float(distance) < float(min_goal_distance):
+                                valid_distances = False
+                                break
+
+                        if valid_distances and goal_pair_distance_fn is not None:
+                            for idx in range(n_goals):
+                                if not valid_distances:
+                                    break
+                                for jdx in range(idx + 1, n_goals):
+                                    distance = distance_matrix[idx + 1][jdx + 1]
+                                    if (
+                                        distance is None
+                                        or float(distance) < float(min_goal_distance)
+                                    ):
+                                        valid_distances = False
+                                        break
+                else:
+                    valid_distances = False
+
+                trajectory_payload["_distance_constraints_checked"] = bool(
+                    distance_constraints_checked
+                )
+                trajectory_payload["_distance_constraints_satisfied"] = bool(
+                    valid_distances
+                )
+
+                if valid_distances:
+                    best_payload = trajectory_payload
+                    break
+
+                if distance_matrix is not None:
+                    n_goals = int(len(sampled_records))
+                    required_values: List[Optional[float]] = []
+                    required_values.extend(
+                        distance_matrix[0][goal_idx + 1]
+                        for goal_idx in range(n_goals)
+                    )
                     for idx in range(n_goals):
                         for jdx in range(idx + 1, n_goals):
-                            pair_distance = goal_pair_distance_fn(
-                                sampled_records[idx],
-                                sampled_records[jdx],
-                            )
-                            distance_matrix[idx + 1][jdx + 1] = pair_distance
-                            distance_matrix[jdx + 1][idx + 1] = pair_distance
-
-                (
-                    ordered_total_geodesic_distance,
-                    unordered_total_geodesic_distance,
-                ) = _compute_total_geodesic_distances_from_matrix(distance_matrix)
-
-            start_position_payload = [0.0, 0.0, 0.0]
-            start_rotation_payload = [0.0, 0.0, 0.0, 1.0]
-            if isinstance(start_state, dict):
-                if _is_vec3(start_state.get("position")):
-                    start_position_payload = [
-                        float(v) for v in start_state.get("position", start_position_payload)
-                    ]
-                if isinstance(start_state.get("rotation"), list) and len(start_state.get("rotation")) == 4:
-                    start_rotation_payload = [
-                        float(v) for v in start_state.get("rotation", start_rotation_payload)
-                    ]
-
-            trajectory_payload: Dict[str, Any] = {
-                "episode_id": str(trajectory_index),
-                "scene_id": str(episode_scene_id),
-                "start_position": start_position_payload,
-                "start_rotation": start_rotation_payload,
-                "num_goals": int(goal_count),
-                "goals": goal_tasks,
-                "ordered_total_geodesic_distance": ordered_total_geodesic_distance,
-                "unordered_total_geodesic_distance": unordered_total_geodesic_distance,
-                "object_category": goal_categories[0] if goal_categories else None,
-                "sound_id": goal_sound_ids[0] if goal_sound_ids else None,
-                "offset": str(
-                    rng.randint(int(audio_offset_min), int(audio_offset_max))
-                ),
-                "duration": str(int(audio_duration)),
-                "sound_sources": [
-                    {"sound_id": sound_id} for sound_id in goal_sound_ids
-                ],
-                "sound_source_schedule": [
-                    str(audio_schedule),
-                    int(audio_duration),
-                ],
-                "goal_instance_keys": goal_instance_keys,
-            }
-            distance_constraints_checked = bool(start_goal_distance_fn is not None)
-            valid_distances = True
-            if distance_constraints_checked:
-                if distance_matrix is None:
-                    valid_distances = False
+                            required_values.append(distance_matrix[idx + 1][jdx + 1])
+                    null_count = int(sum(value is None for value in required_values))
                 else:
-                    n_goals = int(len(sampled_records))
-                    for goal_idx in range(n_goals):
-                        distance = distance_matrix[0][goal_idx + 1]
-                        if distance is None or float(distance) < float(min_goal_distance):
-                            valid_distances = False
-                            break
+                    null_count = int(goal_count + (goal_count * (goal_count - 1)) // 2)
+                if best_null_count is None or null_count < best_null_count:
+                    best_payload = trajectory_payload
+                    best_null_count = null_count
 
-                    if valid_distances and goal_pair_distance_fn is not None:
-                        for idx in range(n_goals):
-                            if not valid_distances:
-                                break
-                            for jdx in range(idx + 1, n_goals):
-                                distance = distance_matrix[idx + 1][jdx + 1]
-                                if (
-                                    distance is None
-                                    or float(distance) < float(min_goal_distance)
-                                ):
-                                    valid_distances = False
-                                    break
-            else:
-                valid_distances = False
+            if best_payload is None:
+                if int(goal_count) > 2:
+                    goal_count -= 1
+                    continue
+                raise RuntimeError("Failed to build trajectory payload")
 
-            trajectory_payload["_distance_constraints_checked"] = bool(
-                distance_constraints_checked
-            )
-            trajectory_payload["_distance_constraints_satisfied"] = bool(
-                valid_distances
-            )
-
-            if valid_distances:
-                best_payload = trajectory_payload
-                break
-
-            if distance_matrix is not None:
-                n_goals = int(len(sampled_records))
-                required_values: List[Optional[float]] = []
-                required_values.extend(
-                    distance_matrix[0][goal_idx + 1]
-                    for goal_idx in range(n_goals)
+            if bool(best_payload.get("_distance_constraints_checked")) and not bool(
+                best_payload.get("_distance_constraints_satisfied")
+            ):
+                if int(goal_count) > 2:
+                    goal_count -= 1
+                    continue
+                raise RuntimeError(
+                    "Failed to satisfy min-distance constraints for episode "
+                    f"{trajectory_index} after {int(distance_max_attempts)} attempts."
                 )
-                for idx in range(n_goals):
-                    for jdx in range(idx + 1, n_goals):
-                        required_values.append(distance_matrix[idx + 1][jdx + 1])
-                null_count = int(sum(value is None for value in required_values))
-            else:
-                null_count = int(goal_count + (goal_count * (goal_count - 1)) // 2)
-            if best_null_count is None or null_count < best_null_count:
-                best_payload = trajectory_payload
-                best_null_count = null_count
 
-        if best_payload is None:
-            raise RuntimeError("Failed to build trajectory payload")
-        if bool(best_payload.get("_distance_constraints_checked")) and not bool(
-            best_payload.get("_distance_constraints_satisfied")
-        ):
-            raise RuntimeError(
-                "Failed to satisfy min-distance constraints for episode "
-                f"{trajectory_index} after {int(distance_max_attempts)} attempts."
-            )
-        trajectories.append(best_payload)
-        for instance_key in best_payload.get("goal_instance_keys", []):
-            if isinstance(instance_key, str):
-                instance_usage_counter[instance_key] += 1
-        if "goal_instance_keys" in best_payload:
-            best_payload.pop("goal_instance_keys", None)
-        if "_distance_constraints_checked" in best_payload:
-            best_payload.pop("_distance_constraints_checked", None)
-        if "_distance_constraints_satisfied" in best_payload:
-            best_payload.pop("_distance_constraints_satisfied", None)
-        goal_count_hist[int(goal_count)] += 1
+            trajectories.append(best_payload)
+            for instance_key in best_payload.get("goal_instance_keys", []):
+                if isinstance(instance_key, str):
+                    instance_usage_counter[instance_key] += 1
+            if "goal_instance_keys" in best_payload:
+                best_payload.pop("goal_instance_keys", None)
+            if "_distance_constraints_checked" in best_payload:
+                best_payload.pop("_distance_constraints_checked", None)
+            if "_distance_constraints_satisfied" in best_payload:
+                best_payload.pop("_distance_constraints_satisfied", None)
+            goal_count_hist[int(goal_count)] += 1
+            break
 
     distinct_goal_instances = int(len(instance_usage_counter))
     reused_instance_count = int(
@@ -1317,7 +1333,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-trajectories",
         type=int,
-        default=100,
+        default=20,
         help="Number of trajectories to generate",
     )
     parser.add_argument(
@@ -1383,7 +1399,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--exp-config",
         type=Path,
-        default=Path("configs/semantic_audionav/av_nav/mp3d/semantic_audiogoal.yaml"),
+        default=Path("configs/omni-long/mp3d/omni-long_semantic_audio.yaml"),
         help="Habitat task config used to instantiate simulator",
     )
     parser.add_argument(
@@ -1440,7 +1456,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--distance-max-attempts",
         type=int,
-        default=2000,
+        default=20000,
         help="Max re-sampling attempts per trajectory to reduce unreachable goal distances",
     )
     parser.add_argument(

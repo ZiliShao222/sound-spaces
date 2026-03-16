@@ -191,26 +191,16 @@ def main() -> None:
                     goal_input_summary["image_path"] = image_path
                 goal_input_summaries.append(goal_input_summary)
 
-            if hasattr(policy, "set_episode_goal_payloads"):
-                policy.set_episode_goal_payloads(goal_payloads)
-            else:
-                setattr(policy, "_episode_goal_payloads", tuple(goal_payloads))
+            context_goal_payloads = tuple(goal_payloads)
             policy.reset(env=env, episode=episode, observations=observations)
 
             print(
-                "[episode {idx}] id={eid} goals={goals}".format(
+                "[policy_task] episode={idx} id={eid} task={task}".format(
                     idx=episode_index,
                     eid=episode_id_text,
-                    goals=goal_summary,
+                    task=goal_summary,
                 )
             )
-            for goal_input_summary in goal_input_summaries:
-                print(
-                    "  [goal {gi}] input={payload}".format(
-                        gi=goal_input_summary["goal_index"],
-                        payload=_format_goal_input_summary(goal_input_summary),
-                    )
-                )
 
             task = getattr(env, "_task", None)
 
@@ -223,7 +213,10 @@ def main() -> None:
             audio_active_steps = 0
 
             while not done and step_idx < max_steps:
-                context = build_lifelong_eval_context(step_idx)
+                context = build_lifelong_eval_context(
+                    step_idx,
+                    goal_payloads=context_goal_payloads,
+                )
                 action = policy.act(
                     env=env,
                     episode=episode,
@@ -327,7 +320,6 @@ def main() -> None:
                 if key in sum_metrics:
                     running_logged_metrics[key] = sum_metrics[key] / float(episodes_seen)
 
-            task = getattr(env, "_task", None)
             row = {
                 "episode_index": episode_index,
                 "episode_id": str(getattr(episode, "episode_id", "")),
@@ -339,10 +331,9 @@ def main() -> None:
                 "metrics": metrics,
                 "goal_specs": goal_summary,
                 "goal_inputs": goal_input_summaries,
-                "goal_order_mode": str(getattr(task, "_mode", getattr(cfg.TASK, "GOAL_ORDER_MODE", "ordered"))),
-                "goal_state_map": getattr(task, "goal_state_map", {}),
-                "submit_count": int(getattr(task, "submit_count", 0)),
-                "submit_limit": int(getattr(task, "submit_limit", 0)),
+                "goal_order_mode": str(
+                    getattr(episode, "goal_order_mode", getattr(cfg.TASK, "GOAL_ORDER_MODE", "ordered"))
+                ),
             }
             episode_writer.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
             episode_writer.flush()

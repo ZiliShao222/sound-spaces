@@ -96,6 +96,8 @@ class PPO(nn.Module):
                     actions_batch,
                 )
 
+                dist_entropy = dist_entropy.mean()
+
                 ratio = torch.exp(
                     action_log_probs - old_action_log_probs_batch
                 )

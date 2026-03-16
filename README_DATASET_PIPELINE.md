@@ -207,7 +207,7 @@ python scripts/export_valid_instances.py "${SCENE}" \
 python scripts/build_trajectories_from_valid_instances.py \
   --input "${OUT}/valid_instances.json" \
   --output "${OUT}/trajectory_dataset.json" \
-  --num-trajectories 500 --min-goals 2 --max-goals 5 --seed 2006 \
+  --num-trajectories 50 --min-goals 2 --max-goals 5 --seed 2026 \
   --sim-start --min-goal-distance 4.0
 
 python scripts/pack_semantic_audionav_json_gz.py \

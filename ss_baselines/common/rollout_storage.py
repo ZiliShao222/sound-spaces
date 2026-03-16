@@ -36,8 +36,8 @@ class RolloutStorage:
 
         self.recurrent_hidden_states = torch.zeros(
             num_steps + 1,
-            num_recurrent_layers,
             num_envs,
+            num_recurrent_layers,
             recurrent_hidden_state_size,
         )
 
@@ -159,7 +159,7 @@ class RolloutStorage:
                     )
 
                 recurrent_hidden_states_batch.append(
-                    self.recurrent_hidden_states[0, :, ind]
+                    self.recurrent_hidden_states[0, ind]
                 )
 
                 actions_batch.append(self.actions[:, ind])
@@ -191,9 +191,8 @@ class RolloutStorage:
             )
             adv_targ = torch.stack(adv_targ, 1)
 
-            # States is just a (num_recurrent_layers, N, -1) tensor
             recurrent_hidden_states_batch = torch.stack(
-                recurrent_hidden_states_batch, 1
+                recurrent_hidden_states_batch, 0
             )
 
             # Flatten the (T, N, ...) tensors to (T * N, ...)
