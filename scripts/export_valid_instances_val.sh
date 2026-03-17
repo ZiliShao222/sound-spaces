@@ -4,10 +4,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-MAX_JOBS="${MAX_JOBS:-16}"
+DATASET_SPLIT="${DATASET_SPLIT:-val}"
+MAX_JOBS="${MAX_JOBS:-65}"
 NUM_GPUS="${NUM_GPUS:-8}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-output}"
+SKIP_EXPORT_VALID_INSTANCES="${SKIP_EXPORT_VALID_INSTANCES:-1}"
 
-SCENES=(
+VAL_SCENES=(
   "x8F5xyUWy9e"
   "QUCTc6BB5sX"
   "EU6Fwq7SyZv"
@@ -21,48 +24,131 @@ SCENES=(
   "8194nk5LbLH"
 )
 
-# SCENES=(
-  # 'sT4fr6TAbpF' 
-          # 'E9uDoFAP3SH' 
-          # 'VzqfbhrpDEA' 
-          # 'kEZ7cmS4wCh' 
-          # '29hnd4uzFmX' 
-          # 'ac26ZMwG7aT'
-              # 'i5noydFURQK'
-              # 's8pcmisQ38h'
-              # 'rPc6DW4iMge'
-              # 'EDJbREhghzL'
-              # 'mJXqzFtmKg4'
-              # 'B6ByNegPMKs'
-              # 'JeFG25nYj2p'
-              # '82sE5b5pLXE'
-              # 'D7N2EKCX4Sj'
-              # '7y3sRwLe3Va'
-              # 'HxpKQynjfin'
-              # '5LpN3gDmAk7',
-              # 'gTV8FGcVJC9', 'ur6pFq6Qu1A', 'qoiz87JEwZ2', 'PuKPg4mmafe', 'VLzqgDo317F', 'aayBHfsNo7d',
-              # 'JmbYfDe2QKZ', 'XcA2TqTSSAj', '8WUmhLawc2A', 'sKLMLpTHeUy', 'r47D5H71a5s', 'Uxmj2M2itWa',
-              # 'Pm6F8kyY3z2', 'p5wJjkQkbXX', '759xd9YjKW5', 'JF19kD82Mey', 'V2XKFyX4ASd', '1LXtFkjw3qL',
-              # '17DRP5sb8fy', '5q7pvUzZiYa', 'VVfe2KiqLaN', 'Vvot9Ly1tCj', 'ULsKaCPVFJR', 'D7G3Y4RVNrH',
-              # 'uNb9QFRL6hY', 'ZMojNkEp431', '2n8kARJN3HM', 'vyrNrziPKCB', 'e9zR4mvMWw7', 'r1Q1Z4BcV1o',
-              # 'PX4nDJXEHrG', 'YmJkqBEsHnH', 'b8cTxDM8gDG', 'GdvgFV5R1Z5', 'pRbA3pwrgk9', 'jh4fc5c5qoQ',
-              # '1pXnuDYAj8r', 'S9hNv5qa7GM', 'VFuaQ6m2Qom', 'cV4RVeZvu5T', 'SN83YJsR3w2'
-# )
+TRAIN_SCENES=(
+  # "sT4fr6TAbpF"
+  # "E9uDoFAP3SH"
+  # "VzqfbhrpDEA"
+  # "kEZ7cmS4wCh"
+  # "29hnd4uzFmX"
+  # "ac26ZMwG7aT"
+  # "i5noydFURQK"
+  # "s8pcmisQ38h"
+  # "rPc6DW4iMge"
+  # "EDJbREhghzL"
+  # "mJXqzFtmKg4"
+  # "B6ByNegPMKs"
+  # "JeFG25nYj2p"
+  # "82sE5b5pLXE"
+  # "D7N2EKCX4Sj"
+  # "7y3sRwLe3Va"
+  # "HxpKQynjfin"
+  # "5LpN3gDmAk7"
+  # "gTV8FGcVJC9"
+  # "ur6pFq6Qu1A"
+  # "qoiz87JEwZ2"
+  # "PuKPg4mmafe"
+  # "VLzqgDo317F"
+  # "aayBHfsNo7d"
+  # "JmbYfDe2QKZ"
+  # "XcA2TqTSSAj"
+  # "8WUmhLawc2A"
+  # "sKLMLpTHeUy"
+  # "r47D5H71a5s"
+  # "Uxmj2M2itWa"
+  # "Pm6F8kyY3z2"
+  # "p5wJjkQkbXX"
+  # "759xd9YjKW5"
+  # "JF19kD82Mey"
+  # "V2XKFyX4ASd"
+  # "1LXtFkjw3qL"
+  # "17DRP5sb8fy"
+  # "5q7pvUzZiYa"
+  # "VVfe2KiqLaN"
+  # "Vvot9Ly1tCj"
+  # "ULsKaCPVFJR"
+  # "D7G3Y4RVNrH"
+  # "uNb9QFRL6hY"
+  # "ZMojNkEp431"
+  # "2n8kARJN3HM"
+  # "vyrNrziPKCB"
+  # "e9zR4mvMWw7"
+  # "r1Q1Z4BcV1o"
+  # "PX4nDJXEHrG"
+  # "YmJkqBEsHnH"
+  # "b8cTxDM8gDG"
+  # "GdvgFV5R1Z5"
+  # "pRbA3pwrgk9"
+  # "jh4fc5c5qoQ"
+  # "dhjEzFoUFzH"
+  # "gZ6f7yhEvPG"
+  # "1pXnuDYAj8r"
+  # "S9hNv5qa7GM"
+  # "VFuaQ6m2Qom"
+  # "cV4RVeZvu5T"
+  # "SN83YJsR3w2"
+)
+
+TEST_SCENES=(
+  "pa4otMbVnkk"
+  "yqstnuAEVhm"
+  "5ZKStnWn8Zo"
+  "Vt2qJdWjCF2"
+  "wc2JMjhGNzB"
+  "WYY7iVyf5p8"
+  "fzynW3qQPVF"
+  "UwV83HsGsw3"
+  "q9vSo1VnCiC"
+  "ARNzJeq3xxb"
+  "rqfALeAoiTq"
+  "gYvKGZ5eRqb"
+  "YFuZgdQ5vWj"
+  "jtcxE69GiFV"
+  "gxdoqLR6rwA"
+  "2t7WUuJeko7"
+  "RPmz2sHmrrY"
+  "YVUC4YcDtcY"
+)
+
+case "${DATASET_SPLIT}" in
+  val)
+    SCENES=("${VAL_SCENES[@]}")
+    DEFAULT_NUM_TRAJECTORIES=20
+    ;;
+  train)
+    SCENES=("${TRAIN_SCENES[@]}")
+    DEFAULT_NUM_TRAJECTORIES=10000
+    ;;
+  test)
+    SCENES=("${TEST_SCENES[@]}")
+    DEFAULT_NUM_TRAJECTORIES=20
+    ;;
+  *)
+    echo "DATASET_SPLIT must be one of: val, train, test; got ${DATASET_SPLIT}" >&2
+    exit 1
+    ;;
+esac
+
+NUM_TRAJECTORIES="${NUM_TRAJECTORIES:-${DEFAULT_NUM_TRAJECTORIES}}"
+DISTANCE_MAX_ATTEMPTS="${DISTANCE_MAX_ATTEMPTS:-200}"
+START_DISTANCE_RETRIES="${START_DISTANCE_RETRIES:-8}"
 
 
 EXPORT_ARGS=(
-  --no-filter-instances
+  # --no-filter-instances
   # --description-max-images 4
   # --no-generate-descriptions
 )
 
 TRAJ_ARGS=(
-  --num-trajectories 20
+  --num-trajectories "${NUM_TRAJECTORIES}"
   --min-goals 2
   --max-goals 5
   --seed 0
   --sim-start
-  --min-goal-distance 4.0
+  --start-min-clearance 0.01
+  --start-distance-retries "${START_DISTANCE_RETRIES}"
+  --distance-max-attempts "${DISTANCE_MAX_ATTEMPTS}"
+  --min-goal-distance 4
 )
 
 cd "${REPO_ROOT}"
@@ -80,12 +166,12 @@ run_scene() {
   local gpu_id="$2"
   shift 2
 
-  local out="output/${scene}"
+  local out="${OUTPUT_ROOT}/${scene}"
   local log_file="${out}/pipeline.log"
   mkdir -p "${out}"
 
   echo "============================================================"
-  echo "[launch] scene=${scene} gpu=${gpu_id} log=${log_file}"
+  echo "[launch] scene=${scene} gpu=${gpu_id} log= ${log_file}"
 
   (
     set -euo pipefail
@@ -93,12 +179,14 @@ run_scene() {
 
     echo "[pipeline] scene=${scene} gpu=${gpu_id}"
 
-    echo "[1/3] export valid instances"
-    python scripts/export_valid_instances.py \
-      "${scene}" \
-      --yolo-device cuda:0 \
-      "${EXPORT_ARGS[@]}" \
-      "$@"
+
+    # echo "[1/3] export valid instances"
+    # python scripts/export_valid_instances.py \
+    #   "${scene}" \
+    #   --yolo-device cuda:0 \
+    #   --output-root "${OUTPUT_ROOT}" \
+    #   "${EXPORT_ARGS[@]}" \
+    #   "$@"
 
     echo "[2/3] build trajectory dataset"
     python scripts/build_trajectories_from_valid_instances.py \
@@ -134,6 +222,14 @@ if (( NUM_GPUS < 1 )); then
   exit 1
 fi
 
+if (( NUM_TRAJECTORIES < 1 )); then
+  echo "NUM_TRAJECTORIES must be >= 1, got ${NUM_TRAJECTORIES}" >&2
+  exit 1
+fi
+
+echo "============================================================"
+echo "[config] split=${DATASET_SPLIT} scenes=${#SCENES[@]} output_root=${OUTPUT_ROOT} num_trajectories=${NUM_TRAJECTORIES} max_jobs=${MAX_JOBS} num_gpus=${NUM_GPUS} skip_export_valid_instances=${SKIP_EXPORT_VALID_INSTANCES}"
+
 scene_index=0
 for scene in "${SCENES[@]}"; do
   gpu_id=$(( scene_index % NUM_GPUS ))
@@ -148,4 +244,4 @@ done
 wait
 
 echo "============================================================"
-echo "[pipeline] done: ${#SCENES[@]} val scenes (max_jobs=${MAX_JOBS}, num_gpus=${NUM_GPUS})"
+echo "[pipeline] done: ${#SCENES[@]} ${DATASET_SPLIT} scenes (max_jobs=${MAX_JOBS}, num_gpus=${NUM_GPUS}, num_trajectories=${NUM_TRAJECTORIES})"

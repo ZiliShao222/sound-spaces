@@ -24,6 +24,56 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 
+CATEGORY_TO_TASK_CATEGORY_ID: Dict[str, int] = {
+    "chair": 0,
+    "table": 1,
+    "picture": 2,
+    "cabinet": 3,
+    "cushion": 4,
+    "sofa": 5,
+    "bed": 6,
+    "chest_of_drawers": 7,
+    "plant": 8,
+    "sink": 9,
+    "toilet": 10,
+    "stool": 11,
+    "towel": 12,
+    "tv_monitor": 13,
+    "shower": 14,
+    "bathtub": 15,
+    "counter": 16,
+    "fireplace": 17,
+    "gym_equipment": 18,
+    "seating": 19,
+    "clothes": 20,
+}
+
+
+CATEGORY_TO_MP3D_CATEGORY_ID: Dict[str, int] = {
+    "chair": 3,
+    "table": 5,
+    "picture": 6,
+    "cabinet": 7,
+    "cushion": 8,
+    "sofa": 10,
+    "bed": 11,
+    "chest_of_drawers": 13,
+    "plant": 14,
+    "sink": 15,
+    "toilet": 18,
+    "stool": 19,
+    "towel": 20,
+    "tv_monitor": 22,
+    "shower": 23,
+    "bathtub": 25,
+    "counter": 26,
+    "fireplace": 27,
+    "gym_equipment": 33,
+    "seating": 34,
+    "clothes": 38,
+}
+
+
 def _read_json(path: Path) -> Any:
     name = path.name.lower()
     if name.endswith(".json.gz") or name.endswith(".gz"):
@@ -144,6 +194,8 @@ def main() -> None:
         "split": split_name,
         "episodes": [],
         "content_scenes_path": "{data_path}/content/{scene}.json.gz",
+        "category_to_task_category_id": CATEGORY_TO_TASK_CATEGORY_ID,
+        "category_to_mp3d_category_id": CATEGORY_TO_MP3D_CATEGORY_ID,
     }
     _write_json_gz(split_index_path, split_index_payload, pretty=args.pretty)
 

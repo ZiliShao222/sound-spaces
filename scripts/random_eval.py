@@ -15,7 +15,7 @@ import numpy as np
 
 import soundspaces  # noqa: F401
 from habitat.datasets import make_dataset
-from ss_baselines.av_nav.config.default import get_config
+from ss_baselines.omni_long.config.default import get_config
 from ss_baselines.common.environments import get_env_class
 from ss_baselines.common.utils import observations_to_image
 from habitat.utils.visualizations.utils import images_to_video
@@ -72,7 +72,7 @@ def main() -> None:
     parser.add_argument(
         "--exp-config",
         type=str,
-        default="ss_baselines/av_nav/config/audionav/mp3d/random_eval.yaml",
+        default="configs/omni-long/mp3d/omni-long_semantic_audio.yaml",
     )
     parser.add_argument("--output-dir", type=str, default="data/random_eval/mp3d")
     parser.add_argument("--split", type=str, default="val_telephone")

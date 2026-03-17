@@ -19,7 +19,7 @@ except Exception:
 import habitat
 import habitat_sim
 import soundspaces  # noqa: F401
-from ss_baselines.av_nav.config.default import get_task_config
+from ss_baselines.omni_long.config.default import get_task_config
 import numpy as np
 from habitat.sims.habitat_simulator.actions import HabitatSimActions
 from soundspaces.tasks.shortest_path_follower import ShortestPathFollower

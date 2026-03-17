@@ -18,7 +18,7 @@ from typing import Dict, Optional
 
 from habitat.core.agent import Agent
 from habitat.core.env import Env
-from ss_baselines.av_nav.config import get_task_config
+from ss_baselines.omni_long.config import get_task_config
 
 
 class Benchmark:

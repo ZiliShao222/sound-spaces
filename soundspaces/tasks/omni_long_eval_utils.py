@@ -17,7 +17,7 @@ from PIL import Image
 import soundspaces  # noqa: F401 - register datasets/tasks/sims
 from habitat.utils.visualizations.utils import images_to_video
 
-from ss_baselines.av_nav.config.default import get_task_config
+from ss_baselines.omni_long.config.default import get_task_config
 from ss_baselines.common.omni_long_eval_policy import (
     build_lifelong_eval_context,
     build_lifelong_eval_policy,

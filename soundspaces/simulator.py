@@ -88,6 +88,10 @@ class SoundSpacesSim(Simulator, ABC):
         pass
 
     def __init__(self, config: Config) -> None:
+        raise RuntimeError(
+            "Legacy discrete SoundSpacesSim has been retired in this repository. "
+            "Use ContinuousSoundSpacesSim instead."
+        )
         self.config = self.habitat_config = config
         agent_config = self._get_agent_config()
         sim_sensors = []

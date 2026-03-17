@@ -327,16 +327,16 @@ def _build_imagenav_args(
         hfov=args.hfov,
         seed=int(args.seed),
         viewpoint_sampling_mode="uniform_floor_grid",
-        uniform_grid_step=0.3,
+        uniform_grid_step=0.2,
         horizontal_only_rotation=args.horizontal_only_rotation,
         sensor_height=args.sensor_height,
         search_radius=1.0,
-        min_surface_offset=0.35,
+        min_surface_offset=0.25,
         candidate_angle_step=30,
-        radial_step=0.15,
+        radial_step=0.1,
         radial_step_jitter=0.05,
         angle_jitter=10.0,
-        min_edge_clearance=0.1,
+        min_edge_clearance=0.05,
         min_iou=0.2,
         min_target_detection_coverage=float(args.min_target_detection_coverage),
         max_floor_levels=args.max_floor_levels,
@@ -351,7 +351,7 @@ def _build_imagenav_args(
         floor_height_tolerance=0.25,
         min_viewpoint_angle_sep=30,
         min_viewpoint_separation=0.45,
-        max_snap_distance=0.5,
+        max_snap_distance=0.6,
         object_clearance=0.1,
         position_adjust_max=0.25,
         position_adjust_step=0.05,
@@ -367,6 +367,7 @@ def _write_render_metadata(
     target_views: List[Dict[str, Any]],
     invalid_views: List[Dict[str, Any]],
     object_output_dir: Path,
+    scan_debug: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Path, Path]:
     object_output_dir.mkdir(parents=True, exist_ok=True)
     object_views_json = object_output_dir / "views.json"
@@ -400,9 +401,28 @@ def _write_render_metadata(
         "object_center": _round_list(target.center),
         "object_sizes": _round_list(target.sizes),
         "horizontal_radius": round(float(target.horizontal_radius), 3),
+        "object_base_y": round(float(target.center[1] - 0.5 * target.sizes[1]), 3),
+        "floor_index": (
+            int(target_floor_level.index) if target_floor_level is not None else None
+        ),
+        "floor_y": (
+            round(float(target_floor_level.y), 3)
+            if target_floor_level is not None
+            else None
+        ),
+        "num_valid_views": len(target_views),
         "num_invalid_views": len(invalid_views),
         "invalid_views": invalid_views,
     }
+    if isinstance(scan_debug, dict):
+        if isinstance(scan_debug.get("scan_diagnostics"), dict):
+            invalid_payload["scan_diagnostics"] = scan_debug["scan_diagnostics"]
+        if isinstance(scan_debug.get("reason_counts"), dict):
+            invalid_payload["reason_counts"] = scan_debug["reason_counts"]
+        if isinstance(scan_debug.get("stage_counts"), dict):
+            invalid_payload["stage_counts"] = scan_debug["stage_counts"]
+        if isinstance(scan_debug.get("failure_summary"), dict):
+            invalid_payload["failure_summary"] = scan_debug["failure_summary"]
     invalid_views_json.write_text(
         json.dumps(invalid_payload, indent=2, ensure_ascii=False)
     )
@@ -700,12 +720,16 @@ def main() -> None:
             target_views, invalid_views = image_scanner._scan_target(
                 render_target, object_output_dir
             )
+            scan_debug = getattr(image_scanner, "_last_scan_debug", {}).get(
+                int(render_target.semantic_id)
+            )
             object_views_json, invalid_views_json = _write_render_metadata(
                 image_scanner,
                 render_target,
                 target_views,
                 invalid_views,
                 object_output_dir,
+                scan_debug,
             )
             pose_only_views = [
                 image_scanner._pose_only_view(view) for view in target_views
@@ -723,6 +747,9 @@ def main() -> None:
                 }
             else:
                 reason_counts, stage_counts = _summarize_invalid_views(invalid_views)
+                if isinstance(scan_debug, dict):
+                    reason_counts = scan_debug.get("reason_counts", reason_counts)
+                    stage_counts = scan_debug.get("stage_counts", stage_counts)
                 no_image_instances.append(
                     {
                         "semantic_id": int(obj.semantic_id),
@@ -737,6 +764,16 @@ def main() -> None:
                         "invalid_views": invalid_views,
                         "reason_counts": reason_counts,
                         "stage_counts": stage_counts,
+                        "scan_diagnostics": (
+                            scan_debug.get("scan_diagnostics")
+                            if isinstance(scan_debug, dict)
+                            else None
+                        ),
+                        "failure_summary": (
+                            scan_debug.get("failure_summary")
+                            if isinstance(scan_debug, dict)
+                            else None
+                        ),
                     }
                 )
 

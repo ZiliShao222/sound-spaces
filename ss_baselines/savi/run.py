@@ -34,7 +34,7 @@ def main():
         "--exp-config",
         type=str,
         # required=True,
-        default='av_nav/config/pointgoal_rgb.yaml',
+        default='configs/omni-long/mp3d/omni-long_semantic_audio.yaml',
         help="path to config yaml containing info about experiment",
     )
     parser.add_argument(

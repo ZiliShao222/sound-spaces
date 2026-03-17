@@ -22,10 +22,11 @@ import math
 import random
 import re
 import sys
+from functools import lru_cache
 from itertools import permutations
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Set, Tuple
 from tqdm import tqdm
 import numpy as np
 
@@ -53,6 +54,22 @@ def _round_vec3(value: Optional[List[float]], digits: int = 3) -> Optional[List[
     if value is None or not _is_vec3(value):
         return None
     return [round(float(v), digits) for v in value]
+
+
+def _goal_record_cache_key(goal_record: Dict[str, Any]) -> str:
+    instance_key = goal_record.get("instance_key")
+    if isinstance(instance_key, str) and instance_key:
+        return instance_key
+
+    semantic_id = goal_record.get("semantic_id")
+    if isinstance(semantic_id, int):
+        return f"semantic:{int(semantic_id)}"
+
+    center = goal_record.get("center")
+    if _is_vec3(center):
+        return "center:" + ",".join(f"{float(v):.3f}" for v in center)
+
+    return repr(sorted(goal_record.items()))
 
 
 def _load_multimodal_module() -> Any:
@@ -146,6 +163,63 @@ def _nearest_floor_y_value(y_value: float, floor_levels: List[Any]) -> float:
         key=lambda floor: abs(float(y_value) - float(getattr(floor, "y", y_value))),
     )
     return float(getattr(closest, "y", y_value))
+
+
+def _preferred_floor_levels_for_goals(
+    goal_records: Optional[List[Dict[str, Any]]],
+    floor_levels: List[Any],
+) -> List[Any]:
+    if not goal_records or not floor_levels:
+        return floor_levels
+
+    preferred_indices: Set[int] = set()
+    preferred_floor_ys: Set[float] = set()
+
+    for goal_record in goal_records:
+        nav_floor_index = goal_record.get("nav_floor_index")
+        if isinstance(nav_floor_index, int) and nav_floor_index >= 0:
+            preferred_indices.add(int(nav_floor_index))
+
+        nav_floor_y = goal_record.get("nav_floor_y")
+        if isinstance(nav_floor_y, (int, float)):
+            _, nearest_floor_y, _ = _nearest_floor(float(nav_floor_y), floor_levels)
+            if nearest_floor_y is not None:
+                preferred_floor_ys.add(round(float(nearest_floor_y), 3))
+            continue
+
+        center = goal_record.get("center")
+        base_y: Optional[float] = None
+        if _is_vec3(center):
+            base_y = float(center[1])
+            bbox_size = goal_record.get("bbox_size")
+            if _is_vec3(bbox_size):
+                base_y -= 0.5 * float(bbox_size[1])
+
+        if base_y is None:
+            continue
+
+        _, nearest_floor_y, _ = _nearest_floor(float(base_y), floor_levels)
+        if nearest_floor_y is not None:
+            preferred_floor_ys.add(round(float(nearest_floor_y), 3))
+
+    preferred_levels: List[Any] = []
+    seen = set()
+    for floor in floor_levels:
+        floor_index = int(getattr(floor, "index", -1))
+        floor_y = round(float(getattr(floor, "y", 0.0)), 3)
+        if (
+            floor_index in preferred_indices
+            or floor_y in preferred_floor_ys
+        ):
+            floor_key = (floor_index, floor_y)
+            if floor_key in seen:
+                continue
+            seen.add(floor_key)
+            preferred_levels.append(floor)
+
+    if preferred_levels:
+        return preferred_levels
+    return floor_levels
 
 
 def _snap_navmesh_point(
@@ -249,6 +323,7 @@ def _build_start_state(
     sim: Any,
     rng: random.Random,
     floor_levels: List[Any],
+    preferred_floor_levels: Optional[List[Any]],
     min_clearance: float,
     max_attempts: int,
     floor_height_tolerance: float,
@@ -257,14 +332,38 @@ def _build_start_state(
     hfov: float,
     sensor_height: float,
 ) -> Dict[str, Any]:
-    start_position = multimodal_module._sample_start_state(
-        pathfinder=sim.pathfinder,
-        rng=rng,
-        min_clearance=float(min_clearance),
-        max_attempts=int(max_attempts),
-        floor_levels=floor_levels,
-        floor_height_tolerance=float(floor_height_tolerance),
-    )
+    start_position: Optional[np.ndarray] = None
+
+    preferred_levels = preferred_floor_levels or []
+    attempt_plan: List[Tuple[List[Any], int]] = []
+    if preferred_levels and preferred_levels != floor_levels:
+        preferred_attempts = int(max(1, round(0.7 * int(max_attempts))))
+        fallback_attempts = int(max(1, int(max_attempts) - preferred_attempts))
+        attempt_plan.append((preferred_levels, preferred_attempts))
+        attempt_plan.append((floor_levels, fallback_attempts))
+    else:
+        attempt_plan.append((floor_levels, int(max_attempts)))
+
+    last_error: Optional[RuntimeError] = None
+    for active_floor_levels, active_max_attempts in attempt_plan:
+        try:
+            start_position = multimodal_module._sample_start_state(
+                pathfinder=sim.pathfinder,
+                rng=rng,
+                min_clearance=float(min_clearance),
+                max_attempts=int(active_max_attempts),
+                floor_levels=active_floor_levels,
+                floor_height_tolerance=float(floor_height_tolerance),
+            )
+            break
+        except RuntimeError as exc:
+            last_error = exc
+
+    if start_position is None:
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Failed to sample a valid start position within max attempts.")
+
     yaw = rng.uniform(-math.pi, math.pi)
     rotation = multimodal_module._yaw_to_quaternion(yaw)
     return {
@@ -284,7 +383,8 @@ def _build_pathfinder_simulator(
     gpu_device_id: int,
 ) -> Any:
     try:
-        from ss_baselines.av_nav.config.default import get_task_config
+        import soundspaces  # noqa: F401 - register SoundSpaces simulators/tasks/datasets
+        from ss_baselines.omni_long.config.default import get_task_config
         from habitat.sims import make_sim
     except Exception as exc:
         raise RuntimeError(
@@ -534,6 +634,18 @@ def _record_has_image(record: Dict[str, Any]) -> bool:
     return bool(record.get("has_image"))
 
 
+def _max_feasible_image_goal_count(
+    records: List[Dict[str, Any]],
+    unique_categories: bool,
+) -> int:
+    image_records = [record for record in records if _record_has_image(record)]
+    if not image_records:
+        return 0
+    if not unique_categories:
+        return int(len(image_records))
+    return int(len({str(record.get("category")) for record in image_records}))
+
+
 def _candidate_usage(
     record: Dict[str, Any],
     instance_usage_counter: Optional[Counter],
@@ -559,6 +671,218 @@ def _pick_low_usage_candidate(
     return rng.choice(best)
 
 
+def _is_candidate_compatible_with_selected(
+    candidate: Dict[str, Any],
+    selected: List[Dict[str, Any]],
+    goal_compatibility_map: Optional[Dict[str, FrozenSet[str]]],
+) -> bool:
+    if goal_compatibility_map is None:
+        return True
+
+    candidate_key = _goal_record_cache_key(candidate)
+    candidate_compatible_keys = goal_compatibility_map.get(candidate_key)
+    if candidate_compatible_keys is None:
+        return False
+
+    for selected_record in selected:
+        selected_key = _goal_record_cache_key(selected_record)
+        if selected_key == candidate_key:
+            return False
+        if selected_key not in candidate_compatible_keys:
+            return False
+    return True
+
+
+def _count_remaining_compatible_choices(
+    candidate: Dict[str, Any],
+    selected: List[Dict[str, Any]],
+    records: List[Dict[str, Any]],
+    unique_categories: bool,
+    goal_compatibility_map: Optional[Dict[str, FrozenSet[str]]],
+) -> int:
+    chosen = list(selected) + [candidate]
+    chosen_instance_keys = {str(record["instance_key"]) for record in chosen}
+    chosen_categories = {str(record["category"]) for record in chosen}
+
+    if unique_categories:
+        feasible_categories: Set[str] = set()
+        for other in records:
+            other_key = str(other["instance_key"])
+            other_category = str(other["category"])
+            if other_key in chosen_instance_keys or other_category in chosen_categories:
+                continue
+            if not _is_candidate_compatible_with_selected(
+                other,
+                chosen,
+                goal_compatibility_map,
+            ):
+                continue
+            feasible_categories.add(other_category)
+        return int(len(feasible_categories))
+
+    feasible_count = 0
+    for other in records:
+        other_key = str(other["instance_key"])
+        if other_key in chosen_instance_keys:
+            continue
+        if not _is_candidate_compatible_with_selected(
+            other,
+            chosen,
+            goal_compatibility_map,
+        ):
+            continue
+        feasible_count += 1
+    return int(feasible_count)
+
+
+def _has_feasible_goal_subset(
+    records: List[Dict[str, Any]],
+    num_goals: int,
+    unique_categories: bool,
+    goal_compatibility_map: Optional[Dict[str, FrozenSet[str]]],
+) -> bool:
+    if int(num_goals) <= 0:
+        return False
+
+    deduped_records: List[Dict[str, Any]] = []
+    seen_keys: Set[str] = set()
+    for record in records:
+        record_key = _goal_record_cache_key(record)
+        if record_key in seen_keys:
+            continue
+        seen_keys.add(record_key)
+        if goal_compatibility_map is not None and record_key not in goal_compatibility_map:
+            continue
+        deduped_records.append(record)
+
+    if unique_categories:
+        max_possible = len({str(record["category"]) for record in deduped_records})
+    else:
+        max_possible = len(deduped_records)
+    if int(num_goals) > int(max_possible):
+        return False
+
+    if goal_compatibility_map is None:
+        return True
+
+    record_by_key: Dict[str, Dict[str, Any]] = {
+        _goal_record_cache_key(record): record for record in deduped_records
+    }
+    category_by_key = {
+        record_key: str(record["category"])
+        for record_key, record in record_by_key.items()
+    }
+    adjacency: Dict[str, Set[str]] = {
+        record_key: {
+            other_key
+            for other_key in goal_compatibility_map.get(record_key, frozenset())
+            if other_key in record_by_key
+        }
+        for record_key in record_by_key
+    }
+    ordered_keys = sorted(
+        record_by_key.keys(),
+        key=lambda record_key: len(adjacency[record_key]),
+        reverse=True,
+    )
+
+    def _search(
+        selected_keys: Tuple[str, ...],
+        candidate_keys: Tuple[str, ...],
+        used_categories: FrozenSet[str],
+    ) -> bool:
+        if len(selected_keys) >= int(num_goals):
+            return True
+
+        remaining_needed = int(num_goals) - int(len(selected_keys))
+        if int(len(candidate_keys)) < int(remaining_needed):
+            return False
+        if unique_categories:
+            remaining_categories = {
+                category_by_key[candidate_key]
+                for candidate_key in candidate_keys
+                if category_by_key[candidate_key] not in used_categories
+            }
+            if int(len(remaining_categories)) < int(remaining_needed):
+                return False
+
+        for index, candidate_key in enumerate(candidate_keys):
+            candidate_category = category_by_key[candidate_key]
+            if unique_categories and candidate_category in used_categories:
+                continue
+
+            next_candidate_keys = tuple(
+                other_key
+                for other_key in candidate_keys[index + 1 :]
+                if other_key in adjacency[candidate_key]
+            )
+            next_used_categories = (
+                frozenset(set(used_categories) | {candidate_category})
+                if unique_categories
+                else used_categories
+            )
+            if _search(
+                selected_keys + (candidate_key,),
+                next_candidate_keys,
+                next_used_categories,
+            ):
+                return True
+
+        return False
+
+    return _search(tuple(), tuple(ordered_keys), frozenset())
+
+
+def _feasible_goal_counts(
+    records: List[Dict[str, Any]],
+    min_goals: int,
+    max_goals: int,
+    unique_categories: bool,
+    goal_compatibility_map: Optional[Dict[str, FrozenSet[str]]],
+) -> List[int]:
+    feasible_counts: List[int] = []
+    for goal_count in range(int(min_goals), int(max_goals) + 1):
+        if _has_feasible_goal_subset(
+            records,
+            num_goals=int(goal_count),
+            unique_categories=bool(unique_categories),
+            goal_compatibility_map=goal_compatibility_map,
+        ):
+            feasible_counts.append(int(goal_count))
+    return feasible_counts
+
+
+def _build_goal_sampling_state(
+    records: List[Dict[str, Any]],
+    goal_compatibility_map: Optional[Dict[str, FrozenSet[str]]],
+) -> Dict[str, Any]:
+    record_by_key: Dict[str, Dict[str, Any]] = {}
+    category_by_key: Dict[str, str] = {}
+    has_image_by_key: Dict[str, bool] = {}
+    compatible_keys: List[str] = []
+    seen_keys: Set[str] = set()
+
+    for record in records:
+        record_key = _goal_record_cache_key(record)
+        if record_key in seen_keys:
+            continue
+        seen_keys.add(record_key)
+        if goal_compatibility_map is not None and record_key not in goal_compatibility_map:
+            continue
+        record_by_key[record_key] = record
+        category_by_key[record_key] = str(record["category"])
+        has_image_by_key[record_key] = bool(_record_has_image(record))
+        compatible_keys.append(record_key)
+
+    return {
+        "compatible_keys": tuple(compatible_keys),
+        "compatible_key_set": frozenset(compatible_keys),
+        "record_by_key": record_by_key,
+        "category_by_key": category_by_key,
+        "has_image_by_key": has_image_by_key,
+    }
+
+
 def _enforce_image_goal_quota(
     sampled_records: List[Dict[str, Any]],
     all_records: List[Dict[str, Any]],
@@ -566,6 +890,8 @@ def _enforce_image_goal_quota(
     unique_categories: bool,
     instance_usage_counter: Optional[Counter],
     rng: random.Random,
+    goal_compatibility_map: Optional[Dict[str, FrozenSet[str]]] = None,
+    goal_sampling_state: Optional[Dict[str, Any]] = None,
 ) -> Optional[List[Dict[str, Any]]]:
     if desired_image_goals < 0:
         desired_image_goals = 0
@@ -573,6 +899,16 @@ def _enforce_image_goal_quota(
     selected = list(sampled_records)
     selected_keys = {str(record["instance_key"]) for record in selected}
     selected_categories = [str(record["category"]) for record in selected]
+    compatibility_state = goal_sampling_state
+    if compatibility_state is None:
+        compatibility_state = _build_goal_sampling_state(
+            all_records,
+            goal_compatibility_map,
+        )
+    compatible_key_set = set(compatibility_state["compatible_key_set"])
+    record_by_key = dict(compatibility_state["record_by_key"])
+    category_by_key = dict(compatibility_state["category_by_key"])
+    has_image_by_key = dict(compatibility_state["has_image_by_key"])
 
     def _replace_once(require_image: bool) -> bool:
         if require_image:
@@ -595,33 +931,45 @@ def _enforce_image_goal_quota(
         for replace_idx in replace_indices:
             old_record = selected[replace_idx]
             old_key = str(old_record["instance_key"])
-            old_category = str(old_record["category"])
+            feasible_candidate_keys = set(compatible_key_set)
+            selected_without_replaced = [
+                selected[idx] for idx in range(len(selected)) if idx != int(replace_idx)
+            ]
+            if goal_compatibility_map is not None:
+                for selected_record in selected_without_replaced:
+                    selected_record_key = _goal_record_cache_key(selected_record)
+                    feasible_candidate_keys.intersection_update(
+                        goal_compatibility_map.get(selected_record_key, frozenset())
+                    )
 
-            candidates: List[Dict[str, Any]] = []
-            for candidate in all_records:
-                candidate_key = str(candidate["instance_key"])
-                if candidate_key in selected_keys:
-                    continue
-                if bool(_record_has_image(candidate)) != bool(require_image):
-                    continue
+            occupied = {
+                str(selected[idx]["category"])
+                for idx in range(len(selected))
+                if idx != int(replace_idx)
+            }
+            candidate_keys = [
+                candidate_key
+                for candidate_key in feasible_candidate_keys
+                if candidate_key not in selected_keys
+                and bool(has_image_by_key.get(candidate_key, False)) == bool(require_image)
+                and (
+                    not unique_categories
+                    or category_by_key.get(candidate_key, "") not in occupied
+                )
+            ]
 
-                candidate_category = str(candidate["category"])
-                if unique_categories:
-                    occupied = {
-                        str(selected[idx]["category"])
-                        for idx in range(len(selected))
-                        if idx != int(replace_idx)
-                    }
-                    if candidate_category in occupied:
-                        continue
-
-                candidates.append(candidate)
-
-            picked = _pick_low_usage_candidate(
-                candidates,
-                instance_usage_counter=instance_usage_counter,
-                rng=rng,
-            )
+            if instance_usage_counter is not None and candidate_keys:
+                min_usage = min(
+                    int(instance_usage_counter.get(candidate_key, 0))
+                    for candidate_key in candidate_keys
+                )
+                candidate_keys = [
+                    candidate_key
+                    for candidate_key in candidate_keys
+                    if int(instance_usage_counter.get(candidate_key, 0)) == int(min_usage)
+                ]
+            picked_key = rng.choice(candidate_keys) if candidate_keys else None
+            picked = record_by_key.get(str(picked_key)) if picked_key is not None else None
             if picked is None:
                 continue
 
@@ -773,7 +1121,10 @@ def _sample_goals_for_trajectory(
     unique_categories: bool,
     instance_usage_counter: Optional[Counter] = None,
     coverage_explore_ratio: float = 0.15,
-) -> List[Dict[str, Any]]:
+    goal_compatibility_map: Optional[Dict[str, FrozenSet[str]]] = None,
+    compatibility_sample_max_attempts: int = 32,
+    goal_sampling_state: Optional[Dict[str, Any]] = None,
+) -> Optional[List[Dict[str, Any]]]:
     use_balanced_sampling = (
         instance_usage_counter is not None
         and float(coverage_explore_ratio) < 1.0
@@ -784,6 +1135,95 @@ def _sample_goals_for_trajectory(
         if instance_usage_counter is None:
             return 0
         return int(instance_usage_counter.get(str(record["instance_key"]), 0))
+
+    if goal_compatibility_map is not None:
+        compatibility_state = goal_sampling_state
+        if compatibility_state is None:
+            compatibility_state = _build_goal_sampling_state(
+                records,
+                goal_compatibility_map,
+            )
+        compatible_keys = list(compatibility_state["compatible_keys"])
+        compatible_key_set = set(compatibility_state["compatible_key_set"])
+        record_by_key = dict(compatibility_state["record_by_key"])
+        category_by_key = dict(compatibility_state["category_by_key"])
+
+        if int(num_goals) > int(len(compatible_keys)):
+            return None
+
+        def _pick_candidate_key(candidates: List[str]) -> Optional[str]:
+            if not candidates:
+                return None
+            if use_balanced_sampling:
+                min_usage = min(
+                    int(instance_usage_counter.get(candidate_key, 0))
+                    for candidate_key in candidates
+                )
+                candidates = [
+                    candidate_key
+                    for candidate_key in candidates
+                    if int(instance_usage_counter.get(candidate_key, 0))
+                    == int(min_usage)
+                ]
+            return rng.choice(candidates)
+
+        for _ in range(max(1, int(compatibility_sample_max_attempts))):
+            selected_keys: List[str] = []
+            selected_key_set: Set[str] = set()
+            selected_categories: Set[str] = set()
+            available_keys: Set[str] = set(compatible_key_set)
+
+            for _step in range(int(num_goals)):
+                candidate_keys: List[str] = []
+                needed_after_pick = int(num_goals) - int(len(selected_keys)) - 1
+
+                for candidate_key in available_keys:
+                    if candidate_key in selected_key_set:
+                        continue
+                    category = category_by_key.get(candidate_key, "")
+                    if unique_categories and category in selected_categories:
+                        continue
+
+                    if needed_after_pick > 0:
+                        next_available_keys = set(available_keys)
+                        next_available_keys.intersection_update(
+                            goal_compatibility_map.get(candidate_key, frozenset())
+                        )
+                        if unique_categories:
+                            remaining_categories = {
+                                category_by_key.get(other_key, "")
+                                for other_key in next_available_keys
+                                if other_key not in selected_key_set
+                                and category_by_key.get(other_key, "")
+                                not in selected_categories
+                                and category_by_key.get(other_key, "") != category
+                            }
+                            if int(len(remaining_categories)) < int(needed_after_pick):
+                                continue
+                        else:
+                            remaining_choices = len(next_available_keys - selected_key_set)
+                            if int(remaining_choices) < int(needed_after_pick):
+                                continue
+                    candidate_keys.append(candidate_key)
+
+                picked_key = _pick_candidate_key(candidate_keys)
+                if picked_key is None:
+                    selected_keys = []
+                    break
+
+                selected_keys.append(picked_key)
+                selected_key_set.add(picked_key)
+                selected_categories.add(category_by_key.get(picked_key, ""))
+                available_keys.intersection_update(
+                    goal_compatibility_map.get(picked_key, frozenset())
+                )
+
+            if len(selected_keys) == int(num_goals):
+                selected = [record_by_key[selected_key] for selected_key in selected_keys]
+                rng.shuffle(selected)
+                return selected
+
+        return None
 
     if use_balanced_sampling and unique_categories:
         categories = [category for category, items in grouped_by_category.items() if items]
@@ -927,6 +1367,37 @@ def _compute_total_geodesic_distances_from_matrix(
     return ordered_rounded, unordered_rounded
 
 
+def _build_goal_compatibility_map(
+    records: List[Dict[str, Any]],
+    goal_pair_distance_fn: Callable[[Dict[str, Any], Dict[str, Any]], Optional[float]],
+    min_goal_distance: float,
+) -> Dict[str, FrozenSet[str]]:
+    compatibility_map: Dict[str, Set[str]] = {}
+    deduped_records: List[Tuple[str, Dict[str, Any]]] = []
+    seen_keys: Set[str] = set()
+
+    for record in records:
+        record_key = _goal_record_cache_key(record)
+        if record_key in seen_keys:
+            continue
+        seen_keys.add(record_key)
+        compatibility_map[record_key] = set()
+        deduped_records.append((record_key, record))
+
+    for idx, (record_key_a, record_a) in enumerate(deduped_records):
+        for record_key_b, record_b in deduped_records[idx + 1 :]:
+            distance = goal_pair_distance_fn(record_a, record_b)
+            if distance is None or float(distance) < float(min_goal_distance):
+                continue
+            compatibility_map[record_key_a].add(record_key_b)
+            compatibility_map[record_key_b].add(record_key_a)
+
+    return {
+        record_key: frozenset(compatible_keys)
+        for record_key, compatible_keys in compatibility_map.items()
+    }
+
+
 def _build_trajectories(
     records: List[Dict[str, Any]],
     instance_lookup: Dict[str, Dict[str, Any]],
@@ -936,13 +1407,16 @@ def _build_trajectories(
     seed: int,
     unique_categories: bool,
     scene_name: str,
-    start_sampler: Optional[Callable[[random.Random], Dict[str, Any]]] = None,
+    start_sampler: Optional[
+        Callable[[random.Random, Optional[List[Dict[str, Any]]]], Dict[str, Any]]
+    ] = None,
     start_goal_distance_fn: Optional[
         Callable[[List[float], Dict[str, Any]], Optional[float]]
     ] = None,
     goal_pair_distance_fn: Optional[
         Callable[[Dict[str, Any], Dict[str, Any]], Optional[float]]
     ] = None,
+    goal_compatibility_map: Optional[Dict[str, FrozenSet[str]]] = None,
     distance_max_attempts: int = 100,
     min_goal_distance: float = 4.0,
     scene_split: str = "val",
@@ -957,11 +1431,16 @@ def _build_trajectories(
     min_image_goals_per_episode: int = 1,
     max_image_goals_per_episode: int = 2,
     episode_scene_id: str = "",
+    start_distance_retries: int = 1,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     rng = random.Random(int(seed))
     instance_usage_counter: Counter = Counter()
 
     total_image_records = int(sum(_record_has_image(record) for record in records))
+    max_feasible_image_goals = _max_feasible_image_goal_count(
+        records,
+        unique_categories=bool(unique_categories),
+    )
     if total_image_records <= 0:
         min_image_goals_per_episode = 0
         max_image_goals_per_episode = 0
@@ -980,12 +1459,37 @@ def _build_trajectories(
             f"min_goals={int(min_goals)} but max_possible_goals={effective_max_goals}."
         )
 
+    feasible_goal_counts = _feasible_goal_counts(
+        records,
+        min_goals=int(min_goals),
+        max_goals=int(effective_max_goals),
+        unique_categories=bool(unique_categories),
+        goal_compatibility_map=goal_compatibility_map,
+    )
+    goal_sampling_state: Optional[Dict[str, Any]] = None
+    if goal_compatibility_map is not None:
+        goal_sampling_state = _build_goal_sampling_state(
+            records,
+            goal_compatibility_map,
+        )
+    if not feasible_goal_counts:
+        raise RuntimeError(
+            "Sampling constraints are infeasible for this scene: "
+            f"no goal_count in [{int(min_goals)}, {int(effective_max_goals)}] satisfies pairwise goal compatibility."
+        )
+    effective_max_goals = int(max(feasible_goal_counts))
+
     trajectories: List[Dict[str, Any]] = []
     goal_count_hist: Counter = Counter()
 
     for trajectory_index in tqdm(range(int(num_trajectories)), desc="generating trajectories"):
-        goal_count = rng.randint(int(min_goals), int(effective_max_goals))
+        goal_count = int(rng.choice(feasible_goal_counts))
+        retry_round = 0
         while True:
+            retry_round += 1
+            if retry_round > 1:
+                goal_count = int(rng.choice(feasible_goal_counts))
+
             best_payload: Optional[Dict[str, Any]] = None
             best_null_count: Optional[int] = None
 
@@ -1009,20 +1513,39 @@ def _build_trajectories(
                 elif int(goal_count) >= 3:
                     required_min_image_goals = 1
 
+            feasible_image_goals_for_count = min(
+                int(goal_count),
+                int(max_feasible_image_goals),
+            )
+            if int(required_min_image_goals) > int(feasible_image_goals_for_count):
+                required_min_image_goals = int(feasible_image_goals_for_count)
+                if int(required_min_image_goals) < 2:
+                    force_split_image_and_text = False
+
             desired_image_min = max(int(desired_image_min), int(required_min_image_goals))
             desired_image_max = max(int(desired_image_max), int(required_min_image_goals))
 
-            desired_image_min = min(desired_image_min, int(goal_count), int(total_image_records))
-            desired_image_max = min(desired_image_max, int(goal_count), int(total_image_records))
+            desired_image_min = min(
+                desired_image_min,
+                int(goal_count),
+                int(total_image_records),
+                int(feasible_image_goals_for_count),
+            )
+            desired_image_max = min(
+                desired_image_max,
+                int(goal_count),
+                int(total_image_records),
+                int(feasible_image_goals_for_count),
+            )
             if int(desired_image_min) < int(required_min_image_goals):
-                if int(goal_count) > 2:
-                    goal_count -= 1
-                    continue
-                raise RuntimeError(
-                    "Insufficient image-capable goals for modality constraints: "
-                    f"goal_count={int(goal_count)}, required_min_image_goals={int(required_min_image_goals)}, "
-                    f"available_image_capable_instances={int(total_image_records)}."
-                )
+                if retry_round % 20 == 0:
+                    tqdm.write(
+                        "[trajectory-builder] Resampling episode because image-goal quota is infeasible: "
+                        f"episode={trajectory_index}, retry_round={retry_round}, goal_count={int(goal_count)}, "
+                        f"required_min_image_goals={int(required_min_image_goals)}, "
+                        f"feasible_image_goals={int(feasible_image_goals_for_count)}"
+                    )
+                continue
             if desired_image_max < desired_image_min:
                 desired_image_max = desired_image_min
 
@@ -1053,7 +1576,11 @@ def _build_trajectories(
                     unique_categories=unique_categories,
                     instance_usage_counter=active_usage_counter,
                     coverage_explore_ratio=float(active_explore_ratio),
+                    goal_compatibility_map=goal_compatibility_map,
+                    goal_sampling_state=goal_sampling_state,
                 )
+                if sampled_records is None:
+                    continue
 
                 adjusted_records = _enforce_image_goal_quota(
                     sampled_records=sampled_records,
@@ -1062,6 +1589,8 @@ def _build_trajectories(
                     unique_categories=bool(unique_categories),
                     instance_usage_counter=active_usage_counter,
                     rng=rng,
+                    goal_compatibility_map=goal_compatibility_map,
+                    goal_sampling_state=goal_sampling_state,
                 )
                 if adjusted_records is None:
                     continue
@@ -1135,89 +1664,41 @@ def _build_trajectories(
                         ]
                     )
 
-                start_state = start_sampler(rng) if start_sampler is not None else None
-
-                distance_matrix: Optional[List[List[Optional[float]]]] = None
-                ordered_total_geodesic_distance: Optional[float] = None
-                unordered_total_geodesic_distance: Optional[float] = None
-                if (
-                    start_goal_distance_fn is not None
-                    and isinstance(start_state, dict)
-                    and _is_vec3(start_state.get("position"))
-                ):
-                    start_position = [float(v) for v in start_state["position"]]
-                    n_goals = int(len(sampled_records))
-                    distance_matrix = [
-                        [None for _ in range(n_goals + 1)] for _ in range(n_goals + 1)
-                    ]
-                    for idx in range(n_goals + 1):
-                        distance_matrix[idx][idx] = 0.0
-
-                    for goal_idx, goal_record in enumerate(sampled_records):
-                        distance = start_goal_distance_fn(start_position, goal_record)
-                        distance_matrix[0][goal_idx + 1] = distance
-                        distance_matrix[goal_idx + 1][0] = distance
-
-                    if goal_pair_distance_fn is not None:
-                        for idx in range(n_goals):
-                            for jdx in range(idx + 1, n_goals):
-                                pair_distance = goal_pair_distance_fn(
-                                    sampled_records[idx],
-                                    sampled_records[jdx],
-                                )
-                                distance_matrix[idx + 1][jdx + 1] = pair_distance
-                                distance_matrix[jdx + 1][idx + 1] = pair_distance
-
-                    (
-                        ordered_total_geodesic_distance,
-                        unordered_total_geodesic_distance,
-                    ) = _compute_total_geodesic_distances_from_matrix(distance_matrix)
-
-                start_position_payload = [0.0, 0.0, 0.0]
-                start_rotation_payload = [0.0, 0.0, 0.0, 1.0]
-                if isinstance(start_state, dict):
-                    if _is_vec3(start_state.get("position")):
-                        start_position_payload = [
-                            float(v) for v in start_state.get("position", start_position_payload)
-                        ]
-                    if isinstance(start_state.get("rotation"), list) and len(start_state.get("rotation")) == 4:
-                        start_rotation_payload = [
-                            float(v) for v in start_state.get("rotation", start_rotation_payload)
-                        ]
-
-                trajectory_payload: Dict[str, Any] = {
-                    "episode_id": str(trajectory_index),
-                    "scene_id": str(episode_scene_id),
-                    "start_position": start_position_payload,
-                    "start_rotation": start_rotation_payload,
-                    "num_goals": int(goal_count),
-                    "goals": goal_tasks,
-                    "ordered_total_geodesic_distance": ordered_total_geodesic_distance,
-                    "unordered_total_geodesic_distance": unordered_total_geodesic_distance,
-                    "object_category": goal_categories[0] if goal_categories else None,
-                    "sound_id": goal_sound_ids[0] if goal_sound_ids else None,
-                    "offset": str(
-                        rng.randint(int(audio_offset_min), int(audio_offset_max))
-                    ),
-                    "duration": str(int(audio_duration)),
-                    "sound_sources": [
-                        {"sound_id": sound_id} for sound_id in goal_sound_ids
-                    ],
-                    "sound_source_schedule": [
-                        str(audio_schedule),
-                        int(audio_duration),
-                    ],
-                    "goal_instance_keys": goal_instance_keys,
-                }
                 distance_constraints_checked = bool(start_goal_distance_fn is not None)
-                valid_distances = True
-                if distance_constraints_checked:
-                    if distance_matrix is None:
-                        valid_distances = False
-                    else:
+                start_retry_limit = 1
+                if distance_constraints_checked and start_sampler is not None:
+                    start_retry_limit = max(1, int(start_distance_retries))
+
+                successful_start = False
+                for _start_retry_idx in range(int(start_retry_limit)):
+                    start_state = (
+                        start_sampler(rng, sampled_records)
+                        if start_sampler is not None
+                        else None
+                    )
+
+                    distance_matrix: Optional[List[List[Optional[float]]]] = None
+                    ordered_total_geodesic_distance: Optional[float] = None
+                    unordered_total_geodesic_distance: Optional[float] = None
+                    valid_distances = False
+                    if (
+                        distance_constraints_checked
+                        and isinstance(start_state, dict)
+                        and _is_vec3(start_state.get("position"))
+                    ):
+                        valid_distances = True
+                        start_position = [float(v) for v in start_state["position"]]
                         n_goals = int(len(sampled_records))
-                        for goal_idx in range(n_goals):
-                            distance = distance_matrix[0][goal_idx + 1]
+                        distance_matrix = [
+                            [None for _ in range(n_goals + 1)] for _ in range(n_goals + 1)
+                        ]
+                        for idx in range(n_goals + 1):
+                            distance_matrix[idx][idx] = 0.0
+
+                        for goal_idx, goal_record in enumerate(sampled_records):
+                            distance = start_goal_distance_fn(start_position, goal_record)
+                            distance_matrix[0][goal_idx + 1] = distance
+                            distance_matrix[goal_idx + 1][0] = distance
                             if distance is None or float(distance) < float(min_goal_distance):
                                 valid_distances = False
                                 break
@@ -1227,60 +1708,127 @@ def _build_trajectories(
                                 if not valid_distances:
                                     break
                                 for jdx in range(idx + 1, n_goals):
-                                    distance = distance_matrix[idx + 1][jdx + 1]
+                                    pair_distance = goal_pair_distance_fn(
+                                        sampled_records[idx],
+                                        sampled_records[jdx],
+                                    )
+                                    distance_matrix[idx + 1][jdx + 1] = pair_distance
+                                    distance_matrix[jdx + 1][idx + 1] = pair_distance
                                     if (
-                                        distance is None
-                                        or float(distance) < float(min_goal_distance)
+                                        pair_distance is None
+                                        or float(pair_distance) < float(min_goal_distance)
                                     ):
                                         valid_distances = False
                                         break
-                else:
-                    valid_distances = False
 
-                trajectory_payload["_distance_constraints_checked"] = bool(
-                    distance_constraints_checked
-                )
-                trajectory_payload["_distance_constraints_satisfied"] = bool(
-                    valid_distances
-                )
+                        if valid_distances:
+                            (
+                                ordered_total_geodesic_distance,
+                                unordered_total_geodesic_distance,
+                            ) = _compute_total_geodesic_distances_from_matrix(
+                                distance_matrix
+                            )
 
-                if valid_distances:
-                    best_payload = trajectory_payload
+                    start_position_payload = [0.0, 0.0, 0.0]
+                    start_rotation_payload = [0.0, 0.0, 0.0, 1.0]
+                    if isinstance(start_state, dict):
+                        if _is_vec3(start_state.get("position")):
+                            start_position_payload = [
+                                float(v)
+                                for v in start_state.get(
+                                    "position", start_position_payload
+                                )
+                            ]
+                        if (
+                            isinstance(start_state.get("rotation"), list)
+                            and len(start_state.get("rotation")) == 4
+                        ):
+                            start_rotation_payload = [
+                                float(v)
+                                for v in start_state.get(
+                                    "rotation", start_rotation_payload
+                                )
+                            ]
+
+                    trajectory_payload: Dict[str, Any] = {
+                        "episode_id": str(trajectory_index),
+                        "scene_id": str(episode_scene_id),
+                        "start_position": start_position_payload,
+                        "start_rotation": start_rotation_payload,
+                        "num_goals": int(goal_count),
+                        "goals": goal_tasks,
+                        "ordered_total_geodesic_distance": ordered_total_geodesic_distance,
+                        "unordered_total_geodesic_distance": unordered_total_geodesic_distance,
+                        "object_category": goal_categories[0] if goal_categories else None,
+                        "sound_id": goal_sound_ids[0] if goal_sound_ids else None,
+                        "offset": str(
+                            rng.randint(int(audio_offset_min), int(audio_offset_max))
+                        ),
+                        "duration": str(int(audio_duration)),
+                        "sound_sources": [
+                            {"sound_id": sound_id} for sound_id in goal_sound_ids
+                        ],
+                        "sound_source_schedule": [
+                            str(audio_schedule),
+                            int(audio_duration),
+                        ],
+                        "goal_instance_keys": goal_instance_keys,
+                    }
+                    if distance_constraints_checked and distance_matrix is None:
+                        valid_distances = False
+
+                    trajectory_payload["_distance_constraints_checked"] = bool(
+                        distance_constraints_checked
+                    )
+                    trajectory_payload["_distance_constraints_satisfied"] = bool(
+                        valid_distances
+                    )
+
+                    if valid_distances:
+                        best_payload = trajectory_payload
+                        successful_start = True
+                        break
+
+                    if distance_matrix is not None:
+                        n_goals = int(len(sampled_records))
+                        required_values: List[Optional[float]] = []
+                        required_values.extend(
+                            distance_matrix[0][goal_idx + 1]
+                            for goal_idx in range(n_goals)
+                        )
+                        for idx in range(n_goals):
+                            for jdx in range(idx + 1, n_goals):
+                                required_values.append(distance_matrix[idx + 1][jdx + 1])
+                        null_count = int(sum(value is None for value in required_values))
+                    else:
+                        null_count = int(goal_count + (goal_count * (goal_count - 1)) // 2)
+                    if best_null_count is None or null_count < best_null_count:
+                        best_payload = trajectory_payload
+                        best_null_count = null_count
+
+                if successful_start:
                     break
 
-                if distance_matrix is not None:
-                    n_goals = int(len(sampled_records))
-                    required_values: List[Optional[float]] = []
-                    required_values.extend(
-                        distance_matrix[0][goal_idx + 1]
-                        for goal_idx in range(n_goals)
-                    )
-                    for idx in range(n_goals):
-                        for jdx in range(idx + 1, n_goals):
-                            required_values.append(distance_matrix[idx + 1][jdx + 1])
-                    null_count = int(sum(value is None for value in required_values))
-                else:
-                    null_count = int(goal_count + (goal_count * (goal_count - 1)) // 2)
-                if best_null_count is None or null_count < best_null_count:
-                    best_payload = trajectory_payload
-                    best_null_count = null_count
-
             if best_payload is None:
-                if int(goal_count) > 2:
-                    goal_count -= 1
-                    continue
-                raise RuntimeError("Failed to build trajectory payload")
+                if retry_round % 20 == 0:
+                    tqdm.write(
+                        "[trajectory-builder] Failed to assemble trajectory payload; resampling goals/start: "
+                        f"episode={trajectory_index}, retry_round={retry_round}, goal_count={int(goal_count)}, "
+                        f"distance_max_attempts={int(distance_max_attempts)}"
+                    )
+                continue
 
             if bool(best_payload.get("_distance_constraints_checked")) and not bool(
                 best_payload.get("_distance_constraints_satisfied")
             ):
-                if int(goal_count) > 2:
-                    goal_count -= 1
-                    continue
-                raise RuntimeError(
-                    "Failed to satisfy min-distance constraints for episode "
-                    f"{trajectory_index} after {int(distance_max_attempts)} attempts."
-                )
+                if retry_round % 20 == 0:
+                    tqdm.write(
+                        "[trajectory-builder] Failed min-distance constraints; resampling goals/start: "
+                        f"episode={trajectory_index}, retry_round={retry_round}, goal_count={int(goal_count)}, "
+                        f"distance_max_attempts={int(distance_max_attempts)}, "
+                        f"min_goal_distance={float(min_goal_distance):.3f}"
+                    )
+                continue
 
             trajectories.append(best_payload)
             for instance_key in best_payload.get("goal_instance_keys", []):
@@ -1306,6 +1854,7 @@ def _build_trajectories(
         "goal_count_histogram": {
             str(k): int(v) for k, v in sorted(goal_count_hist.items())
         },
+        "feasible_goal_counts": [int(k) for k in feasible_goal_counts],
         "effective_max_goals": int(effective_max_goals),
         "num_distinct_goal_instances": distinct_goal_instances,
         "num_reused_goal_instances": reused_instance_count,
@@ -1430,6 +1979,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum attempts when sampling one start position",
     )
     parser.add_argument(
+        "--start-distance-retries",
+        type=int,
+        default=8,
+        help="How many times to resample start for the same goal set before resampling goals",
+    )
+    parser.add_argument(
         "--floor-level-tolerance",
         type=float,
         default=0.35,
@@ -1456,7 +2011,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--distance-max-attempts",
         type=int,
-        default=20000,
+        default=200,
         help="Max re-sampling attempts per trajectory to reduce unreachable goal distances",
     )
     parser.add_argument(
@@ -1632,6 +2187,7 @@ def main() -> None:
                     "num_dominant_floors": int(len(dominant_floors)),
                     "start_min_clearance": float(args.start_min_clearance),
                     "start_max_attempts": int(args.start_max_attempts),
+                    "start_distance_retries": int(args.start_distance_retries),
                     "gpu_device_id": int(args.gpu_device_id),
                     "floor_level_tolerance": float(args.floor_level_tolerance),
                     "floor_height_tolerance": float(args.floor_height_tolerance),
@@ -1646,12 +2202,76 @@ def main() -> None:
                 }
             )
 
-            def _sample_start(rng: random.Random) -> Dict[str, Any]:
+            goal_record_cache: Dict[str, Dict[str, Any]] = {
+                _goal_record_cache_key(record): record for record in records
+            }
+
+            @lru_cache(maxsize=None)
+            def _cached_goal_nav_point(
+                goal_key: str,
+            ) -> Optional[Tuple[float, float, float]]:
+                goal_record = goal_record_cache.get(str(goal_key))
+                if goal_record is None:
+                    return None
+                snapped_goal = _resolve_goal_navmesh_point(
+                    simulator.pathfinder,
+                    goal_record,
+                    dominant_floors,
+                    max_snap_distance=float(args.max_snap_distance),
+                )
+                if snapped_goal is None:
+                    return None
+                return tuple(float(v) for v in snapped_goal.tolist())
+
+            @lru_cache(maxsize=4096)
+            def _cached_start_snap(
+                start_key: Tuple[float, float, float],
+            ) -> Optional[Tuple[float, float, float]]:
+                snapped_start = _snap_navmesh_point(
+                    simulator.pathfinder,
+                    [float(v) for v in start_key],
+                    max_snap_distance=float(args.max_snap_distance),
+                )
+                if snapped_start is None:
+                    return None
+                return tuple(float(v) for v in snapped_start.tolist())
+
+            @lru_cache(maxsize=None)
+            def _cached_goal_pair_ground_distance(
+                goal_key_a: str,
+                goal_key_b: str,
+            ) -> Optional[float]:
+                cached_nav_a = _cached_goal_nav_point(str(goal_key_a))
+                cached_nav_b = _cached_goal_nav_point(str(goal_key_b))
+                if cached_nav_a is None or cached_nav_b is None:
+                    return None
+                distance = float(
+                    multimodal_module._geodesic_distance(
+                        simulator.pathfinder,
+                        np.array(cached_nav_a, dtype=np.float32),
+                        np.array(cached_nav_b, dtype=np.float32),
+                    )
+                )
+                if not math.isfinite(distance):
+                    return None
+                return round(distance, 3)
+
+            goal_compatibility_map: Optional[Dict[str, FrozenSet[str]]] = None
+
+            def _sample_start(
+                rng: random.Random,
+                sampled_records: Optional[List[Dict[str, Any]]] = None,
+            ) -> Dict[str, Any]:
+                preferred_floor_levels = _preferred_floor_levels_for_goals(
+                    sampled_records,
+                    dominant_floors,
+                )
                 return _build_start_state(
                     multimodal_module=multimodal_module,
                     sim=simulator,
                     rng=rng,
                     floor_levels=dominant_floors,
+                    preferred_floor_levels=preferred_floor_levels,
                     min_clearance=float(args.start_min_clearance),
                     max_attempts=int(args.start_max_attempts),
                     floor_height_tolerance=float(args.floor_height_tolerance),
@@ -1669,27 +2289,20 @@ def main() -> None:
             ) -> Optional[float]:
                 if not _is_vec3(start_position):
                     return None
-                start_snapped = _snap_navmesh_point(
-                    simulator.pathfinder,
-                    [float(v) for v in start_position],
-                    max_snap_distance=float(args.max_snap_distance),
-                )
-                if start_snapped is None:
+                start_key = tuple(round(float(v), 3) for v in start_position)
+                cached_start = _cached_start_snap(start_key)
+                if cached_start is None:
+                    return None
+                goal_key = _goal_record_cache_key(goal_record)
+                cached_goal = _cached_goal_nav_point(goal_key)
+                if cached_goal is None:
                     return None
 
-                snapped_goal = _resolve_goal_navmesh_point(
-                    simulator.pathfinder,
-                    goal_record,
-                    dominant_floors,
-                    max_snap_distance=float(args.max_snap_distance),
-                )
-                if snapped_goal is None:
-                    return None
                 distance = float(
                     multimodal_module._geodesic_distance(
                         simulator.pathfinder,
-                        np.array(start_snapped, dtype=np.float32),
-                        np.array(snapped_goal, dtype=np.float32),
+                        np.array(cached_start, dtype=np.float32),
+                        np.array(cached_goal, dtype=np.float32),
                     )
                 )
                 if not math.isfinite(distance):
@@ -1702,32 +2315,38 @@ def main() -> None:
                 goal_a: Dict[str, Any],
                 goal_b: Dict[str, Any],
             ) -> Optional[float]:
-                snapped_a = _resolve_goal_navmesh_point(
-                    simulator.pathfinder,
-                    goal_a,
-                    dominant_floors,
-                    max_snap_distance=float(args.max_snap_distance),
-                )
-                snapped_b = _resolve_goal_navmesh_point(
-                    simulator.pathfinder,
-                    goal_b,
-                    dominant_floors,
-                    max_snap_distance=float(args.max_snap_distance),
-                )
-                if snapped_a is None or snapped_b is None:
-                    return None
-                distance = float(
-                    multimodal_module._geodesic_distance(
-                        simulator.pathfinder,
-                        np.array(snapped_a, dtype=np.float32),
-                        np.array(snapped_b, dtype=np.float32),
-                    )
-                )
-                if not math.isfinite(distance):
-                    return None
-                return round(distance, 3)
+                goal_key_a = _goal_record_cache_key(goal_a)
+                goal_key_b = _goal_record_cache_key(goal_b)
+                if goal_key_a <= goal_key_b:
+                    return _cached_goal_pair_ground_distance(goal_key_a, goal_key_b)
+                return _cached_goal_pair_ground_distance(goal_key_b, goal_key_a)
 
             goal_pair_distance_fn = _goal_pair_ground_distance
+
+            if len(records) > 1:
+                goal_compatibility_map = _build_goal_compatibility_map(
+                    records=records,
+                    goal_pair_distance_fn=goal_pair_distance_fn,
+                    min_goal_distance=float(args.min_goal_distance),
+                )
+
+                compatible_record_count = int(
+                    sum(
+                        1
+                        for compatible_keys in goal_compatibility_map.values()
+                        if len(compatible_keys) > 0
+                    )
+                )
+                compatible_pair_count = int(
+                    sum(len(compatible_keys) for compatible_keys in goal_compatibility_map.values())
+                    // 2
+                )
+                start_sampling_metadata.update(
+                    {
+                        "goal_compatibility_records": compatible_record_count,
+                        "goal_compatibility_pairs": compatible_pair_count,
+                    }
+                )
 
         episodes, sampling_summary = _build_trajectories(
             records=records,
@@ -1741,6 +2360,7 @@ def main() -> None:
             start_sampler=start_sampler,
             start_goal_distance_fn=start_goal_distance_fn,
             goal_pair_distance_fn=goal_pair_distance_fn,
+            goal_compatibility_map=goal_compatibility_map,
             distance_max_attempts=int(args.distance_max_attempts),
             min_goal_distance=float(args.min_goal_distance),
             scene_split=str(scene_split),
@@ -1755,6 +2375,7 @@ def main() -> None:
             min_image_goals_per_episode=int(args.min_image_goals_per_episode),
             max_image_goals_per_episode=int(args.max_image_goals_per_episode),
             episode_scene_id=str(episode_scene_id),
+            start_distance_retries=int(args.start_distance_retries),
         )
     finally:
         if simulator is not None and hasattr(simulator, "close"):
@@ -1787,6 +2408,7 @@ def main() -> None:
                 "text_description": "bind_to_selected_image_view_when_available",
             },
             "start_sampling": start_sampling_metadata,
+            "summary": sampling_summary,
         },
         "episodes": episodes,
         "instances": instance_lookup,

@@ -63,7 +63,7 @@ from habitat.utils.geometry_utils import quaternion_rotate_vector
 from habitat.sims import make_sim
 from habitat_sim.utils.common import quat_from_angle_axis
 from PIL import Image
-from ss_baselines.av_nav.config.default import get_task_config
+from ss_baselines.omni_long.config.default import get_task_config
 from soundspaces.continuous_simulator import _quat_to_list
 from tqdm import tqdm
 from yolo26_demo import (
@@ -253,6 +253,7 @@ class ImageNavDeterministicScanner:
             self._compute_largest_navmesh_island_radius()
         )
         self._initialize_yolo_validator()
+        self._last_scan_debug: Dict[int, Dict[str, Any]] = {}
 
         if self.all_floor_levels:
             all_floor_summary = [
@@ -543,6 +544,258 @@ class ImageNavDeterministicScanner:
                     f"{coverage} < min_target_detection_coverage={min_coverage}"
                 )
         return None
+
+    def _count_invalid_views(
+        self,
+        invalid_views: Sequence[Dict[str, Any]],
+    ) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """Aggregate invalid-view counts by reason and stage."""
+        reason_counts: Dict[str, int] = {}
+        stage_counts: Dict[str, int] = {}
+        for view in invalid_views:
+            reason = str(view.get("reason", "unknown"))
+            stage = str(view.get("stage", "unknown"))
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            stage_counts[stage] = stage_counts.get(stage, 0) + 1
+        return reason_counts, stage_counts
+
+    def _scan_failure_detail(
+        self,
+        primary_reason: str,
+        scan_diagnostics: Dict[str, Any],
+    ) -> str:
+        """Create a detailed object-level explanation for why no image was saved."""
+        search_radius = float(getattr(self.args, "search_radius", 0.0))
+        min_surface_offset = float(getattr(self.args, "min_surface_offset", 0.0))
+        max_snap_distance = float(getattr(self.args, "max_snap_distance", 0.0))
+        floor_height_tolerance = float(
+            getattr(self.args, "floor_height_tolerance", 0.0)
+        )
+        min_edge_clearance = float(getattr(self.args, "min_edge_clearance", 0.0))
+        min_iou = float(getattr(self.args, "min_iou", 0.0))
+        min_target_detection_coverage = float(
+            getattr(self.args, "min_target_detection_coverage", 0.0)
+        )
+        yolo_conf_threshold = float(getattr(self.args, "yolo_conf_threshold", 0.0))
+
+        if primary_reason == "no_raw_viewpoints":
+            return (
+                "No candidate viewpoints were generated before rendering. "
+                "Both the uniform floor sampler and fallback ring sampler failed to produce "
+                "a standable navmesh point near the object after snap-to-navmesh filtering. "
+                f"Current thresholds: search_radius={search_radius:.3f}, "
+                f"min_surface_offset={min_surface_offset:.3f}, "
+                f"max_snap_distance={max_snap_distance:.3f}, "
+                f"floor_height_tolerance={floor_height_tolerance:.3f}."
+            )
+        if primary_reason == "y_mismatch":
+            return (
+                "Raw floor candidates existed, but all of them were filtered out because their "
+                "heights did not match the target floor band within "
+                f"floor_height_tolerance={floor_height_tolerance:.3f}."
+            )
+        if primary_reason == "too_far":
+            return (
+                "Raw floor candidates existed, but all of them were outside the allowed radius "
+                f"from the object surface. Current search_radius={search_radius:.3f}."
+            )
+        if primary_reason == "too_near":
+            return (
+                "Raw floor candidates existed, but all of them were too close to the object "
+                "surface, so the agent would stand unrealistically close to the target. "
+                f"Current min_surface_offset={min_surface_offset:.3f}."
+            )
+        if primary_reason == "invalid_floor_navmesh":
+            return (
+                "Raw candidates passed distance checks, but none remained on a valid navigable "
+                "floor location after navmesh validation."
+            )
+        if primary_reason == "edge_reject":
+            return (
+                "Raw candidates existed, but all surviving floor points were too close to the "
+                f"navmesh boundary. Current min_edge_clearance={min_edge_clearance:.3f}."
+            )
+        if primary_reason == "sensor_pose_none":
+            return (
+                "Standing viewpoints existed, but no valid camera/sensor pose could be built for "
+                "the selected floor candidates, so rendering never started."
+            )
+        if primary_reason == "no_selected_viewpoints":
+            return (
+                "Floor candidates existed, but none survived into the final list of viewpoints "
+                "that should be rendered."
+            )
+        if primary_reason == "observe_failure":
+            return (
+                "Renderable viewpoints were selected, but Habitat failed while generating RGB "
+                "or semantic observations for all attempts."
+            )
+        if primary_reason == "iou_reject":
+            return (
+                "Images were rendered, but they were rejected before saving because the "
+                f"projected target mask and semantic mask did not align well enough (min_iou={min_iou:.3f})."
+            )
+        if primary_reason == "yolo_reject":
+            return (
+                "Images were rendered and viewpoints did exist, but all rendered images were "
+                "rejected by YOLO validation because the target category was not detected with "
+                f"confidence >= {yolo_conf_threshold:.3f}."
+            )
+        if primary_reason == "target_coverage_reject":
+            return (
+                "YOLO detected the target category, but the matched detection boxes covered too "
+                "little of the semantic target region, so the images were still rejected. "
+                "Current min_target_detection_coverage="
+                f"{min_target_detection_coverage:.3f}."
+            )
+        if primary_reason == "rendered_views_available":
+            return "At least one image passed all viewpoint, rendering, and validation checks."
+
+        raw_candidates = int(scan_diagnostics.get("raw_candidates", 0))
+        selected = int(scan_diagnostics.get("selected", 0))
+        rendered_views = int(scan_diagnostics.get("rendered_views", 0))
+        return (
+            "No image was saved, but the run did not collapse into a single dominant failure. "
+            f"Summary: raw_candidates={raw_candidates}, selected={selected}, "
+            f"rendered_views={rendered_views}."
+        )
+
+    def _build_scan_failure_summary(
+        self,
+        target: SemanticTarget,
+        scan_diagnostics: Dict[str, Any],
+        invalid_views: Sequence[Dict[str, Any]],
+        num_valid_views: int,
+    ) -> Dict[str, Any]:
+        """Summarize at object level why images were or were not finally saved."""
+        reason_counts, stage_counts = self._count_invalid_views(invalid_views)
+        raw_candidates = int(scan_diagnostics.get("raw_candidates", 0))
+        valid_mask_pass = int(scan_diagnostics.get("valid_mask_pass", 0))
+        ranked_floor = int(scan_diagnostics.get("ranked_floor", 0))
+        selected = int(scan_diagnostics.get("selected", 0))
+        observe_failures = int(scan_diagnostics.get("observe_failures", 0))
+        iou_reject = int(scan_diagnostics.get("iou_reject", 0))
+        yolo_reject = int(scan_diagnostics.get("yolo_reject", 0))
+        target_coverage_reject = int(
+            scan_diagnostics.get("target_coverage_reject", 0)
+        )
+        sensor_pose_none = int(scan_diagnostics.get("sensor_pose_none", 0))
+
+        primary_stage = "success"
+        primary_reason = "rendered_views_available"
+        if num_valid_views <= 0:
+            if raw_candidates <= 0:
+                primary_stage = "viewpoint_sampling"
+                primary_reason = "no_raw_viewpoints"
+            elif valid_mask_pass <= 0:
+                primary_stage = "floor_candidate"
+                primary_reason = max(
+                    ("y_mismatch", int(scan_diagnostics.get("y_mismatch", 0))),
+                    ("too_far", int(scan_diagnostics.get("too_far", 0))),
+                    ("too_near", int(scan_diagnostics.get("too_near", 0))),
+                    key=lambda item: item[1],
+                )[0]
+            elif ranked_floor <= 0:
+                primary_stage = "floor_candidate"
+                primary_reason = max(
+                    (
+                        "invalid_floor_navmesh",
+                        int(scan_diagnostics.get("invalid_floor_navmesh", 0)),
+                    ),
+                    ("edge_reject", int(scan_diagnostics.get("edge_reject", 0))),
+                    key=lambda item: item[1],
+                )[0]
+            elif selected <= 0:
+                primary_stage = "sensor_pose"
+                primary_reason = (
+                    "sensor_pose_none" if sensor_pose_none > 0 else "no_selected_viewpoints"
+                )
+            else:
+                primary_stage = "render_validation"
+                primary_reason = max(
+                    ("observe_failure", observe_failures),
+                    ("iou_reject", iou_reject),
+                    ("yolo_reject", yolo_reject),
+                    ("target_coverage_reject", target_coverage_reject),
+                    key=lambda item: item[1],
+                )[0]
+
+        summary = {
+            "status": "success" if num_valid_views > 0 else "failed",
+            "num_valid_views": int(num_valid_views),
+            "num_invalid_views": int(len(invalid_views)),
+            "primary_failure_stage": primary_stage,
+            "primary_failure_reason": primary_reason,
+            "primary_failure_detail": self._scan_failure_detail(
+                primary_reason,
+                scan_diagnostics,
+            ),
+            "has_viewpoints_before_render": bool(selected > 0),
+            "render_reached": bool(
+                selected > 0
+                or observe_failures > 0
+                or iou_reject > 0
+                or yolo_reject > 0
+                or target_coverage_reject > 0
+            ),
+            "yolo_validation_enabled": bool(self.yolo_model is not None),
+            "reason_counts": reason_counts,
+            "stage_counts": stage_counts,
+            "sampling_config": {
+                "viewpoint_sampling_mode": str(
+                    getattr(self.args, "viewpoint_sampling_mode", "uniform_floor_grid")
+                ),
+                "search_radius": round(float(getattr(self.args, "search_radius", 0.0)), 3),
+                "min_surface_offset": round(
+                    float(getattr(self.args, "min_surface_offset", 0.0)),
+                    3,
+                ),
+                "max_snap_distance": round(
+                    float(getattr(self.args, "max_snap_distance", 0.0)),
+                    3,
+                ),
+                "floor_height_tolerance": round(
+                    float(getattr(self.args, "floor_height_tolerance", 0.0)),
+                    3,
+                ),
+                "min_edge_clearance": round(
+                    float(getattr(self.args, "min_edge_clearance", 0.0)),
+                    3,
+                ),
+                "max_viewpoints": int(getattr(self.args, "max_viewpoints", 0)),
+                "max_saved_views": int(getattr(self.args, "max_saved_views", 0)),
+                "min_iou": round(float(getattr(self.args, "min_iou", 0.0)), 3),
+                "min_target_detection_coverage": round(
+                    float(getattr(self.args, "min_target_detection_coverage", 0.0)),
+                    3,
+                ),
+                "yolo_conf_threshold": round(
+                    float(getattr(self.args, "yolo_conf_threshold", 0.0)),
+                    3,
+                ),
+            },
+            "object_context": {
+                "semantic_id": int(target.semantic_id),
+                "category": target.category_name,
+                "object_center": self._json_value(target.center),
+                "object_sizes": self._json_value(target.sizes),
+                "horizontal_radius": round(float(target.horizontal_radius), 3),
+                "target_floor_index": scan_diagnostics.get("target_floor_index"),
+                "target_floor_y": round(
+                    float(scan_diagnostics.get("target_floor_y", target.center[1])),
+                    3,
+                ),
+                "min_center_distance": round(
+                    float(scan_diagnostics.get("min_center_distance", 0.0)),
+                    3,
+                ),
+                "max_center_distance": round(
+                    float(scan_diagnostics.get("max_center_distance", 0.0)),
+                    3,
+                ),
+            },
+        }
+        return self._json_value(summary)
 
     def _build_yolo_aliases(self, alias_path: Optional[Path]) -> Dict[str, List[str]]:
         """Merge built-in MP3D-to-YOLO aliases with optional user overrides."""
@@ -2892,6 +3145,18 @@ class ImageNavDeterministicScanner:
             target.category_name,
             len(views),
         )
+        reason_counts, stage_counts = self._count_invalid_views(invalid_views)
+        self._last_scan_debug[int(target.semantic_id)] = {
+            "scan_diagnostics": self._json_value(scan_diagnostics),
+            "reason_counts": self._json_value(reason_counts),
+            "stage_counts": self._json_value(stage_counts),
+            "failure_summary": self._build_scan_failure_summary(
+                target,
+                scan_diagnostics,
+                invalid_views,
+                len(views),
+            ),
+        }
         if not views:
             self.logger.info(
                 (

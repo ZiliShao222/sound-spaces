@@ -19,7 +19,7 @@ from ss_baselines.savi.ddppo.policy import resnet
 from ss_baselines.savi.ddppo.policy.running_mean_and_var import (
     RunningMeanAndVar,
 )
-from ss_baselines.av_nav.models.rnn_state_encoder import RNNStateEncoder
+from ss_baselines.common.rnn_state_encoder import RNNStateEncoder
 from ss_baselines.savi.ppo.policy import Net, Policy
 from ss_baselines.savi.models.visual_cnn import VisualCNN
 from ss_baselines.savi.models.audio_cnn import AudioCNN
@@ -311,4 +311,3 @@ class AudioNavResNetNet(Net):
         e_time = torch.exp(-time)
         formatted_pose = torch.stack([x, y, cos_theta, sin_theta, e_time], 1)
         return formatted_pose
-

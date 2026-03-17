@@ -6,27 +6,20 @@
 
 from typing import Any, Dict, List, Optional, Tuple
 from abc import ABC
-from collections import defaultdict, namedtuple
+from collections import defaultdict
 import logging
-import time
-import pickle
 import os
-import json
 
 import librosa
 import math
 import psutil
-import scipy
-from scipy.io import wavfile
 from scipy.signal import fftconvolve
 import numpy as np
-import networkx as nx
 from gym import spaces
 
 from habitat.core.registry import registry
 import habitat_sim
 from habitat_sim.utils.common import quat_from_angle_axis, quat_from_coeffs, quat_to_angle_axis
-from habitat.sims.habitat_simulator.actions import HabitatSimActions
 from habitat.sims.habitat_simulator.habitat_simulator import HabitatSimSensor, overwrite_config
 from habitat.core.simulator import (
     AgentState,
@@ -36,8 +29,6 @@ from habitat.core.simulator import (
     ShortestPathPoint,
     Simulator,
 )
-from soundspaces.utils import load_metadata
-from soundspaces.mp3d_utils import HouseReader
 from pathlib import Path
 
 
@@ -85,12 +76,10 @@ def _quat_to_list(quat) -> List[float]:
 
 @registry.register_simulator()
 class ContinuousSoundSpacesSim(Simulator, ABC):
-    r"""Changes made to simulator wrapper over habitat-sim
+    r"""Continuous Habitat-Sim wrapper with optional online audio rendering.
 
-    This simulator first loads the graph of current environment and moves the agent among nodes.
-    Any sounds can be specified in the episode and loaded in this simulator.
-    Args:
-        config: configuration for initializing the simulator.
+    This simulator uses continuous agent poses and Habitat-Sim pathfinder queries.
+    Legacy discrete graph metadata and precomputed observation modes are not supported.
     """
 
     def action_space_shortest_path(self, source: AgentState, targets: List[AgentState], agent_id: int = 0) -> List[
@@ -99,6 +88,7 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
 
     def __init__(self, config: Config) -> None:
         self.config = self.habitat_config = config
+        self._validate_legacy_config()
         agent_config = self._get_agent_config()
         sim_sensors = []
         for sensor_name in agent_config.SENSORS:
@@ -118,9 +108,6 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
         )
         self._prev_sim_obs = None
 
-        self._source_position_index = None
-        self._receiver_position_index = None
-        self._rotation_angle = None
         self._current_sound = None
         self._sound_ids = None
         self._sound_positions = None
@@ -132,19 +119,26 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
         self._audio_length = None
         self._source_sound_dict = dict()
         self._sampling_rate = None
-        self._node2index = None
-        self._scene_observations = None
         self._episode_step_count = None
         self._is_episode_active = None
-        self._position_to_index_mapping = dict()
         self._previous_step_collided = False
-        self._house_readers = dict()
 
-        self.points, self.graph = self._try_load_metadata()
         self._sim = habitat_sim.Simulator(config=self.sim_config)
         self.add_acoustic_config()
         self._last_rir = None
         self._current_sample_index = 0
+
+    def _validate_legacy_config(self) -> None:
+        if bool(getattr(self.config, "USE_RENDERED_OBSERVATIONS", False)):
+            raise RuntimeError(
+                "ContinuousSoundSpacesSim no longer supports USE_RENDERED_OBSERVATIONS. "
+                "Use live Habitat-Sim rendering instead."
+            )
+        if bool(getattr(self.config.AUDIO, "HAS_DISTRACTOR_SOUND", False)):
+            raise RuntimeError(
+                "ContinuousSoundSpacesSim no longer supports legacy distractor-sound graph mode. "
+                "Use SOUND_SOURCES with continuous positions instead."
+            )
 
     def add_acoustic_config(self):
         if not self._audio_enabled():
@@ -315,24 +309,8 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
         return True
 
     @property
-    def binaural_rir_dir(self):
-        return os.path.join(self.config.AUDIO.BINAURAL_RIR_DIR, self.config.SCENE_DATASET, self.current_scene_name)
-
-    @property
     def source_sound_dir(self):
         return self.config.AUDIO.SOURCE_SOUND_DIR
-
-    @property
-    def distractor_sound_dir(self):
-        return self.config.AUDIO.DISTRACTOR_SOUND_DIR
-
-    @property
-    def metadata_dir(self):
-        return os.path.join(
-            self.config.AUDIO.METADATA_DIR,
-            self._scene_dataset_name(),
-            self.current_scene_name,
-        )
 
     @property
     def current_scene_name(self):
@@ -391,6 +369,7 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
 
     def reconfigure(self, config: Config) -> None:
         self.config = config
+        self._validate_legacy_config()
         if hasattr(self.config.AGENT_0, 'OFFSET'):
             self._offset = int(self.config.AGENT_0.OFFSET)
         else:
@@ -443,8 +422,6 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
                 )
             logging.debug('Loaded scene {}'.format(self.current_scene_name))
 
-            self.points, self.graph = self._try_load_metadata()
-
         self._update_agents_state()
         if self._audio_enabled():
             audio_sensor = self._sim.get_agent(0)._sensors["audio_sensor"]
@@ -455,31 +432,6 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
         self._episode_step_count = 0
         self._last_rir = None
         self._current_sample_index = np.random.randint(self.config.AUDIO.RIR_SAMPLING_RATE * self.config.STEP_TIME)
-
-    @staticmethod
-    def position_encoding(position):
-        return '{:.2f}_{:.2f}_{:.2f}'.format(*position)
-
-    def _position_to_index(self, position):
-        if self.position_encoding(position) in self._position_to_index_mapping:
-            return self._position_to_index_mapping[self.position_encoding(position)]
-        else:
-            raise ValueError("Position misalignment.")
-
-    def _try_load_metadata(self):
-        try:
-            return load_metadata(self.metadata_dir)
-        except (FileNotFoundError, FileExistsError):
-            scene_lower = str(self._current_scene).lower()
-            if "hm3d" in self._scene_dataset_name().lower() or "hm3d" in scene_lower:
-                logging.warning(
-                    "Metadata not found for HM3D scene '%s' at %s; "
-                    "continuing without points/graph.",
-                    self.current_scene_name,
-                    self.metadata_dir,
-                )
-                return [], None
-            raise
 
     def _snap_to_navmesh(self, position):
         try:

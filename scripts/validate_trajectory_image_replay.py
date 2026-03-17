@@ -273,7 +273,7 @@ def _build_rgb_simulator(
     sensor_height: float,
     gpu_device_id: int,
 ):
-    from ss_baselines.av_nav.config.default import get_task_config
+    from ss_baselines.omni_long.config.default import get_task_config
     from habitat.sims import make_sim
 
     cfg = get_task_config(config_paths=[str(exp_config)])

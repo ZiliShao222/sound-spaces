@@ -10,7 +10,7 @@ import habitat
 from habitat.core.dataset import EpisodeIterator
 import numpy as np
 import soundspaces  # noqa: F401 - register SoundSpaces datasets/tasks
-from ss_baselines.av_nav.config.default import get_task_config
+from ss_baselines.omni_long.config.default import get_task_config
 from ss_baselines.common.utils import images_to_video_with_audio
 from ss_baselines.common.utils import observations_to_image
 from habitat.utils.visualizations.utils import images_to_video

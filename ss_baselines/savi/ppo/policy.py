@@ -16,7 +16,7 @@ from torchsummary import summary
 
 from soundspaces.tasks.nav import PoseSensor, SpectrogramSensor, LocationBelief, CategoryBelief, Category
 from ss_baselines.common.utils import CategoricalNet
-from ss_baselines.av_nav.models.rnn_state_encoder import RNNStateEncoder
+from ss_baselines.common.rnn_state_encoder import RNNStateEncoder
 from ss_baselines.savi.models.visual_cnn import VisualCNN
 from ss_baselines.savi.models.audio_cnn import AudioCNN
 from ss_baselines.savi.models.smt_state_encoder import SMTStateEncoder

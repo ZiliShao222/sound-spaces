@@ -7,11 +7,15 @@ from itertools import permutations
 from typing import Any, Dict, List, Optional, Sequence, Type
 
 import attr
-import clip
 import numpy as np
 import torch
 from gym import spaces
 from PIL import Image
+
+try:
+    import clip
+except ImportError:
+    clip = None
 
 from habitat.config import Config
 from habitat.core.dataset import Episode
@@ -20,6 +24,13 @@ from habitat.core.registry import registry
 from habitat.core.simulator import Sensor, SensorTypes, Simulator
 from habitat.tasks.nav.nav import DistanceToGoal, EmbodiedTask, Measure, NavigationEpisode, NavigationTask
 
+from soundspaces.tasks.omni_long_goal_features import (
+    DEFAULT_GOAL_FEATURES_FILENAME,
+    goal_feature_cache_path,
+    infer_feature_dim,
+    load_goal_feature_cache,
+    lookup_goal_feature,
+)
 from soundspaces.tasks.semantic_audionav_task import SemanticAudioGoal
 
 
@@ -1035,9 +1046,15 @@ class LifelongSubmitAction(SimulatorTaskAction):
 
 
 _OMNI_LONG_CLIP_CACHE: Dict[str, Any] = {}
+_OMNI_LONG_PRECOMPUTED_FEATURE_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
 
 
 def _load_omni_long_clip(model_name: str):
+    if clip is None:
+        raise ImportError(
+            "`clip` is required for online OmniLongGoalSensor encoding. "
+            "Install the CLIP dependency or enable precomputed goal features."
+        )
     cache_key = str(model_name)
     if cache_key not in _OMNI_LONG_CLIP_CACHE:
         model, preprocess = clip.load(model_name, device="cpu", jit=False)
@@ -1068,11 +1085,92 @@ class OmniLongGoalSensor(Sensor):
         self._dataset = dataset
         self._clip_model_name = str(getattr(config, "CLIP_MODEL", "RN50"))
         self._max_goals = max(1, int(getattr(config, "MAX_GOALS", 5)))
-        self._model, self._preprocess = _load_omni_long_clip(self._clip_model_name)
-        self._embedding_dim = int(getattr(self._model.visual, "output_dim", 1024))
+        self._use_precomputed_features = bool(
+            getattr(config, "USE_PRECOMPUTED_FEATURES", False)
+        )
+        self._allow_online_fallback = bool(
+            getattr(config, "ALLOW_ONLINE_FALLBACK", True)
+        )
+        self._features_root = str(
+            getattr(config, "FEATURES_ROOT", getattr(config, "IMAGE_ROOT", "output"))
+        )
+        self._features_filename = str(
+            getattr(config, "FEATURES_FILENAME", DEFAULT_GOAL_FEATURES_FILENAME)
+        )
+        self._category_prompt_template = str(
+            getattr(config, "CATEGORY_PROMPT_TEMPLATE", "Find the {category}.")
+        )
+        self._model = None
+        self._preprocess = None
+        self._embedding_dim = 0
+        if self._use_precomputed_features:
+            self._embedding_dim = int(getattr(config, "FEATURE_DIM", 0))
+            if self._embedding_dim <= 0:
+                self._embedding_dim = self._infer_precomputed_feature_dim()
+        if self._embedding_dim <= 0 or not self._use_precomputed_features:
+            self._ensure_online_encoder()
         self._text_cache: Dict[str, np.ndarray] = {}
         self._rendered_image_cache: Dict[str, np.ndarray] = {}
         super().__init__(config=config)
+
+    def _ensure_online_encoder(self) -> None:
+        if self._model is not None and self._preprocess is not None:
+            return
+        self._model, self._preprocess = _load_omni_long_clip(self._clip_model_name)
+        if self._embedding_dim <= 0:
+            self._embedding_dim = int(getattr(self._model.visual, "output_dim", 1024))
+
+    def _infer_precomputed_feature_dim(self) -> int:
+        dataset_episodes = getattr(self._dataset, "episodes", None)
+        if not isinstance(dataset_episodes, list):
+            return 0
+        for episode in dataset_episodes:
+            cache_payload = self._load_scene_feature_cache(getattr(episode, "scene_id", ""))
+            if not isinstance(cache_payload, dict):
+                continue
+            feature_dim = infer_feature_dim(cache_payload)
+            if feature_dim > 0:
+                return int(feature_dim)
+        return 0
+
+    def _load_scene_feature_cache(self, scene_id: Any) -> Optional[Dict[str, Any]]:
+        cache_path = goal_feature_cache_path(
+            self._features_root,
+            scene_id,
+            filename=self._features_filename,
+        )
+        cache_key = str(cache_path)
+        if cache_key not in _OMNI_LONG_PRECOMPUTED_FEATURE_CACHE:
+            if not cache_path.exists():
+                _OMNI_LONG_PRECOMPUTED_FEATURE_CACHE[cache_key] = None
+            else:
+                _OMNI_LONG_PRECOMPUTED_FEATURE_CACHE[cache_key] = load_goal_feature_cache(cache_path)
+        return _OMNI_LONG_PRECOMPUTED_FEATURE_CACHE[cache_key]
+
+    def _precomputed_goal_embedding(
+        self,
+        episode: OmniLongEpisode,
+        instance_key: str,
+        modality: str,
+    ) -> Optional[np.ndarray]:
+        cache_payload = self._load_scene_feature_cache(getattr(episode, "scene_id", ""))
+        if cache_payload is None:
+            if self._use_precomputed_features and not self._allow_online_fallback:
+                raise FileNotFoundError(
+                    "Missing precomputed goal feature cache for scene "
+                    f"`{getattr(episode, 'scene_id', '')}` under `{self._features_root}`."
+                )
+            return None
+        feature = lookup_goal_feature(cache_payload, instance_key, modality)
+        if feature is None:
+            return None
+        if self._embedding_dim > 0 and int(feature.shape[0]) != int(self._embedding_dim):
+            raise RuntimeError(
+                "Precomputed goal feature dimension mismatch: "
+                f"expected {self._embedding_dim}, got {int(feature.shape[0])} "
+                f"for instance={instance_key}, modality={modality}."
+            )
+        return np.asarray(feature, dtype=np.float32)
 
     def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
         return self.cls_uuid
@@ -1093,6 +1191,7 @@ class OmniLongGoalSensor(Sensor):
         if not key:
             return np.zeros((self._embedding_dim,), dtype=np.float32)
         if key not in self._text_cache:
+            self._ensure_online_encoder()
             with torch.no_grad():
                 tokens = clip.tokenize([key], truncate=True)
                 embedding = self._model.encode_text(tokens).float()
@@ -1101,6 +1200,7 @@ class OmniLongGoalSensor(Sensor):
         return self._text_cache[key]
 
     def _encode_rendered_rgb(self, rgb: np.ndarray) -> np.ndarray:
+        self._ensure_online_encoder()
         image = Image.fromarray(np.asarray(rgb, dtype=np.uint8), mode="RGB")
         with torch.no_grad():
             image_tensor = self._preprocess(image).unsqueeze(0)
@@ -1188,6 +1288,17 @@ class OmniLongGoalSensor(Sensor):
         instance_key: str,
         modality: str,
     ) -> np.ndarray:
+        if self._use_precomputed_features:
+            precomputed_feature = self._precomputed_goal_embedding(
+                episode,
+                instance_key,
+                modality,
+            )
+            if precomputed_feature is not None:
+                return precomputed_feature
+            if not self._allow_online_fallback:
+                return np.zeros((self._embedding_dim,), dtype=np.float32)
+
         record = self._lookup_goal_record(episode, instance_key)
         if not isinstance(record, dict):
             return np.zeros((self._embedding_dim,), dtype=np.float32)
@@ -1213,7 +1324,9 @@ class OmniLongGoalSensor(Sensor):
         if description and modality.startswith("text"):
             return self._encode_text(description)
 
-        return self._encode_text(category)
+        return self._encode_text(
+            self._category_prompt_template.format(category=category)
+        )
 
     def get_observation(
         self,

@@ -20,7 +20,7 @@ except Exception:
 
 import numpy as np
 import habitat_sim
-from ss_baselines.av_nav.config.default import get_task_config
+from ss_baselines.omni_long.config.default import get_task_config
 from habitat.sims import make_sim
 
 
