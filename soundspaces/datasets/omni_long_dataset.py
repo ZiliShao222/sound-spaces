@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import attr
@@ -20,6 +21,8 @@ from soundspaces.tasks.semantic_audionav_task import ObjectViewLocation, Semanti
 
 CONTENT_SCENES_PATH_FIELD = "content_scenes_path"
 DEFAULT_SCENE_PATH_PREFIX = "data/scene_dataset/"
+_FLOAT_TOKEN_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+_INT_TOKEN_RE = re.compile(r"^[+-]?\d+$")
 
 
 def _is_vec3(value: Any) -> bool:
@@ -152,10 +155,11 @@ def _build_goal_dict_from_instance(instance_key: str, record: Dict[str, Any]) ->
 def _coerce_float(value: Any, default: float = 0.0) -> float:
     if isinstance(value, (int, float)):
         return float(value)
-    try:
-        return float(value)
-    except Exception:
-        return float(default)
+    if isinstance(value, str):
+        token = value.strip()
+        if token and _FLOAT_TOKEN_RE.fullmatch(token):
+            return float(token)
+    return float(default)
 
 
 def _coerce_int(value: Any, default: int = 0) -> int:
@@ -163,10 +167,11 @@ def _coerce_int(value: Any, default: int = 0) -> int:
         return int(value)
     if isinstance(value, int):
         return int(value)
-    try:
-        return int(value)
-    except Exception:
-        return int(default)
+    if isinstance(value, str):
+        token = value.strip()
+        if token and _INT_TOKEN_RE.fullmatch(token):
+            return int(token)
+    return int(default)
 
 
 @registry.register_dataset(name="OmniLongNav")
@@ -267,11 +272,7 @@ class OmniLongNavDataset(Dataset):
 
     @staticmethod
     def _resolve_dataset_path(config: Config) -> str:
-        data_path = str(config.DATA_PATH)
-        try:
-            return data_path.format(version=config.VERSION, split=config.SPLIT)
-        except Exception:
-            return data_path
+        return str(config.DATA_PATH).format(version=config.VERSION, split=config.SPLIT)
 
     @staticmethod
     def __deserialize_goal(serialized_goal: Dict[str, Any]) -> SemanticAudioGoal:

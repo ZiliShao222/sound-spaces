@@ -15,6 +15,7 @@ from habitat.config import Config
 import numpy as np
 from PIL import Image
 import soundspaces  # noqa: F401 - register datasets/tasks/sims
+import yaml
 from habitat.utils.visualizations.utils import images_to_video
 
 from ss_baselines.omni_long.config.default import get_task_config
@@ -30,6 +31,16 @@ DEFAULT_CONFIG = "configs/omni-long/mp3d/omni-long_semantic_audio.yaml"
 DEFAULT_TASK_TYPE = "OmniLongSemanticAudioNav"
 DEFAULT_EXP_NAME = "exp_eval_omni-long"
 DEFAULT_OUTPUT_PARENT_DIR = "results"
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        value = float(value)
+        if np.isfinite(value):
+            return value
+    return None
 
 
 def _is_vec3(value: Any) -> bool:
@@ -144,14 +155,11 @@ def _render_reference_image(
     if not _is_vec3(position) or not _is_quat4(rotation):
         return None
 
-    try:
-        observations = env.sim.get_observations_at(
-            position=[float(v) for v in position],
-            rotation=[float(v) for v in rotation],
-            keep_agent_at_new_pose=False,
-        )
-    except Exception:
-        return None
+    observations = env.sim.get_observations_at(
+        position=[float(v) for v in position],
+        rotation=[float(v) for v in rotation],
+        keep_agent_at_new_pose=False,
+    )
 
     if observations is None:
         return None
@@ -306,13 +314,12 @@ def _normalize_task_specs(raw_tasks: Any) -> List[Tuple[str, str]]:
 
 def _episode_goal_count(episode: Any, goal_specs: List[Tuple[str, str]]) -> int:
     raw_count = getattr(episode, "num_goals", None)
-    try:
-        goal_count = int(raw_count)
-    except Exception:
-        goal_count = int(len(goal_specs))
+    goal_count = _optional_float(raw_count)
+    if goal_count is None:
+        goal_count = float(len(goal_specs))
     if goal_count <= 0:
-        goal_count = int(len(goal_specs))
-    return max(1, goal_count)
+        goal_count = float(len(goal_specs))
+    return max(1, int(goal_count))
 
 
 def _format_episode_metrics(metrics: Dict[str, Any], num_goals: int) -> Dict[str, float]:
@@ -331,11 +338,8 @@ def _format_episode_metrics(metrics: Dict[str, Any], num_goals: int) -> Dict[str
             continue
         if token == "success":
             continue
-        try:
-            numeric_value = float(value)
-        except Exception:
-            continue
-        if not np.isfinite(numeric_value):
+        numeric_value = _optional_float(value)
+        if numeric_value is None:
             continue
         formatted[token] = numeric_value
     formatted["num_goals"] = float(max(1, int(num_goals)))
@@ -346,10 +350,7 @@ def _safe_json_load(raw: str, fallback: Any) -> Any:
     token = str(raw).strip()
     if not token:
         return fallback
-    try:
-        return json.loads(token)
-    except Exception:
-        return fallback
+    return json.loads(token)
 
 
 def _safe_yaml_or_json_load(path: Path) -> Dict[str, Any]:
@@ -359,12 +360,6 @@ def _safe_yaml_or_json_load(path: Path) -> Dict[str, Any]:
     if path.suffix.lower() == ".json":
         payload = json.loads(path.read_text(encoding="utf-8"))
     else:
-        try:
-            import yaml
-        except Exception as exc:
-            raise RuntimeError(
-                "Reading YAML eval config requires PyYAML. Install with `pip install pyyaml`."
-            ) from exc
         payload = yaml.safe_load(path.read_text(encoding="utf-8"))
 
     if payload is None:
@@ -540,7 +535,7 @@ def apply_eval_config(args: argparse.Namespace) -> argparse.Namespace:
         _first_cfg_value(cfg, "video_audio_max_gain", "eval.video_audio_max_gain"),
     )
 
-    if args.disable_content_scenes is False:
+    if args.disable_content_scenes is None:
         disable_content = _first_cfg_value(cfg, "disable_content_scenes", "dataset.disable_content_scenes")
         if isinstance(disable_content, bool):
             args.disable_content_scenes = disable_content
@@ -632,7 +627,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--disable-content-scenes",
-        action="store_true",
+        default=None,
+        action=argparse.BooleanOptionalAction,
         help="Disable per-scene content loading.",
     )
     parser.add_argument(
@@ -779,11 +775,11 @@ def build_config(args: argparse.Namespace) -> habitat.Config:
     if args.goal_order_mode is not None:
         cfg.TASK.GOAL_ORDER_MODE = args.goal_order_mode
     # Ensure RGB+Depth are both enabled so video can include depth panel.
-    try:
-        default_agent_id = cfg.SIMULATOR.DEFAULT_AGENT_ID
-        agent_name = cfg.SIMULATOR.AGENTS[default_agent_id]
-        agent_cfg = getattr(cfg.SIMULATOR, agent_name)
-    except Exception:
+    default_agent_id = getattr(cfg.SIMULATOR, "DEFAULT_AGENT_ID", 0)
+    agent_names = list(getattr(cfg.SIMULATOR, "AGENTS", []))
+    if 0 <= int(default_agent_id) < len(agent_names):
+        agent_cfg = getattr(cfg.SIMULATOR, agent_names[int(default_agent_id)])
+    else:
         agent_cfg = getattr(cfg.SIMULATOR, "AGENT_0")
 
     agent_sensors = [str(sensor) for sensor in list(getattr(agent_cfg, "SENSORS", []))]

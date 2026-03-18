@@ -19,13 +19,7 @@ class MiniCPMGoalFeatureEncoder:
     ) -> None:
         if not model_path:
             raise ValueError("`model_path` is required for MiniCPMGoalFeatureEncoder.")
-        try:
-            from transformers import AutoModel, AutoProcessor, AutoTokenizer
-        except ImportError as exc:
-            raise ImportError(
-                "`transformers` is required for MiniCPMGoalFeatureEncoder. "
-                "Install it in your training environment first."
-            ) from exc
+        from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
         self._device = torch.device(device)
         self._batch_size = int(batch_size)

@@ -152,15 +152,10 @@ class BaseRLTrainer(BaseTrainer):
         ckpt_cmd_opts = checkpoint_config.CMD_TRAILING_OPTS
         eval_cmd_opts = config.CMD_TRAILING_OPTS
 
-        try:
-            config.merge_from_other_cfg(checkpoint_config)
-            config.merge_from_other_cfg(self.config)
-            config.merge_from_list(ckpt_cmd_opts)
-            config.merge_from_list(eval_cmd_opts)
-        except KeyError:
-            logger.info("Saved config is outdated, using solely eval config")
-            config = self.config.clone()
-            config.merge_from_list(eval_cmd_opts)
+        config.merge_from_other_cfg(checkpoint_config)
+        config.merge_from_other_cfg(self.config)
+        config.merge_from_list(ckpt_cmd_opts)
+        config.merge_from_list(eval_cmd_opts)
 
         config.TASK_CONFIG.SIMULATOR.AGENT_0.defrost()
         config.TASK_CONFIG.SIMULATOR.AGENT_0.SENSORS = self.config.SENSORS

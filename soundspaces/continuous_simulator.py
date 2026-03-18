@@ -15,6 +15,7 @@ import math
 import psutil
 from scipy.signal import fftconvolve
 import numpy as np
+from PIL import Image
 from gym import spaces
 
 from habitat.core.registry import registry
@@ -35,6 +36,23 @@ from pathlib import Path
 def calculate_mem_usage():
     process = psutil.Process(os.getpid())
     return process.memory_info().rss / 1024.0 / 1024 / 1024  # in GB
+
+
+def _as_int_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, str):
+        token = value.strip()
+        if token.startswith(("+", "-")):
+            sign = token[0]
+            digits = token[1:]
+            if digits.isdigit():
+                return int(sign + digits)
+        if token.isdigit():
+            return int(token)
+    return None
 
 
 def crossfade(x1, x2, sr):
@@ -61,17 +79,14 @@ def _resolve_scene_dataset_config(scene_dataset: str) -> Optional[str]:
 
 
 def _quat_to_list(quat) -> List[float]:
-    try:
+    if all(hasattr(quat, attr) for attr in ("x", "y", "z", "w")):
         return [float(quat.x), float(quat.y), float(quat.z), float(quat.w)]
-    except Exception:
-        pass
     if hasattr(quat, "vector") and hasattr(quat, "scalar"):
         v = quat.vector
         return [float(v[0]), float(v[1]), float(v[2]), float(quat.scalar)]
-    try:
+    if isinstance(quat, (list, tuple, np.ndarray)) and len(quat) == 4:
         return [float(x) for x in quat]
-    except Exception:
-        return [0.0, 0.0, 0.0, 1.0]
+    return [0.0, 0.0, 0.0, 1.0]
 
 
 @registry.register_simulator()
@@ -204,9 +219,12 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
                 "start_position",
                 "start_rotation",
                 "goal_position",
+                "goal_positions",
                 "offset",
                 "duration",
                 "sound_id",
+                "sound_sources",
+                "sound_source_schedule",
                 "mass",
                 "linear_acceleration",
                 "angular_acceleration",
@@ -434,11 +452,8 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
         self._current_sample_index = np.random.randint(self.config.AUDIO.RIR_SAMPLING_RATE * self.config.STEP_TIME)
 
     def _snap_to_navmesh(self, position):
-        try:
-            if hasattr(self.pathfinder, "snap_point"):
-                return np.array(self.pathfinder.snap_point(position), dtype=np.float32)
-        except Exception:
-            pass
+        if hasattr(self.pathfinder, "snap_point"):
+            return np.array(self.pathfinder.snap_point(position), dtype=np.float32)
         return np.array(position, dtype=np.float32)
 
     def reset(self):
@@ -599,10 +614,16 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
         scene = getattr(self._sim, "semantic_scene", None)
         if scene is None:
             return []
-        try:
-            return list(scene.objects)
-        except Exception:
+        objects = getattr(scene, "objects", None)
+        if objects is None:
             return []
+        if isinstance(objects, list):
+            return objects
+        if isinstance(objects, tuple):
+            return list(objects)
+        if hasattr(objects, "__iter__"):
+            return list(objects)
+        return []
 
     def resolve_semantic_target(
         self,
@@ -617,10 +638,7 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
         def _get_semantic_id(obj: Any) -> Optional[int]:
             for attr in ("semantic_id", "semanticID"):
                 if hasattr(obj, attr):
-                    try:
-                        return int(getattr(obj, attr))
-                    except Exception:
-                        return None
+                    return _as_int_or_none(getattr(obj, attr))
             return None
 
         # direct match on semantic id if possible (but respect goal_category when provided)
@@ -632,15 +650,13 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
                 if goal_category and cat_name and cat_name != goal_category:
                     continue
                 return sem_id, cat_name
-            try:
-                if int(getattr(obj, "id", -1)) == int(object_id):
-                    name = getattr(obj, "category", None)
-                    cat_name = name.name() if name is not None else ""
-                    if goal_category and cat_name and cat_name != goal_category:
-                        continue
-                    return sem_id if sem_id is not None else int(object_id), cat_name
-            except Exception:
-                pass
+            object_instance_id = _as_int_or_none(getattr(obj, "id", -1))
+            if object_instance_id == int(object_id):
+                name = getattr(obj, "category", None)
+                cat_name = name.name() if name is not None else ""
+                if goal_category and cat_name and cat_name != goal_category:
+                    continue
+                return sem_id if sem_id is not None else int(object_id), cat_name
 
         # fallback: nearest object with matching category name
         if goal_position is not None and goal_category:
@@ -650,10 +666,10 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
                 cat = getattr(obj, "category", None)
                 if cat is None:
                     continue
-                try:
-                    name = cat.name()
-                except Exception:
+                name_fn = getattr(cat, "name", None)
+                if not callable(name_fn):
                     continue
+                name = name_fn()
                 if name != goal_category:
                     continue
                 aabb = getattr(obj, "aabb", None)
@@ -772,19 +788,14 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
                     continue
 
             # enforce obstacle clearance if supported
-            try:
+            if hasattr(self.pathfinder, "distance_to_closest_obstacle"):
                 dist_to_obs = self.pathfinder.distance_to_closest_obstacle(pos)
                 if dist_to_obs < obstacle_clearance:
                     continue
-            except Exception:
-                pass
 
             # enforce geodesic distance constraint
-            try:
-                geo = self.geodesic_distance(pos, [goal_pos])
-                if (not np.isfinite(geo)) or geo > max_geodesic_dist:
-                    continue
-            except Exception:
+            geo = self.geodesic_distance(pos, [goal_pos])
+            if geo is None or (not np.isfinite(geo)) or geo > max_geodesic_dist:
                 continue
 
             # normalize position height to snapped goal height (agent stays on navmesh plane)
@@ -857,10 +868,6 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
         rgb = sim_obs.get(rgb_uuid)
         if rgb is None:
             raise RuntimeError("RGB observation missing.")
-        try:
-            from PIL import Image
-        except ImportError as exc:
-            raise RuntimeError("PIL not available. Please `pip install pillow`.") from exc
         Image.fromarray(rgb).save(out_path)
 
     def set_active_sound_index(self, idx: int) -> bool:

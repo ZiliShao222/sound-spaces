@@ -242,21 +242,15 @@ class SemanticAudioNavigationTask(NavigationTask):
 
     def _apply_goal_to_sim(self, episode: Episode, goal_index: int) -> None:
         if hasattr(self._sim, "set_active_sound_index"):
-            try:
-                self._sim.set_active_sound_index(goal_index)
-                return
-            except Exception:
-                pass
+            self._sim.set_active_sound_index(goal_index)
+            return
         goal = self._all_goals[goal_index]
         sound_id = None
         sound_sources = getattr(episode, "sound_sources", None)
         if sound_sources and goal_index < len(sound_sources):
             sound_id = sound_sources[goal_index].get("sound_id")
         if hasattr(self._sim, "set_active_goal"):
-            try:
-                self._sim.set_active_goal(goal.position, sound_id=sound_id)
-            except Exception:
-                pass
+            self._sim.set_active_goal(goal.position, sound_id=sound_id)
 
 
 def merge_sim_episode_config(

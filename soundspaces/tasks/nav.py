@@ -329,13 +329,10 @@ class EgoMap(Sensor):
         return xyz_camera
 
     def safe_assign(self, im_map, x_idx, y_idx, value):
-        try:
-            im_map[x_idx, y_idx] = value
-        except IndexError:
-            valid_idx1 = np.logical_and(x_idx >= 0, x_idx < im_map.shape[0])
-            valid_idx2 = np.logical_and(y_idx >= 0, y_idx < im_map.shape[1])
-            valid_idx = np.logical_and(valid_idx1, valid_idx2)
-            im_map[x_idx[valid_idx], y_idx[valid_idx]] = value
+        valid_idx1 = np.logical_and(x_idx >= 0, x_idx < im_map.shape[0])
+        valid_idx2 = np.logical_and(y_idx >= 0, y_idx < im_map.shape[1])
+        valid_idx = np.logical_and(valid_idx1, valid_idx2)
+        im_map[x_idx[valid_idx], y_idx[valid_idx]] = value
 
     def _get_depth_projection(self, sim_depth):
         """

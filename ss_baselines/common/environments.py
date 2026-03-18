@@ -13,7 +13,7 @@ in habitat. Customized environments should be registered using
 ``@baseline_registry.register_env(name="myEnv")` for reusability
 """
 
-from typing import Optional, Type
+from typing import Any, Dict, Optional, Type
 import logging
 import math
 
@@ -107,7 +107,29 @@ class AudioNavRLEnv(habitat.RLEnv):
         return done
 
     def get_info(self, observations):
-        return self.habitat_env.get_metrics()
+        info = dict(self.habitat_env.get_metrics())
+        task = getattr(self._env, "task", None)
+        if task is None:
+            return info
+
+        remaining_submit_count = getattr(task, "remaining_submit_count", None)
+        if remaining_submit_count is not None:
+            info["remaining_submit_count"] = int(remaining_submit_count)
+
+        if hasattr(task, "get_last_action_feedback"):
+            feedback = task.get_last_action_feedback()
+            if isinstance(feedback, dict):
+                info["last_action_feedback"] = feedback
+                info["found_goal_this_step"] = int(bool(feedback.get("found_goal_this_step", False)))
+                info["found_goal_index_this_step"] = int(feedback.get("found_goal_index", -1))
+                if "remaining_submit_count" in feedback:
+                    info["remaining_submit_count"] = int(feedback["remaining_submit_count"])
+                if "submit_count" in feedback:
+                    info["submit_count"] = int(feedback["submit_count"])
+                if "submit_limit" in feedback:
+                    info["submit_limit"] = int(feedback["submit_limit"])
+
+        return info
 
     # for data collection
     def get_current_episode_id(self):
@@ -152,10 +174,7 @@ class OmniLongRLEnv(habitat.RLEnv):
     def _goal_completion_value(self) -> float:
         metrics = self._env.get_metrics()
         completion_value = metrics.get("lifelong_goal_completion", 0.0)
-        try:
-            return float(completion_value)
-        except Exception:
-            return 0.0
+        return float(completion_value)
 
     def _time_penalty_scale(self) -> float:
         if not bool(getattr(self._rl_config, "DYNAMIC_TIME_PENALTY", True)):
@@ -184,6 +203,50 @@ class OmniLongRLEnv(habitat.RLEnv):
     def step(self, *args, **kwargs):
         return super().step(*args, **kwargs)
 
+    def _last_action_feedback(self) -> Dict[str, Any]:
+        task = getattr(self._env, "task", None)
+        if task is None or not hasattr(task, "get_last_action_feedback"):
+            return {}
+
+        feedback = task.get_last_action_feedback()
+        if isinstance(feedback, dict):
+            return feedback
+        return {}
+
+    def _action_feedback_reward(self) -> float:
+        feedback = self._last_action_feedback()
+        action_name = str(feedback.get("action_name") or "").strip().upper()
+        found_goal = bool(feedback.get("found_goal_this_step", False))
+
+        if not action_name:
+            return 0.0
+
+        if action_name == "STOP":
+            return self._mode_reward_value(
+                ordered_key="ORDERED_STOP_PENALTY",
+                unordered_key="UNORDERED_STOP_PENALTY",
+                fallback_key="STOP_PENALTY",
+                default=-5.0,
+            )
+
+        if action_name == "LIFELONG_SUBMIT":
+            reward = self._mode_reward_value(
+                ordered_key="ORDERED_SUBMIT_PENALTY",
+                unordered_key="UNORDERED_SUBMIT_PENALTY",
+                fallback_key="SUBMIT_PENALTY",
+                default=-2.0,
+            )
+            if found_goal:
+                reward += self._mode_reward_value(
+                    ordered_key="ORDERED_FOUND_GOAL_REWARD",
+                    unordered_key="UNORDERED_FOUND_GOAL_REWARD",
+                    fallback_key="FOUND_GOAL_REWARD",
+                    default=10.0,
+                )
+            return float(reward)
+
+        return 0.0
+
     def get_reward_range(self):
         slack_reward = self._mode_reward_value(
             ordered_key="ORDERED_SLACK_REWARD",
@@ -195,19 +258,35 @@ class OmniLongRLEnv(habitat.RLEnv):
             ordered_key="ORDERED_SUCCESS_REWARD",
             unordered_key="UNORDERED_SUCCESS_REWARD",
             fallback_key="SUCCESS_REWARD",
+            default=20.0,
+        )
+
+        stop_floor = self._mode_reward_value(
+            ordered_key="ORDERED_STOP_PENALTY",
+            unordered_key="UNORDERED_STOP_PENALTY",
+            fallback_key="STOP_PENALTY",
+            default=-5.0,
+        )
+        submit_floor = self._mode_reward_value(
+            ordered_key="ORDERED_SUBMIT_PENALTY",
+            unordered_key="UNORDERED_SUBMIT_PENALTY",
+            fallback_key="SUBMIT_PENALTY",
+            default=-2.0,
+        )
+        submit_success = submit_floor + self._mode_reward_value(
+            ordered_key="ORDERED_FOUND_GOAL_REWARD",
+            unordered_key="UNORDERED_FOUND_GOAL_REWARD",
+            fallback_key="FOUND_GOAL_REWARD",
             default=10.0,
         )
         return (
-            float(slack_reward) - 10.0,
-            float(success_reward) + 10.0,
+            float(slack_reward) + min(0.0, float(stop_floor), float(submit_floor)) - 10.0,
+            float(slack_reward) + max(float(submit_success), float(stop_floor) + float(success_reward)) + 10.0,
         )
 
     def _success_value(self) -> float:
         success_metric = self._env.get_metrics().get(self._success_measure_name, 0.0)
-        try:
-            return float(success_metric)
-        except Exception:
-            return 0.0
+        return float(success_metric)
 
     def get_reward(self, observations):
         reward = 0.0
@@ -217,22 +296,23 @@ class OmniLongRLEnv(habitat.RLEnv):
                 unordered_key="UNORDERED_SLACK_REWARD",
                 fallback_key="SLACK_REWARD",
                 default=-0.01,
-            ) * self._time_penalty_scale()
+            )
 
         reward_metric = self._env.get_metrics().get(self._reward_measure_name, 0.0)
-        try:
-            reward += float(reward_metric)
-        except Exception:
-            pass
+        reward += float(reward_metric)
+        reward += self._action_feedback_reward()
 
-        if self._success_value() >= 1.0:
+        feedback = self._last_action_feedback()
+        action_name = str(feedback.get("action_name") or "").strip().upper()
+        if action_name == "STOP" and self._success_value() >= 1.0:
             reward += self._mode_reward_value(
                 ordered_key="ORDERED_SUCCESS_REWARD",
                 unordered_key="UNORDERED_SUCCESS_REWARD",
                 fallback_key="SUCCESS_REWARD",
-                default=10.0,
+                default=20.0,
             )
 
+        assert not math.isnan(reward)
         return reward
 
     def get_done(self, observations):
@@ -243,4 +323,32 @@ class OmniLongRLEnv(habitat.RLEnv):
         return False
 
     def get_info(self, observations):
-        return self.habitat_env.get_metrics()
+        info = dict(self.habitat_env.get_metrics())
+        task = getattr(self._env, "task", None)
+        if task is None:
+            return info
+
+        remaining_submit_count = getattr(task, "remaining_submit_count", None)
+        if remaining_submit_count is not None:
+            info["remaining_submit_count"] = int(remaining_submit_count)
+
+        if hasattr(task, "get_last_action_feedback"):
+            feedback = task.get_last_action_feedback()
+            if isinstance(feedback, dict):
+                info["last_action_feedback"] = feedback
+                info["found_goal_this_step"] = int(
+                    bool(feedback.get("found_goal_this_step", False))
+                )
+                info["found_goal_index_this_step"] = int(
+                    feedback.get("found_goal_index", -1)
+                )
+                if "remaining_submit_count" in feedback:
+                    info["remaining_submit_count"] = int(
+                        feedback["remaining_submit_count"]
+                    )
+                if "submit_count" in feedback:
+                    info["submit_count"] = int(feedback["submit_count"])
+                if "submit_limit" in feedback:
+                    info["submit_limit"] = int(feedback["submit_limit"])
+
+        return info

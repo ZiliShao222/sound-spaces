@@ -15,11 +15,7 @@ class WandbRun:
         if wandb_cfg is None or not getattr(wandb_cfg, "ENABLED", False):
             return
 
-        try:
-            import wandb
-        except ModuleNotFoundError:
-            logger.warning("`wandb` is not installed; disabling Weights & Biases logging.")
-            return
+        import wandb
 
         run_dir = str(getattr(wandb_cfg, "DIR", "") or os.path.dirname(config.TENSORBOARD_DIR))
         os.makedirs(run_dir, exist_ok=True)

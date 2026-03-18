@@ -209,9 +209,12 @@ class SoundSpacesSim(Simulator, ABC):
                 "start_position",
                 "start_rotation",
                 "goal_position",
+                "goal_positions",
                 "offset",
                 "duration",
                 "sound_id",
+                "sound_sources",
+                "sound_source_schedule",
                 "mass",
                 "linear_acceleration",
                 "angular_acceleration",
@@ -338,16 +341,13 @@ class SoundSpacesSim(Simulator, ABC):
         )
 
     def _load_graph_or_raise(self):
-        try:
-            return load_metadata(self.metadata_dir)
-        except (FileNotFoundError, FileExistsError) as exc:
-            if "hm3d" in self._scene_dataset_name().lower():
-                raise RuntimeError(
-                    "HM3D metadata missing for SoundSpacesSim. "
-                    "Use ContinuousSoundSpacesSim (default in semantic_audionav_eval.py) "
-                    "or generate metadata at: {}".format(self.metadata_dir)
-                ) from exc
-            raise
+        if not os.path.exists(self.metadata_dir) and "hm3d" in self._scene_dataset_name().lower():
+            raise RuntimeError(
+                "HM3D metadata missing for SoundSpacesSim. "
+                "Use ContinuousSoundSpacesSim (default in semantic_audionav_eval.py) "
+                "or generate metadata at: {}".format(self.metadata_dir)
+            )
+        return load_metadata(self.metadata_dir)
 
     @property
     def current_scene_name(self):
@@ -676,11 +676,7 @@ class SoundSpacesSim(Simulator, ABC):
             if self.config.USE_RENDERED_OBSERVATIONS:
                 binaural_rir_file = os.path.join(self.binaural_rir_dir, str(self.azimuth_angle), '{}_{}.wav'.format(
                     self._receiver_position_index, self._source_position_index))
-                try:
-                    sampling_freq, binaural_rir = wavfile.read(binaural_rir_file)  # float32
-                except ValueError:
-                    logging.warning("{} file is not readable".format(binaural_rir_file))
-                    binaural_rir = np.zeros((sampling_rate, 2)).astype(np.float32)
+                sampling_freq, binaural_rir = wavfile.read(binaural_rir_file)  # float32
                 if len(binaural_rir) == 0:
                     logging.debug("Empty RIR file at {}".format(binaural_rir_file))
                     binaural_rir = np.zeros((sampling_rate, 2)).astype(np.float32)
@@ -711,11 +707,7 @@ class SoundSpacesSim(Simulator, ABC):
             if self.config.AUDIO.HAS_DISTRACTOR_SOUND:
                 binaural_rir_file = os.path.join(self.binaural_rir_dir, str(self.azimuth_angle), '{}_{}.wav'.format(
                     self._receiver_position_index, self._distractor_position_index))
-                try:
-                    sampling_freq, distractor_rir = wavfile.read(binaural_rir_file)
-                except ValueError:
-                    logging.warning("{} file is not readable".format(binaural_rir_file))
-                    distractor_rir = np.zeros((self.config.AUDIO.RIR_SAMPLING_RATE, 2)).astype(np.float32)
+                sampling_freq, distractor_rir = wavfile.read(binaural_rir_file)
                 if len(distractor_rir) == 0:
                     logging.debug("Empty RIR file at {}".format(binaural_rir_file))
                     distractor_rir = np.zeros((self.config.AUDIO.RIR_SAMPLING_RATE, 2)).astype(np.float32)
@@ -791,10 +783,10 @@ class SoundSpacesSim(Simulator, ABC):
             self._spectrogram_cache = dict()
             updated = True
         if position is not None:
-            try:
-                self._source_position_index = self._position_to_index(position)
-            except Exception:
+            position_key = self.position_encoding(position)
+            if position_key not in self._position_to_index_mapping:
                 return updated
+            self._source_position_index = self._position_to_index_mapping[position_key]
             if not self.config.USE_RENDERED_OBSERVATIONS:
                 audio_sensor = self._sim.get_agent(0)._sensors["audio_sensor"]
                 audio_sensor.setAudioSourceTransform(

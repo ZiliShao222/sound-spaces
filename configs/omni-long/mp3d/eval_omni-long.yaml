@@ -6,7 +6,7 @@ output_parent_dir: "results"
 # Scene / dataset paths
 scene_dataset_config_path: "data/scene_datasets/mp3d/mp3d.scene_dataset_config.json"
 scene_data_path: "data/scene_datasets/mp3d"
-test_data_dir: "output/QUCTc6BB5sX/trajectory_dataset.json.gz"
+test_data_dir: "data/datasets/omni_long/mp3d/v1/val/val.json.gz"
 
 # Habitat task config (our omni-long base config)
 habitat_config_path: "configs/omni-long/mp3d/omni-long_semantic_audio.yaml"
@@ -28,4 +28,4 @@ distance_submit_threshold: 1.0
 
 # Optional overrides
 split: "val"
-disable_content_scenes: true
+disable_content_scenes: false

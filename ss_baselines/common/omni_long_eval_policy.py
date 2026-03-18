@@ -13,6 +13,33 @@ from habitat.utils.geometry_utils import quaternion_rotate_vector
 from soundspaces.tasks.shortest_path_follower import ShortestPathFollower
 
 
+def _as_int_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, str):
+        token = value.strip()
+        if token.startswith(("+", "-")):
+            sign = token[0]
+            digits = token[1:]
+            if digits.isdigit():
+                return int(sign + digits)
+        if token.isdigit():
+            return int(token)
+    return None
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        value = float(value)
+        if np.isfinite(value):
+            return value
+    return None
+
+
 def _get_task(env: Any) -> Any:
     task = getattr(env, "task", None)
     if task is not None:
@@ -44,9 +71,8 @@ def _build_named_action(action_name: str) -> Dict[str, str]:
 
 
 def _sim_action_to_named_action(action: Any) -> Any:
-    try:
-        action_id = int(action)
-    except Exception:
+    action_id = _as_int_or_none(action)
+    if action_id is None:
         return action
 
     if action_id == int(HabitatSimActions.STOP):
@@ -70,23 +96,14 @@ def _distance_to_current_goal(env: Any, episode: Any) -> Optional[float]:
 def _distance_to_specific_goal(env: Any, episode: Any, goal: Any) -> Optional[float]:
     task = _get_task(env)
     if task is not None and hasattr(task, "_distance_to_goal"):
-        try:
-            distance = task._distance_to_goal(goal, episode)
-            if distance is None:
-                return None
-            return float(distance)
-        except Exception:
-            pass
+        return _optional_float(task._distance_to_goal(goal, episode))
 
-    try:
-        goal_pos = getattr(goal, "position", None)
-        if goal_pos is None:
-            return None
-        current_pos = env.sim.get_agent_state().position
-        distance = env.sim.geodesic_distance(current_pos, [goal_pos], episode)
-        return float(distance)
-    except Exception:
+    goal_pos = getattr(goal, "position", None)
+    if goal_pos is None:
         return None
+    current_pos = env.sim.get_agent_state().position
+    distance = env.sim.geodesic_distance(current_pos, [goal_pos], episode)
+    return _optional_float(distance)
 
 
 def _normalize_goal_order_mode(value: Any) -> Optional[str]:
@@ -113,10 +130,7 @@ def _order_enforced(env: Any, policy: Optional["LifelongEvalPolicy"] = None) -> 
     if task is None:
         return True
     if hasattr(task, "order_enforced"):
-        try:
-            return bool(task.order_enforced)
-        except Exception:
-            pass
+        return bool(task.order_enforced)
     mode = getattr(task, "_mode", None)
     if mode is None:
         return True
@@ -200,17 +214,11 @@ def _nearest_target_position(
     best_distance: Optional[float] = None
     for target_position in target_positions:
         candidate_target = np.asarray(target_position, dtype=np.float32)
-        try:
-            if hasattr(env.sim, "_snap_to_navmesh"):
-                candidate_target = np.asarray(env.sim._snap_to_navmesh(candidate_target), dtype=np.float32)
-            elif hasattr(env.sim, "pathfinder") and hasattr(env.sim.pathfinder, "snap_point"):
-                candidate_target = np.asarray(env.sim.pathfinder.snap_point(candidate_target), dtype=np.float32)
-        except Exception:
-            candidate_target = np.asarray(target_position, dtype=np.float32)
-        try:
-            distance = env.sim.geodesic_distance(current_position, [candidate_target], episode)
-        except Exception:
-            continue
+        if hasattr(env.sim, "_snap_to_navmesh"):
+            candidate_target = np.asarray(env.sim._snap_to_navmesh(candidate_target), dtype=np.float32)
+        elif hasattr(env.sim, "pathfinder") and hasattr(env.sim.pathfinder, "snap_point"):
+            candidate_target = np.asarray(env.sim.pathfinder.snap_point(candidate_target), dtype=np.float32)
+        distance = env.sim.geodesic_distance(current_position, [candidate_target], episode)
         if distance is None or not np.isfinite(distance):
             continue
         if best_distance is None or float(distance) < float(best_distance):
@@ -257,10 +265,10 @@ def _task_success_distance(env: Any, default: float = 1.0) -> float:
     task_config = getattr(task, "_config", None)
     success_cfg = getattr(task_config, "SUCCESS", None)
     value = getattr(success_cfg, "SUCCESS_DISTANCE", default)
-    try:
-        return float(value)
-    except Exception:
-        return float(default)
+    parsed = _optional_float(value)
+    if parsed is not None:
+        return parsed
+    return float(default)
 
 
 @dataclass

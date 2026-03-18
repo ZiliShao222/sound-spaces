@@ -27,19 +27,11 @@ import numpy as np
 from gym.spaces import Dict as SpaceDict
 
 import habitat
+import torch.multiprocessing as mp
 from habitat.config import Config
 from habitat.core.env import Env, Observations, RLEnv
 from habitat.core.logging import logger
 from habitat.core.utils import tile_images
-
-try:
-    # Use torch.multiprocessing if we can.
-    # We have yet to find a reason to not use it and
-    # you are required to use it when sending a torch.Tensor
-    # between processes
-    import torch.multiprocessing as mp
-except ImportError:
-    import multiprocessing as mp
 
 STEP_COMMAND = "step"
 RESET_COMMAND = "reset"

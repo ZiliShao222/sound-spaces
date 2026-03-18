@@ -37,6 +37,16 @@ WEIGHTED_METRIC_NAMES = ("success", "spl", "softspl")
 RUNNING_MEAN_METRIC_NAMES = ("na",)
 
 
+def _optional_metric_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        value = float(value)
+        if np.isfinite(value):
+            return value
+    return None
+
+
 def _spl_diagnostics(env: habitat.Env) -> Tuple[Optional[float], Optional[float]]:
     task = getattr(env, "_task", None)
     if task is None:
@@ -56,16 +66,12 @@ def _spl_diagnostics(env: habitat.Env) -> Tuple[Optional[float], Optional[float]
     if spl_measure is None:
         return None, None
 
-    agent_episode_distance_m: Optional[float] = None
-    reference_distance_m: Optional[float] = None
-    try:
-        agent_episode_distance_m = float(getattr(spl_measure, "_agent_episode_distance"))
-    except Exception:
-        pass
-    try:
-        reference_distance_m = float(getattr(spl_measure, "_reference_distance"))
-    except Exception:
-        pass
+    agent_episode_distance_m = _optional_metric_float(
+        getattr(spl_measure, "_agent_episode_distance", None)
+    )
+    reference_distance_m = _optional_metric_float(
+        getattr(spl_measure, "_reference_distance", None)
+    )
     return agent_episode_distance_m, reference_distance_m
 
 
@@ -143,6 +149,9 @@ def main() -> None:
     episodes = _prepare_episode_list(env, args)
     if not episodes:
         episode_writer.close()
+        episode_metric_writer.close()
+        running_metric_writer.close()
+        policy.close()
         env.close()
         print("No episodes selected.")
         return
@@ -156,7 +165,7 @@ def main() -> None:
     episodes_done = 0
     episodes_truncated = 0
 
-    try:
+    if True:
         for episode_index, episode_id in enumerate(ordered_episode_ids):
             target_episode = episodes_by_id[episode_id]
             env.current_episode = target_episode
@@ -420,14 +429,11 @@ def main() -> None:
                 else:
                     images_to_video(frames, str(args.video_dir), video_name, fps=int(fps))
 
-    finally:
-        episode_writer.close()
-        episode_metric_writer.close()
-        running_metric_writer.close()
-        try:
-            policy.close()
-        finally:
-            env.close()
+    episode_writer.close()
+    episode_metric_writer.close()
+    running_metric_writer.close()
+    policy.close()
+    env.close()
 
     if episodes_done == 0:
         print("No episodes evaluated.")

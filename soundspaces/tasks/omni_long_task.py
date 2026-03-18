@@ -8,14 +8,8 @@ from typing import Any, Dict, List, Optional, Sequence, Type
 
 import attr
 import numpy as np
-import torch
 from gym import spaces
 from PIL import Image
-
-try:
-    import clip
-except ImportError:
-    clip = None
 
 from habitat.config import Config
 from habitat.core.dataset import Episode
@@ -24,20 +18,15 @@ from habitat.core.registry import registry
 from habitat.core.simulator import Sensor, SensorTypes, Simulator
 from habitat.tasks.nav.nav import DistanceToGoal, EmbodiedTask, Measure, NavigationEpisode, NavigationTask
 
-from soundspaces.tasks.omni_long_goal_features import (
-    DEFAULT_GOAL_FEATURES_FILENAME,
-    goal_feature_cache_path,
-    infer_feature_dim,
-    load_goal_feature_cache,
-    lookup_goal_feature,
-)
 from soundspaces.tasks.semantic_audionav_task import SemanticAudioGoal
 
 
 def _optional_float(value: Any) -> Optional[float]:
     if value is None:
         return None
-    return float(value)
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    return None
 
 
 def _normalize_order_mode(value: Any) -> str:
@@ -113,9 +102,8 @@ def _episode_reference_distance(episode: Episode, task: EmbodiedTask) -> float:
     else:
         distance = getattr(episode, "ordered_total_geodesic_distance", None)
 
-    try:
-        distance_value = float(distance)
-    except Exception:
+    distance_value = _optional_float(distance)
+    if distance_value is None:
         distance_value = 0.0
 
     if distance_value > 1e-6:
@@ -123,11 +111,8 @@ def _episode_reference_distance(episode: Episode, task: EmbodiedTask) -> float:
 
     info = getattr(episode, "info", None)
     if isinstance(info, dict):
-        try:
-            fallback = float(info.get("geodesic_distance", 0.0))
-        except Exception:
-            fallback = 0.0
-        if fallback > 1e-6:
+        fallback = _optional_float(info.get("geodesic_distance", 0.0))
+        if fallback is not None and fallback > 1e-6:
             return fallback
 
     return 1e-6
@@ -155,13 +140,10 @@ def _task_goals_found(task: EmbodiedTask) -> int:
 
 
 def _task_active_goal_index(task: EmbodiedTask) -> Optional[int]:
-    try:
-        if hasattr(task, "_navigation_goal_state"):
-            goal_state = task._navigation_goal_state()
-        else:
-            goal_state = task._ordered_active_goal_state()
-    except Exception:
-        goal_state = None
+    if hasattr(task, "_navigation_goal_state"):
+        goal_state = task._navigation_goal_state()
+    else:
+        goal_state = task._ordered_active_goal_state()
     if not isinstance(goal_state, dict):
         return None
     goal_index = goal_state.get("goal_index")
@@ -171,9 +153,8 @@ def _task_active_goal_index(task: EmbodiedTask) -> Optional[int]:
 
 
 def _finite_distance(value: Any) -> Optional[float]:
-    try:
-        distance = float(value)
-    except Exception:
+    distance = _optional_float(value)
+    if distance is None:
         return None
     if not np.isfinite(distance):
         return None
@@ -453,7 +434,9 @@ class OmniLongNavigationTask(NavigationTask):
         self._unordered_goal_lock_best_distance: Optional[float] = None
         self._unordered_lock_candidate_index: Optional[int] = None
         self._unordered_lock_candidate_anchor_distance: Optional[float] = None
+        self._last_action_feedback: Dict[str, Any] = {}
         self._refresh_episode_goals(episode, apply_to_sim=False)
+        self._set_last_action_feedback(action_name=None, matched_goal_state=None)
 
         return super().reset(episode)
 
@@ -475,6 +458,68 @@ class OmniLongNavigationTask(NavigationTask):
         if active_goal_state is None:
             return int(len(self._all_goals))
         return int(active_goal_state.get("goal_index", len(self._all_goals)))
+
+    @property
+    def remaining_submit_count(self) -> int:
+        return max(0, int(self._submit_limit) - int(self._submit_count))
+
+    def get_last_action_feedback(self) -> Dict[str, Any]:
+        return dict(getattr(self, "_last_action_feedback", {}))
+
+    def _goal_descriptor_payload(self, descriptor: Any) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if isinstance(descriptor, (list, tuple)) and len(descriptor) >= 2:
+            payload["instance_key"] = str(descriptor[0])
+            payload["modality"] = str(descriptor[1])
+        elif descriptor is not None:
+            payload["descriptor"] = str(descriptor)
+        return payload
+
+    def _goal_state_payload(self, goal_state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not isinstance(goal_state, dict):
+            return None
+
+        goal = goal_state.get("goal")
+        payload: Dict[str, Any] = {
+            "goal_index": int(goal_state.get("goal_index", -1)),
+            "goal_key": "goal_{:03d}".format(int(goal_state.get("goal_index", -1))),
+        }
+        payload.update(self._goal_descriptor_payload(goal_state.get("descriptor")))
+
+        if goal is not None:
+            object_category = getattr(goal, "object_category", None)
+            object_name = getattr(goal, "object_name", None)
+            object_id = getattr(goal, "object_id", None)
+            position = getattr(goal, "position", None)
+            room_name = getattr(goal, "room_name", None)
+            if object_category is not None:
+                payload["object_category"] = str(object_category)
+            if object_name is not None:
+                payload["object_name"] = str(object_name)
+            if object_id is not None:
+                payload["object_id"] = str(object_id)
+            if room_name is not None:
+                payload["room_name"] = str(room_name)
+            if _is_vec3(position):
+                payload["position"] = [float(v) for v in position]
+
+        return payload
+
+    def _set_last_action_feedback(
+        self,
+        action_name: Optional[str],
+        matched_goal_state: Optional[Dict[str, Any]],
+    ) -> None:
+        goal_payload = self._goal_state_payload(matched_goal_state)
+        self._last_action_feedback = {
+            "action_name": action_name,
+            "found_goal_this_step": bool(goal_payload is not None),
+            "found_goal_index": int(goal_payload.get("goal_index", -1)) if goal_payload else -1,
+            "remaining_submit_count": int(self.remaining_submit_count),
+            "submit_count": int(self._submit_count),
+            "submit_limit": int(self._submit_limit),
+            "goal": goal_payload,
+        }
 
     def _goal_state_by_index(self, goal_index: int) -> Optional[Dict[str, Any]]:
         goal_key = "goal_{:03d}".format(int(goal_index))
@@ -610,33 +655,45 @@ class OmniLongNavigationTask(NavigationTask):
         episode: Episode,
         **kwargs: Any,
     ) -> bool:
+        self._set_last_action_feedback(action_name=None, matched_goal_state=None)
         if getattr(self, "is_stop_called", False):
             self.is_stop_called = False  # type: ignore
-            self._handle_stop(episode)
+            matched_goal_state = self._handle_stop(episode)
+            self._set_last_action_feedback(action_name="STOP", matched_goal_state=matched_goal_state)
             return False
         if getattr(self, "is_submit_called", False):
             self.is_submit_called = False  # type: ignore
             if self._submit_count >= self._submit_limit:
-                self._handle_stop(episode)
+                matched_goal_state = self._handle_stop(episode)
+                self._set_last_action_feedback(
+                    action_name="LIFELONG_SUBMIT",
+                    matched_goal_state=matched_goal_state,
+                )
                 return False
             self._submit_count += 1
-            return self._handle_submit(episode)
+            is_active, matched_goal_state = self._handle_submit(episode)
+            self._set_last_action_feedback(
+                action_name="LIFELONG_SUBMIT",
+                matched_goal_state=matched_goal_state,
+            )
+            return is_active
         return True
 
-    def _handle_submit(self, episode: Episode) -> bool:
+    def _handle_submit(self, episode: Episode) -> Any:
         goal_state = self._match_goal_state(episode)
         if goal_state is None:
-            return True
+            return True, None
         self._mark_goal_found(goal_state)
         if all(bool(state["found"]) for state in self._goals_map.values()):
-            return False
+            return False, goal_state
         self._refresh_episode_goals(episode, apply_to_sim=True)
-        return True
+        return True, goal_state
 
-    def _handle_stop(self, episode: Episode) -> None:
+    def _handle_stop(self, episode: Episode):
         goal_state = self._match_goal_state(episode)
         if goal_state is not None:
             self._mark_goal_found(goal_state)
+        return goal_state
 
     def _distance_to_goal(self, goal: SemanticAudioGoal, episode: Episode) -> Optional[float]:
         current_position = self._sim.get_agent_state().position
@@ -757,11 +814,8 @@ class OmniLongNavigationTask(NavigationTask):
 
     def _apply_goal_to_sim(self, episode: Episode, goal_index: int) -> None:
         if hasattr(self._sim, "set_active_sound_index"):
-            try:
-                self._sim.set_active_sound_index(goal_index)
-                return
-            except Exception:
-                pass
+            self._sim.set_active_sound_index(goal_index)
+            return
 
         goal = self._all_goals[goal_index]
         sound_id = None
@@ -771,10 +825,76 @@ class OmniLongNavigationTask(NavigationTask):
             if isinstance(candidate, dict):
                 sound_id = candidate.get("sound_id")
         if hasattr(self._sim, "set_active_goal"):
-            try:
-                self._sim.set_active_goal(goal.position, sound_id=sound_id)
-            except Exception:
-                pass
+            self._sim.set_active_goal(goal.position, sound_id=sound_id)
+
+
+@registry.register_measure
+class OmniLongDistanceToGoal(Measure):
+    cls_uuid: str = DistanceToGoal.cls_uuid
+
+    def __init__(self, *args: Any, sim: Simulator, config: Config, **kwargs: Any):
+        self._sim = sim
+        self._config = config
+        self._previous_position: Optional[Sequence[float]] = None
+        self._previous_state_signature: Optional[tuple] = None
+        self._metric: float = 0.0
+        super().__init__()
+
+    def _get_uuid(self, *args: Any, **kwargs: Any):
+        return self.cls_uuid
+
+    def _state_signature(self, task: EmbodiedTask, episode: Episode) -> tuple:
+        mode = getattr(task, "goal_order_mode", _resolve_goal_order_mode(episode, task=task))
+        if str(mode).strip().lower() == "ordered":
+            return (str(mode), _task_active_goal_index(task), _task_goals_found(task))
+
+        remaining_goal_indices = tuple(
+            sorted(
+                int(goal_state.get("goal_index", -1))
+                for goal_state in getattr(task, "_goals_map", {}).values()
+                if not bool(goal_state.get("found", False))
+            )
+        )
+        return (str(mode), remaining_goal_indices)
+
+    def _compute_distance(self, task: EmbodiedTask, episode: Episode) -> float:
+        mode = getattr(task, "goal_order_mode", _resolve_goal_order_mode(episode, task=task))
+        if str(mode).strip().lower() == "unordered":
+            distance = _shortest_remaining_path_length(task, episode)
+        else:
+            distance = task._distance_to_goal_by_mode(episode)
+
+        distance_value = _finite_distance(distance)
+        if distance_value is not None:
+            return float(max(0.0, distance_value))
+
+        previous_value = _finite_distance(self._metric)
+        if previous_value is not None:
+            return float(max(0.0, previous_value))
+        return 0.0
+
+    def reset_metric(self, *args: Any, episode: Episode, task: EmbodiedTask, **kwargs: Any):
+        self._previous_position = None
+        self._previous_state_signature = None
+        self._metric = 0.0
+        self.update_metric(episode=episode, task=task)
+
+    def update_metric(self, *args: Any, episode: Episode, task: EmbodiedTask, **kwargs: Any):
+        current_position = np.array(self._sim.get_agent_state().position, dtype=np.float32)
+        state_signature = self._state_signature(task, episode)
+
+        if (
+            self._previous_position is None
+            or not np.allclose(self._previous_position, current_position, atol=1e-4)
+            or self._previous_state_signature != state_signature
+        ):
+            self._metric = self._compute_distance(task, episode)
+            self._previous_position = (
+                float(current_position[0]),
+                float(current_position[1]),
+                float(current_position[2]),
+            )
+            self._previous_state_signature = state_signature
 
 
 @registry.register_measure
@@ -837,43 +957,12 @@ class OmniLongDistanceToGoalReward(Measure):
         self._sim = sim
         self._config = config
         self._previous_distance: Optional[float] = None
-        self._previous_remaining_path_length: Optional[float] = None
         self._previous_active_goal_index: Optional[int] = None
         self._previous_goals_found: int = 0
         super().__init__()
 
     def _get_uuid(self, *args: Any, **kwargs: Any):
         return "omni_long_distance_to_goal_reward"
-
-    def _unordered_dense_reward_mode(self) -> str:
-        return str(
-            getattr(self._config, "UNORDERED_DENSE_REWARD_MODE", "global_path_reduction")
-        ).strip().lower()
-
-    def _milestone_reward(self, mode: str, previous_goals_found: int, goals_found_delta: int) -> float:
-        base_reward = _mode_config_float(
-            self._config,
-            mode,
-            ordered_key="ORDERED_SUBMIT_SUCCESS_REWARD",
-            unordered_key="UNORDERED_SUBMIT_SUCCESS_REWARD",
-            fallback_key="SUBMIT_SUCCESS_REWARD",
-            default=10.0,
-        )
-        reward_increment = _mode_config_float(
-            self._config,
-            mode,
-            ordered_key="ORDERED_SUBMIT_SUCCESS_REWARD_INCREMENT",
-            unordered_key="UNORDERED_SUBMIT_SUCCESS_REWARD_INCREMENT",
-            fallback_key="SUBMIT_SUCCESS_REWARD_INCREMENT",
-            default=0.0,
-        )
-
-        total_reward = 0.0
-        for found_offset in range(int(goals_found_delta)):
-            total_reward += float(base_reward) + float(reward_increment) * float(
-                int(previous_goals_found) + int(found_offset)
-            )
-        return float(total_reward)
 
     def reset_metric(self, *args: Any, episode, task: EmbodiedTask, **kwargs: Any):
         task.measurements.check_measure_dependencies(
@@ -888,7 +977,6 @@ class OmniLongDistanceToGoalReward(Measure):
         self._previous_distance = _finite_distance(
             task.measurements.measures[DistanceToGoal.cls_uuid].get_metric()
         )
-        self._previous_remaining_path_length = _shortest_remaining_path_length(task, episode)
         self._previous_active_goal_index = _task_active_goal_index(task)
         self._previous_goals_found = _task_goals_found(task)
         self._metric = 0.0
@@ -901,7 +989,6 @@ class OmniLongDistanceToGoalReward(Measure):
         current_distance = _finite_distance(
             task.measurements.measures[DistanceToGoal.cls_uuid].get_metric()
         )
-        current_remaining_path_length = _shortest_remaining_path_length(task, episode)
         current_goals_found = _task_goals_found(task)
         current_active_goal_index = _task_active_goal_index(task)
 
@@ -922,48 +1009,15 @@ class OmniLongDistanceToGoalReward(Measure):
             default=1.0,
         )
 
-        if str(mode) == "ordered":
-            if (
-                not goal_switched
-                and self._previous_distance is not None
-                and current_distance is not None
-            ):
-                reward += float(self._previous_distance - current_distance) * float(distance_scale)
-
-            inactive_goal_penalty = float(
-                getattr(self._config, "ORDERED_INACTIVE_GOAL_PENALTY", 0.0)
-            )
-            if inactive_goal_penalty > 0.0:
-                reward -= inactive_goal_penalty * float(_ordered_inactive_goal_hits(task, episode))
-        else:
-            unordered_dense_reward_mode = self._unordered_dense_reward_mode()
-            if unordered_dense_reward_mode in {"global_path_reduction", "global_tsp_reduction", "tsp"}:
-                if (
-                    self._previous_remaining_path_length is not None
-                    and current_remaining_path_length is not None
-                ):
-                    reward += (
-                        float(self._previous_remaining_path_length)
-                        - float(current_remaining_path_length)
-                    ) * float(distance_scale)
-            else:
-                if (
-                    not goal_switched
-                    and self._previous_distance is not None
-                    and current_distance is not None
-                ):
-                    reward += float(self._previous_distance - current_distance) * float(distance_scale)
-
-        if goals_found_delta > 0:
-            reward += self._milestone_reward(
-                mode,
-                previous_goals_found=self._previous_goals_found,
-                goals_found_delta=goals_found_delta,
-            )
+        if (
+            (str(mode) != "ordered" or not goal_switched)
+            and self._previous_distance is not None
+            and current_distance is not None
+        ):
+            reward += float(self._previous_distance - current_distance) * float(distance_scale)
 
         self._metric = float(reward)
         self._previous_distance = current_distance
-        self._previous_remaining_path_length = current_remaining_path_length
         self._previous_active_goal_index = current_active_goal_index
         self._previous_goals_found = int(current_goals_found)
 
@@ -1045,24 +1099,6 @@ class LifelongSubmitAction(SimulatorTaskAction):
         return self._sim.get_observations_at()  # type: ignore
 
 
-_OMNI_LONG_CLIP_CACHE: Dict[str, Any] = {}
-_OMNI_LONG_PRECOMPUTED_FEATURE_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
-
-
-def _load_omni_long_clip(model_name: str):
-    if clip is None:
-        raise ImportError(
-            "`clip` is required for online OmniLongGoalSensor encoding. "
-            "Install the CLIP dependency or enable precomputed goal features."
-        )
-    cache_key = str(model_name)
-    if cache_key not in _OMNI_LONG_CLIP_CACHE:
-        model, preprocess = clip.load(model_name, device="cpu", jit=False)
-        model.eval()
-        _OMNI_LONG_CLIP_CACHE[cache_key] = (model, preprocess)
-    return _OMNI_LONG_CLIP_CACHE[cache_key]
-
-
 def _goal_modality_image_index(modality: str) -> int:
     token = str(modality).strip().lower()
     if not token.startswith("image"):
@@ -1075,138 +1111,69 @@ def _goal_modality_image_index(modality: str) -> int:
     return 0
 
 
-@registry.register_sensor
-class OmniLongGoalSensor(Sensor):
-    cls_uuid: str = "omni_long_goal"
+def _goal_text_from_record(
+    record: Dict[str, Any],
+    modality: str,
+    category_prompt_template: str,
+) -> str:
+    category = str(record.get("category", "object")).strip() or "object"
+    description = str(record.get("description", "")).strip()
+    modality_token = str(modality).strip().lower()
 
+    if modality_token == "description" and description:
+        return description
+    if description and modality_token.startswith("text"):
+        return description
+    return str(category_prompt_template).format(category=category)
+
+
+def _goal_modality_mask(modality: str) -> np.ndarray:
+    modality_token = str(modality).strip().lower()
+    if modality_token.startswith("image"):
+        return np.asarray([0.0, 1.0], dtype=np.float32)
+    return np.asarray([1.0, 0.0], dtype=np.float32)
+
+
+def _resize_goal_rgb(rgb: np.ndarray, width: int, height: int) -> np.ndarray:
+    resized = Image.fromarray(np.asarray(rgb, dtype=np.uint8), mode="RGB")
+    resized = resized.resize((int(width), int(height)), Image.BILINEAR)
+    return np.asarray(resized, dtype=np.uint8)
+
+
+class _OmniLongRawGoalSensorBase(Sensor):
     def __init__(self, *args: Any, sim: Simulator, config: Config, dataset=None, **kwargs: Any):
         self._sim = sim
         self._config = config
         self._dataset = dataset
-        self._clip_model_name = str(getattr(config, "CLIP_MODEL", "RN50"))
         self._max_goals = max(1, int(getattr(config, "MAX_GOALS", 5)))
-        self._use_precomputed_features = bool(
-            getattr(config, "USE_PRECOMPUTED_FEATURES", False)
-        )
-        self._allow_online_fallback = bool(
-            getattr(config, "ALLOW_ONLINE_FALLBACK", True)
-        )
-        self._features_root = str(
-            getattr(config, "FEATURES_ROOT", getattr(config, "IMAGE_ROOT", "output"))
-        )
-        self._features_filename = str(
-            getattr(config, "FEATURES_FILENAME", DEFAULT_GOAL_FEATURES_FILENAME)
-        )
         self._category_prompt_template = str(
             getattr(config, "CATEGORY_PROMPT_TEMPLATE", "Find the {category}.")
         )
-        self._model = None
-        self._preprocess = None
-        self._embedding_dim = 0
-        if self._use_precomputed_features:
-            self._embedding_dim = int(getattr(config, "FEATURE_DIM", 0))
-            if self._embedding_dim <= 0:
-                self._embedding_dim = self._infer_precomputed_feature_dim()
-        if self._embedding_dim <= 0 or not self._use_precomputed_features:
-            self._ensure_online_encoder()
-        self._text_cache: Dict[str, np.ndarray] = {}
-        self._rendered_image_cache: Dict[str, np.ndarray] = {}
+        self._image_width = max(1, int(getattr(config, "WIDTH", 224)))
+        self._image_height = max(1, int(getattr(config, "HEIGHT", 224)))
+        self._max_text_bytes = max(
+            1,
+            int(getattr(config, "MAX_TEXT_BYTES", getattr(config, "CONTEXT_LENGTH", 77))),
+        )
+        self._rendered_rgb_cache: Dict[str, np.ndarray] = {}
+        self._text_bytes_cache: Dict[str, np.ndarray] = {}
         super().__init__(config=config)
 
-    def _ensure_online_encoder(self) -> None:
-        if self._model is not None and self._preprocess is not None:
-            return
-        self._model, self._preprocess = _load_omni_long_clip(self._clip_model_name)
-        if self._embedding_dim <= 0:
-            self._embedding_dim = int(getattr(self._model.visual, "output_dim", 1024))
-
-    def _infer_precomputed_feature_dim(self) -> int:
-        dataset_episodes = getattr(self._dataset, "episodes", None)
-        if not isinstance(dataset_episodes, list):
-            return 0
-        for episode in dataset_episodes:
-            cache_payload = self._load_scene_feature_cache(getattr(episode, "scene_id", ""))
-            if not isinstance(cache_payload, dict):
-                continue
-            feature_dim = infer_feature_dim(cache_payload)
-            if feature_dim > 0:
-                return int(feature_dim)
-        return 0
-
-    def _load_scene_feature_cache(self, scene_id: Any) -> Optional[Dict[str, Any]]:
-        cache_path = goal_feature_cache_path(
-            self._features_root,
-            scene_id,
-            filename=self._features_filename,
-        )
-        cache_key = str(cache_path)
-        if cache_key not in _OMNI_LONG_PRECOMPUTED_FEATURE_CACHE:
-            if not cache_path.exists():
-                _OMNI_LONG_PRECOMPUTED_FEATURE_CACHE[cache_key] = None
-            else:
-                _OMNI_LONG_PRECOMPUTED_FEATURE_CACHE[cache_key] = load_goal_feature_cache(cache_path)
-        return _OMNI_LONG_PRECOMPUTED_FEATURE_CACHE[cache_key]
-
-    def _precomputed_goal_embedding(
+    def _lookup_goal_record(
         self,
         episode: OmniLongEpisode,
         instance_key: str,
-        modality: str,
-    ) -> Optional[np.ndarray]:
-        cache_payload = self._load_scene_feature_cache(getattr(episode, "scene_id", ""))
-        if cache_payload is None:
-            if self._use_precomputed_features and not self._allow_online_fallback:
-                raise FileNotFoundError(
-                    "Missing precomputed goal feature cache for scene "
-                    f"`{getattr(episode, 'scene_id', '')}` under `{self._features_root}`."
-                )
+    ) -> Optional[Dict[str, Any]]:
+        scene_instances = getattr(self._dataset, "instances_by_scene", None)
+        if not isinstance(scene_instances, dict):
             return None
-        feature = lookup_goal_feature(cache_payload, instance_key, modality)
-        if feature is None:
+        records = scene_instances.get(str(getattr(episode, "scene_id", "")))
+        if not isinstance(records, dict):
             return None
-        if self._embedding_dim > 0 and int(feature.shape[0]) != int(self._embedding_dim):
-            raise RuntimeError(
-                "Precomputed goal feature dimension mismatch: "
-                f"expected {self._embedding_dim}, got {int(feature.shape[0])} "
-                f"for instance={instance_key}, modality={modality}."
-            )
-        return np.asarray(feature, dtype=np.float32)
-
-    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
-        return self.cls_uuid
-
-    def _get_sensor_type(self, *args: Any, **kwargs: Any):
-        return SensorTypes.SEMANTIC
-
-    def _get_observation_space(self, *args: Any, **kwargs: Any):
-        return spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(self._max_goals, self._embedding_dim),
-            dtype=np.float32,
-        )
-
-    def _encode_text(self, text: str) -> np.ndarray:
-        key = str(text).strip()
-        if not key:
-            return np.zeros((self._embedding_dim,), dtype=np.float32)
-        if key not in self._text_cache:
-            self._ensure_online_encoder()
-            with torch.no_grad():
-                tokens = clip.tokenize([key], truncate=True)
-                embedding = self._model.encode_text(tokens).float()
-                embedding = embedding / embedding.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-            self._text_cache[key] = embedding[0].cpu().numpy().astype(np.float32)
-        return self._text_cache[key]
-
-    def _encode_rendered_rgb(self, rgb: np.ndarray) -> np.ndarray:
-        self._ensure_online_encoder()
-        image = Image.fromarray(np.asarray(rgb, dtype=np.uint8), mode="RGB")
-        with torch.no_grad():
-            image_tensor = self._preprocess(image).unsqueeze(0)
-            embedding = self._model.encode_image(image_tensor).float()
-            embedding = embedding / embedding.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        return embedding[0].cpu().numpy().astype(np.float32)
+        record = records.get(str(instance_key))
+        if not isinstance(record, dict):
+            return None
+        return record
 
     def _render_reference_rgb(
         self,
@@ -1234,98 +1201,69 @@ class OmniLongGoalSensor(Sensor):
         if not _is_vec3(position) or not _is_quat4(rotation):
             return None
 
-        try:
-            observations = self._sim.get_observations_at(
-                position=[float(v) for v in position],
-                rotation=[float(v) for v in rotation],
-                keep_agent_at_new_pose=False,
-            )
-        except Exception:
-            return None
+        observations = self._sim.get_observations_at(
+            position=[float(v) for v in position],
+            rotation=[float(v) for v in rotation],
+            keep_agent_at_new_pose=False,
+        )
 
         if observations is None:
             return None
-        return _extract_rgb_from_observations(observations)
+        rgb = _extract_rgb_from_observations(observations)
+        if rgb is None:
+            return None
+        return _resize_goal_rgb(rgb, self._image_width, self._image_height)
 
-    def _render_image_embedding(
+    def _render_goal_rgb(
         self,
         episode: OmniLongEpisode,
         instance_key: str,
         instance_record: Dict[str, Any],
         image_index: int,
     ) -> Optional[np.ndarray]:
-        cache_key = "{scene}|{instance}|{index}".format(
+        cache_key = "{scene}|{instance}|{index}|{width}x{height}".format(
             scene=str(getattr(episode, "scene_id", "")),
             instance=str(instance_key),
             index=int(max(0, image_index)),
+            width=int(self._image_width),
+            height=int(self._image_height),
         )
-        if cache_key not in self._rendered_image_cache:
+        if cache_key not in self._rendered_rgb_cache:
             rgb = self._render_reference_rgb(instance_record, image_index)
             if rgb is None:
                 return None
-            self._rendered_image_cache[cache_key] = self._encode_rendered_rgb(rgb)
-        return self._rendered_image_cache[cache_key]
+            self._rendered_rgb_cache[cache_key] = rgb
+        return self._rendered_rgb_cache[cache_key]
 
-    def _lookup_goal_record(
-        self,
-        episode: OmniLongEpisode,
-        instance_key: str,
-    ) -> Optional[Dict[str, Any]]:
-        scene_instances = getattr(self._dataset, "instances_by_scene", None)
-        if not isinstance(scene_instances, dict):
-            return None
-        records = scene_instances.get(str(getattr(episode, "scene_id", "")))
-        if not isinstance(records, dict):
-            return None
-        record = records.get(str(instance_key))
-        if not isinstance(record, dict):
-            return None
-        return record
+    def _encode_goal_text_bytes(self, text: str) -> np.ndarray:
+        key = str(text).strip()
+        if not key:
+            return np.zeros((self._max_text_bytes,), dtype=np.uint8)
+        if key not in self._text_bytes_cache:
+            encoded = key.encode("utf-8", errors="ignore")[: self._max_text_bytes]
+            buffer = np.zeros((self._max_text_bytes,), dtype=np.uint8)
+            if len(encoded) > 0:
+                buffer[: len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
+            self._text_bytes_cache[key] = buffer
+        return self._text_bytes_cache[key]
 
-    def _goal_embedding_from_spec(
-        self,
-        episode: OmniLongEpisode,
-        instance_key: str,
-        modality: str,
-    ) -> np.ndarray:
-        if self._use_precomputed_features:
-            precomputed_feature = self._precomputed_goal_embedding(
-                episode,
-                instance_key,
-                modality,
-            )
-            if precomputed_feature is not None:
-                return precomputed_feature
-            if not self._allow_online_fallback:
-                return np.zeros((self._embedding_dim,), dtype=np.float32)
 
-        record = self._lookup_goal_record(episode, instance_key)
-        if not isinstance(record, dict):
-            return np.zeros((self._embedding_dim,), dtype=np.float32)
+@registry.register_sensor
+class OmniLongGoalImageSensor(_OmniLongRawGoalSensorBase):
+    cls_uuid: str = "omni_long_goal_image"
 
-        category = str(record.get("category", "object"))
-        description = str(record.get("description", "")).strip()
+    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+        return self.cls_uuid
 
-        if modality.startswith("image"):
-            image_idx = _goal_modality_image_index(modality)
-            image_embedding = self._render_image_embedding(
-                episode,
-                instance_key,
-                record,
-                image_idx,
-            )
-            if image_embedding is not None:
-                return image_embedding
-            return np.zeros((self._embedding_dim,), dtype=np.float32)
+    def _get_sensor_type(self, *args: Any, **kwargs: Any):
+        return SensorTypes.COLOR
 
-        if modality == "description" and description:
-            return self._encode_text(description)
-
-        if description and modality.startswith("text"):
-            return self._encode_text(description)
-
-        return self._encode_text(
-            self._category_prompt_template.format(category=category)
+    def _get_observation_space(self, *args: Any, **kwargs: Any):
+        return spaces.Box(
+            low=0,
+            high=255,
+            shape=(self._max_goals, self._image_height, self._image_width, 3),
+            dtype=np.uint8,
         )
 
     def get_observation(
@@ -1333,28 +1271,171 @@ class OmniLongGoalSensor(Sensor):
         observations,
         *args: Any,
         episode: OmniLongEpisode,
-        task: EmbodiedTask,
         **kwargs: Any,
     ) -> np.ndarray:
-        task_specs = list(getattr(episode, "tasks", []) or [])
-        if len(task_specs) > self._max_goals:
-            raise RuntimeError(
-                "OmniLongGoalSensor received more goals than configured capacity: "
-                f"num_goals={len(task_specs)}, max_goals={self._max_goals}."
-            )
-
-        goal_embeddings = np.zeros(
-            (self._max_goals, self._embedding_dim),
-            dtype=np.float32,
+        goal_images = np.zeros(
+            (self._max_goals, self._image_height, self._image_width, 3),
+            dtype=np.uint8,
         )
-        for goal_index, task_spec in enumerate(task_specs):
+        for goal_index, task_spec in enumerate(list(getattr(episode, "tasks", []) or [])[: self._max_goals]):
             if not isinstance(task_spec, (list, tuple)) or len(task_spec) < 2:
                 continue
             instance_key = str(task_spec[0])
             modality = str(task_spec[1])
-            goal_embeddings[goal_index] = self._goal_embedding_from_spec(
+            if not modality.strip().lower().startswith("image"):
+                continue
+            record = self._lookup_goal_record(episode, instance_key)
+            if not isinstance(record, dict):
+                continue
+            rgb = self._render_goal_rgb(
                 episode,
                 instance_key,
-                modality,
+                record,
+                _goal_modality_image_index(modality),
             )
-        return goal_embeddings
+            if rgb is not None:
+                goal_images[goal_index] = rgb
+        return goal_images
+
+
+@registry.register_sensor
+class OmniLongGoalTextSensor(_OmniLongRawGoalSensorBase):
+    cls_uuid: str = "omni_long_goal_text"
+
+    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+        return self.cls_uuid
+
+    def _get_sensor_type(self, *args: Any, **kwargs: Any):
+        return SensorTypes.TEXT
+
+    def _get_observation_space(self, *args: Any, **kwargs: Any):
+        return spaces.Box(
+            low=0,
+            high=255,
+            shape=(self._max_goals, self._max_text_bytes),
+            dtype=np.uint8,
+        )
+
+    def get_observation(
+        self,
+        observations,
+        *args: Any,
+        episode: OmniLongEpisode,
+        **kwargs: Any,
+    ) -> np.ndarray:
+        text_bytes = np.zeros((self._max_goals, self._max_text_bytes), dtype=np.uint8)
+        for goal_index, task_spec in enumerate(list(getattr(episode, "tasks", []) or [])[: self._max_goals]):
+            if not isinstance(task_spec, (list, tuple)) or len(task_spec) < 2:
+                continue
+            instance_key = str(task_spec[0])
+            modality = str(task_spec[1])
+            record = self._lookup_goal_record(episode, instance_key)
+            if not isinstance(record, dict):
+                continue
+            text = _goal_text_from_record(record, modality, self._category_prompt_template)
+            text_bytes[goal_index] = self._encode_goal_text_bytes(text)
+        return text_bytes
+
+
+@registry.register_sensor
+class OmniLongGoalModalitySensor(_OmniLongRawGoalSensorBase):
+    cls_uuid: str = "omni_long_goal_modality"
+
+    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+        return self.cls_uuid
+
+    def _get_sensor_type(self, *args: Any, **kwargs: Any):
+        return SensorTypes.SEMANTIC
+
+    def _get_observation_space(self, *args: Any, **kwargs: Any):
+        return spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(self._max_goals, 2),
+            dtype=np.float32,
+        )
+
+    def get_observation(
+        self,
+        observations,
+        *args: Any,
+        episode: OmniLongEpisode,
+        **kwargs: Any,
+    ) -> np.ndarray:
+        modality_mask = np.zeros((self._max_goals, 2), dtype=np.float32)
+        for goal_index, task_spec in enumerate(list(getattr(episode, "tasks", []) or [])[: self._max_goals]):
+            if not isinstance(task_spec, (list, tuple)) or len(task_spec) < 2:
+                continue
+            modality_mask[goal_index] = _goal_modality_mask(str(task_spec[1]))
+        return modality_mask
+
+
+@registry.register_sensor
+class OmniLongGoalMaskSensor(_OmniLongRawGoalSensorBase):
+    cls_uuid: str = "goal_mask"
+
+    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+        return self.cls_uuid
+
+    def _get_sensor_type(self, *args: Any, **kwargs: Any):
+        return SensorTypes.TENSOR
+
+    def _get_observation_space(self, *args: Any, **kwargs: Any):
+        return spaces.Box(low=0.0, high=1.0, shape=(self._max_goals,), dtype=np.float32)
+
+    def get_observation(
+        self,
+        observations,
+        *args: Any,
+        episode: OmniLongEpisode,
+        task: Optional[EmbodiedTask] = None,
+        **kwargs: Any,
+    ) -> np.ndarray:
+        goal_mask = np.zeros((self._max_goals,), dtype=np.float32)
+        goal_states = list(getattr(task, "_goals_map", {}).values()) if task is not None else []
+        if goal_states:
+            mode = str(getattr(task, "goal_order_mode", _resolve_goal_order_mode(episode, task=task)))
+            if mode == "ordered":
+                active_goal_state = None
+                if hasattr(task, "_ordered_active_goal_state"):
+                    active_goal_state = task._ordered_active_goal_state()
+                if isinstance(active_goal_state, dict):
+                    goal_index = int(active_goal_state.get("goal_index", -1))
+                    if 0 <= goal_index < self._max_goals:
+                        goal_mask[goal_index] = 1.0
+                return goal_mask
+
+            for goal_state in goal_states:
+                goal_index = int(goal_state.get("goal_index", -1))
+                if 0 <= goal_index < self._max_goals and not bool(goal_state.get("found", False)):
+                    goal_mask[goal_index] = 1.0
+            return goal_mask
+
+        for goal_index, _ in enumerate(list(getattr(episode, "tasks", []) or [])[: self._max_goals]):
+            goal_mask[goal_index] = 1.0
+        return goal_mask
+
+
+@registry.register_sensor
+class OmniLongTaskModeSensor(_OmniLongRawGoalSensorBase):
+    cls_uuid: str = "task_mode_flag"
+
+    def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
+        return self.cls_uuid
+
+    def _get_sensor_type(self, *args: Any, **kwargs: Any):
+        return SensorTypes.TENSOR
+
+    def _get_observation_space(self, *args: Any, **kwargs: Any):
+        return spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
+
+    def get_observation(
+        self,
+        observations,
+        *args: Any,
+        episode: OmniLongEpisode,
+        task: Optional[EmbodiedTask] = None,
+        **kwargs: Any,
+    ) -> np.ndarray:
+        mode = str(getattr(task, "goal_order_mode", _resolve_goal_order_mode(episode, task=task)))
+        return np.asarray([1.0 if mode == "unordered" else 0.0], dtype=np.float32)
