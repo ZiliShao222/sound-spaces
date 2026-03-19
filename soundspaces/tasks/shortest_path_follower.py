@@ -73,7 +73,12 @@ class ShortestPathFollower:
         """Returns the next action along the shortest path."""
         self._build_follower()
         assert self._follower is not None
-        next_action = self._follower.next_action_along(goal_pos)
+        try:
+            next_action = self._follower.next_action_along(goal_pos)
+        except habitat_sim.errors.GreedyFollowerError:
+            if not self._stop_on_error:
+                raise
+            next_action = HabitatSimActions.STOP
         return self._get_return_value(next_action)
 
     @property

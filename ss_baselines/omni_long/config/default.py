@@ -146,6 +146,17 @@ _C.RL.PPO.goal_attention_debug = False
 _C.RL.PPO.goal_attention_debug_interval = 200
 _C.RL.PPO.goal_attention_debug_max_logs = 20
 
+_C.RL.BC = CN()
+_C.RL.BC.lr = 2.5e-4
+_C.RL.BC.eps = 1e-5
+_C.RL.BC.max_grad_norm = 0.5
+_C.RL.BC.num_steps = 64
+_C.RL.BC.bc_epoch = 4
+_C.RL.BC.num_mini_batch = 1
+_C.RL.BC.reward_window_size = 50
+_C.RL.BC.use_linear_lr_decay = True
+_C.RL.BC.expert_success_distance = 1.0
+
 
 _TC = habitat.get_config()
 _TC.defrost()

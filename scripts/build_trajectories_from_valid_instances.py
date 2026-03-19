@@ -98,6 +98,59 @@ def _resolve_scene_name(payload: Dict[str, Any], override: Optional[str]) -> str
     raise RuntimeError("Unable to infer scene_name from input JSON.")
 
 
+def _load_json_object(path: Path) -> Dict[str, Any]:
+    payload = json.loads(path.read_text())
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"JSON root must be an object: {path}")
+    return payload
+
+
+def _replace_instances_from_payload(
+    base_payload: Dict[str, Any],
+    instances_payload: Dict[str, Any],
+    base_path: Path,
+    instances_path: Path,
+) -> Dict[str, Any]:
+    if not isinstance(instances_payload.get("instances"), dict):
+        raise RuntimeError(
+            f"Instances source does not contain an `instances` dict: {instances_path}"
+        )
+
+    base_scene_id = base_payload.get("scene_id")
+    instances_scene_id = instances_payload.get("scene_id")
+    if (
+        isinstance(base_scene_id, str)
+        and isinstance(instances_scene_id, str)
+        and base_scene_id.strip()
+        and instances_scene_id.strip()
+        and base_scene_id.strip() != instances_scene_id.strip()
+    ):
+        raise RuntimeError(
+            "Scene mismatch between base input and instances source: "
+            f"{base_path} has scene_id={base_scene_id}, "
+            f"but {instances_path} has scene_id={instances_scene_id}"
+        )
+
+    base_scene_name = base_payload.get("scene_name")
+    instances_scene_name = instances_payload.get("scene_name")
+    if (
+        isinstance(base_scene_name, str)
+        and isinstance(instances_scene_name, str)
+        and base_scene_name.strip()
+        and instances_scene_name.strip()
+        and base_scene_name.strip() != instances_scene_name.strip()
+    ):
+        raise RuntimeError(
+            "Scene mismatch between base input and instances source: "
+            f"{base_path} has scene_name={base_scene_name}, "
+            f"but {instances_path} has scene_name={instances_scene_name}"
+        )
+
+    merged_payload = copy.deepcopy(base_payload)
+    merged_payload["instances"] = copy.deepcopy(instances_payload["instances"])
+    return merged_payload
+
+
 def _infer_scene_split(scene_id: Any) -> str:
     if not isinstance(scene_id, str) or not scene_id.strip():
         return "val"
@@ -426,15 +479,46 @@ def _build_pathfinder_simulator(
     return sim
 
 
-def _image_summary(image_payload: Dict[str, Any]) -> Dict[str, Any]:
-    render_views = image_payload.get("render_views", [])
-    num_views = int(image_payload.get("num_views", len(render_views)))
+def _instance_description_text(instance_record: Dict[str, Any]) -> Optional[str]:
+    description = instance_record.get("description")
+    if isinstance(description, str) and description.strip():
+        return description.strip()
+    return None
+
+
+def _image_summary(instance_record: Dict[str, Any]) -> Dict[str, Any]:
+    image_payload = instance_record.get("image")
+    render_views = _render_views_from_instance(instance_record)
+    num_views = int(
+        instance_record.get(
+            "num_render_view_points",
+            image_payload.get("num_views", len(render_views))
+            if isinstance(image_payload, dict)
+            else len(render_views),
+        )
+    )
     summary: Dict[str, Any] = {
-        "output_dir": image_payload.get("output_dir"),
-        "views_json": image_payload.get("views_json"),
-        "invalid_views_json": image_payload.get("invalid_views_json"),
+        "output_dir": (
+            image_payload.get("output_dir")
+            if isinstance(image_payload, dict)
+            else instance_record.get("render_output_dir")
+        ),
+        "views_json": (
+            image_payload.get("views_json")
+            if isinstance(image_payload, dict)
+            else instance_record.get("render_views_json")
+        ),
+        "invalid_views_json": (
+            image_payload.get("invalid_views_json")
+            if isinstance(image_payload, dict)
+            else None
+        ),
         "num_views": num_views,
-        "num_invalid_views": int(image_payload.get("num_invalid_views", 0)),
+        "num_invalid_views": (
+            int(image_payload.get("num_invalid_views", 0))
+            if isinstance(image_payload, dict)
+            else 0
+        ),
     }
     if isinstance(render_views, list) and render_views:
         summary["primary_view"] = render_views[0]
@@ -448,6 +532,10 @@ def _safe_float(value: Any, default: float = -1.0) -> float:
 
 
 def _render_views_from_instance(instance_record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    render_views = instance_record.get("render_view_points")
+    if isinstance(render_views, list):
+        return [view for view in render_views if isinstance(view, dict)]
+
     image_payload = instance_record.get("image")
     if not isinstance(image_payload, dict):
         return []
@@ -541,10 +629,14 @@ def _build_goal_input_entry(
         strategy=str(view_strategy),
     )
     has_image = selected_view is not None and selected_view_index is not None
+    description_text = _instance_description_text(instance_record)
+    has_text_description = isinstance(description_text, str) and bool(description_text)
 
     available_modalities: List[str] = ["audio", "object"]
     if has_image:
-        available_modalities.extend(["image", "text_description"])
+        available_modalities.append("image")
+    if has_text_description:
+        available_modalities.append("text_description")
 
     entry: Dict[str, Any] = {
         "instance_key": instance_key,
@@ -572,10 +664,12 @@ def _build_goal_input_entry(
             "render_view": _compact_render_view(selected_view),
         }
         entry["image"] = image_ref
+
+    if has_text_description:
         entry["text_description"] = {
-            "description_id": image_ref["view_id"],
-            "source": "image_view",
-            "text": None,
+            "description_id": f"{instance_key}#description",
+            "source": "instance_description",
+            "text": description_text,
         }
 
     return entry, sound_id
@@ -586,31 +680,65 @@ def _goal_has_image(goal_input: Dict[str, Any]) -> bool:
     return isinstance(image_payload, dict)
 
 
+def _goal_has_text_description(goal_input: Dict[str, Any]) -> bool:
+    description_payload = goal_input.get("text_description")
+    if not isinstance(description_payload, dict):
+        return False
+    text = description_payload.get("text")
+    return isinstance(text, str) and bool(text.strip())
+
+
 def _assign_goal_modalities(
     goal_inputs: List[Dict[str, Any]],
     rng: random.Random,
     prefer_image_text_per_episode: bool,
     force_split_image_and_text: bool = False,
+    required_distinct_modalities: int = 1,
 ) -> Tuple[List[str], Dict[str, Any]]:
     image_candidates = [
         idx for idx, goal_input in enumerate(goal_inputs) if _goal_has_image(goal_input)
     ]
-    goal_modalities: List[str] = [
-        "image" if idx in image_candidates else "object"
-        for idx in range(len(goal_inputs))
+    text_candidates = [
+        idx
+        for idx, goal_input in enumerate(goal_inputs)
+        if _goal_has_text_description(goal_input)
     ]
+    goal_modalities: List[str] = ["object" for _ in range(len(goal_inputs))]
 
-    if force_split_image_and_text and len(image_candidates) >= 2:
-        goal_modalities[image_candidates[0]] = "image"
-        goal_modalities[image_candidates[1]] = "text_description"
-    elif prefer_image_text_per_episode and len(image_candidates) >= 2:
-        text_idx = int(rng.choice(image_candidates))
-        goal_modalities[text_idx] = "text_description"
+    if force_split_image_and_text or int(required_distinct_modalities) >= 3:
+        if image_candidates and text_candidates:
+            image_idx = int(rng.choice(image_candidates))
+            text_choices = [idx for idx in text_candidates if idx != image_idx]
+            if text_choices:
+                text_idx = int(rng.choice(text_choices))
+                goal_modalities[image_idx] = "image"
+                goal_modalities[text_idx] = "text_description"
+    elif int(required_distinct_modalities) >= 2:
+        non_object_candidates = image_candidates or text_candidates
+        if non_object_candidates:
+            chosen_idx = int(rng.choice(non_object_candidates))
+            if chosen_idx in image_candidates:
+                goal_modalities[chosen_idx] = "image"
+            else:
+                goal_modalities[chosen_idx] = "text_description"
+    elif prefer_image_text_per_episode:
+        if image_candidates and text_candidates:
+            image_idx = int(rng.choice(image_candidates))
+            text_choices = [idx for idx in text_candidates if idx != image_idx]
+            if text_choices:
+                goal_modalities[image_idx] = "image"
+                goal_modalities[int(rng.choice(text_choices))] = "text_description"
+        elif image_candidates:
+            goal_modalities[int(rng.choice(image_candidates))] = "image"
+        elif text_candidates:
+            goal_modalities[int(rng.choice(text_candidates))] = "text_description"
 
     coverage = {
         "has_image_goal": bool("image" in goal_modalities),
         "has_text_description_goal": bool("text_description" in goal_modalities),
         "num_image_capable_goals": int(len(image_candidates)),
+        "num_text_description_capable_goals": int(len(text_candidates)),
+        "distinct_non_audio_modalities": int(len(set(goal_modalities))),
     }
     return goal_modalities, coverage
 
@@ -632,6 +760,10 @@ def _to_task_modality_token(goal_input: Dict[str, Any], modality: str) -> str:
 
 def _record_has_image(record: Dict[str, Any]) -> bool:
     return bool(record.get("has_image"))
+
+
+def _record_has_text_description(record: Dict[str, Any]) -> bool:
+    return bool(record.get("has_text_description"))
 
 
 def _max_feasible_image_goal_count(
@@ -1006,6 +1138,7 @@ def _flatten_instances(
     flat_records: List[Dict[str, Any]] = []
     total_category_counts: Counter = Counter()
     eligible_category_counts: Counter = Counter()
+    no_view_points_count = 0
     no_image_count = 0
 
     for category, per_category in nested_instances.items():
@@ -1019,12 +1152,19 @@ def _flatten_instances(
             key = str(instance_key)
             total_category_counts[category_name] += 1
 
-            image_payload = record.get("image")
-            has_image = (
-                isinstance(image_payload, dict)
-                and isinstance(image_payload.get("render_views"), list)
-                and len(image_payload.get("render_views", [])) > 0
-            )
+            num_view_points = record.get("num_view_points")
+            if not isinstance(num_view_points, int):
+                view_points = record.get("view_points")
+                if isinstance(view_points, list):
+                    num_view_points = len(view_points)
+                else:
+                    num_view_points = 0
+            if int(num_view_points) <= 0:
+                no_view_points_count += 1
+                continue
+
+            has_image = len(_render_views_from_instance(record)) > 0
+            has_text_description = _instance_description_text(record) is not None
             if require_image and not has_image:
                 no_image_count += 1
                 continue
@@ -1035,6 +1175,7 @@ def _flatten_instances(
                 "category": category_name,
                 "semantic_id": semantic_id,
                 "has_image": bool(has_image),
+                "has_text_description": bool(has_text_description),
                 "center": _round_vec3(record.get("center")),
                 "bbox_size": _round_vec3(record.get("bbox_size")),
                 "nav_position": _round_vec3(record.get("nav_position")),
@@ -1043,7 +1184,7 @@ def _flatten_instances(
                 "horizontal_radius": record.get("horizontal_radius"),
             }
             if include_image_summary and has_image:
-                item["image"] = _image_summary(image_payload)
+                item["image"] = _image_summary(record)
 
             flat_records.append(item)
             eligible_category_counts[category_name] += 1
@@ -1051,6 +1192,7 @@ def _flatten_instances(
     stats = {
         "num_instances_total": int(sum(total_category_counts.values())),
         "num_instances_eligible": int(len(flat_records)),
+        "num_instances_excluded_no_view_points": int(no_view_points_count),
         "num_instances_excluded_no_image": int(no_image_count),
         "total_category_counts": dict(sorted(total_category_counts.items())),
         "eligible_category_counts": dict(sorted(eligible_category_counts.items())),
@@ -1098,14 +1240,17 @@ def _build_instance_lookup(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]
 
             render_views = _render_views_from_instance(full_record)
             has_image = len(render_views) > 0
+            has_text_description = _instance_description_text(full_record) is not None
             full_record["modalities"] = {
                 "audio": True,
                 "object": True,
                 "image": bool(has_image),
-                "text_description": bool(has_image),
+                "text_description": bool(has_text_description),
             }
             full_record["preferred_non_audio_modality"] = (
-                "image" if has_image else "object"
+                "image"
+                if has_image
+                else ("text_description" if has_text_description else "object")
             )
             full_record["num_image_views"] = int(len(render_views))
 
@@ -1437,6 +1582,19 @@ def _build_trajectories(
     instance_usage_counter: Counter = Counter()
 
     total_image_records = int(sum(_record_has_image(record) for record in records))
+    total_text_description_records = int(
+        sum(_record_has_text_description(record) for record in records)
+    )
+    total_available_non_audio_modalities = 1
+    if total_image_records > 0:
+        total_available_non_audio_modalities += 1
+    if total_text_description_records > 0:
+        total_available_non_audio_modalities += 1
+    max_feasible_distinct_non_audio_modalities = 1
+    if total_image_records > 0:
+        max_feasible_distinct_non_audio_modalities = 2
+    if total_image_records >= 2 and total_text_description_records > 0:
+        max_feasible_distinct_non_audio_modalities = 3
     max_feasible_image_goals = _max_feasible_image_goal_count(
         records,
         unique_categories=bool(unique_categories),
@@ -1500,17 +1658,31 @@ def _build_trajectories(
 
             required_min_image_goals = 0
             force_split_image_and_text = False
+            required_distinct_modalities = 1
+            if int(goal_count) > 4:
+                required_distinct_modalities = min(
+                    3,
+                    int(total_available_non_audio_modalities),
+                    int(max_feasible_distinct_non_audio_modalities),
+                )
+            elif int(goal_count) > 2:
+                required_distinct_modalities = min(
+                    2,
+                    int(total_available_non_audio_modalities),
+                    int(max_feasible_distinct_non_audio_modalities),
+                )
+
             if int(total_image_records) < 2:
                 desired_image_min = 0
             else:
                 # Rule by episode goal count:
-                # - goals >= 4: must include both image and text_description modalities
-                # - goals >= 3: must include at least one image/text_description modality
+                # - goals > 4: target 3 non-audio modalities when dataset supports them
+                # - goals > 2: target 2 non-audio modalities when dataset supports them
                 # - others: fallback to CLI range config
-                if int(goal_count) >= 4:
+                if int(goal_count) > 4 and int(total_text_description_records) > 0:
                     required_min_image_goals = 2
                     force_split_image_and_text = True
-                elif int(goal_count) >= 3:
+                elif int(goal_count) > 2:
                     required_min_image_goals = 1
 
             feasible_image_goals_for_count = min(
@@ -1618,21 +1790,21 @@ def _build_trajectories(
                     rng=rng,
                     prefer_image_text_per_episode=bool(prefer_image_text_per_episode),
                     force_split_image_and_text=bool(force_split_image_and_text),
+                    required_distinct_modalities=int(required_distinct_modalities),
                 )
 
-                if int(total_image_records) >= 2:
-                    if int(goal_count) >= 4:
-                        if not (
-                            bool(modality_coverage.get("has_image_goal"))
-                            and bool(modality_coverage.get("has_text_description_goal"))
-                        ):
-                            continue
-                    elif int(goal_count) >= 3:
-                        if not (
-                            bool(modality_coverage.get("has_image_goal"))
-                            or bool(modality_coverage.get("has_text_description_goal"))
-                        ):
-                            continue
+                if int(required_distinct_modalities) >= 3:
+                    if not (
+                        bool(modality_coverage.get("has_image_goal"))
+                        and bool(modality_coverage.get("has_text_description_goal"))
+                    ):
+                        continue
+                elif int(required_distinct_modalities) >= 2:
+                    if not (
+                        bool(modality_coverage.get("has_image_goal"))
+                        or bool(modality_coverage.get("has_text_description_goal"))
+                    ):
+                        continue
 
                 for index, modality in enumerate(goal_modalities):
                     goal_inputs[index]["selected_non_audio_modality"] = str(modality)
@@ -1880,6 +2052,15 @@ def parse_args() -> argparse.Namespace:
         help="Output trajectory dataset JSON (default: <input_dir>/trajectory_dataset.json)",
     )
     parser.add_argument(
+        "--instances-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON whose `instances` block will replace the base input `instances` "
+            "before trajectory building. Useful for injecting the latest view_points."
+        ),
+    )
+    parser.add_argument(
         "--num-trajectories",
         type=int,
         default=20,
@@ -2111,7 +2292,20 @@ def main() -> None:
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    payload = json.loads(input_path.read_text())
+    payload = _load_json_object(input_path)
+    instances_source_path: Optional[Path] = None
+    if args.instances_json is not None:
+        instances_source_path = args.instances_json.expanduser().resolve()
+        if not instances_source_path.is_file():
+            raise RuntimeError(f"Instances source file not found: {instances_source_path}")
+        instances_payload = _load_json_object(instances_source_path)
+        payload = _replace_instances_from_payload(
+            base_payload=payload,
+            instances_payload=instances_payload,
+            base_path=input_path,
+            instances_path=instances_source_path,
+        )
+
     scene_name = _resolve_scene_name(payload, args.scene_name)
     scene_id = payload.get("scene_id")
     scene_split = _infer_scene_split(scene_id)
@@ -2182,7 +2376,6 @@ def main() -> None:
             dominant_floors_payload = _serialize_floor_levels(dominant_floors)
             start_sampling_metadata.update(
                 {
-                    "scene_path": str(scene_path),
                     "num_navmesh_height_bands": int(len(all_floor_levels)),
                     "num_dominant_floors": int(len(dominant_floors)),
                     "start_min_clearance": float(args.start_min_clearance),
@@ -2386,7 +2579,6 @@ def main() -> None:
         "version": "0.1",
         "scene_name": scene_name,
         "scene_id": episode_scene_id,
-        "source_valid_instances": str(input_path),
         "sampling": {
             "num_trajectories": int(args.num_trajectories),
             "min_goals": int(args.min_goals),

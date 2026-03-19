@@ -450,6 +450,28 @@ def apply_eval_config(args: argparse.Namespace) -> argparse.Namespace:
     )
     _set_arg_if_default(
         args,
+        "scene_start_index",
+        None,
+        _first_cfg_value(
+            cfg,
+            "scene_start_index",
+            "eval.scene_start_index",
+            "dataset.scene_start_index",
+        ),
+    )
+    _set_arg_if_default(
+        args,
+        "scene_end_index",
+        None,
+        _first_cfg_value(
+            cfg,
+            "scene_end_index",
+            "eval.scene_end_index",
+            "dataset.scene_end_index",
+        ),
+    )
+    _set_arg_if_default(
+        args,
         "num_episodes",
         None,
         _first_cfg_value(cfg, "num_episodes", "eval.num_episodes"),
@@ -534,6 +556,25 @@ def apply_eval_config(args: argparse.Namespace) -> argparse.Namespace:
         200.0,
         _first_cfg_value(cfg, "video_audio_max_gain", "eval.video_audio_max_gain"),
     )
+    _set_arg_if_default(
+        args,
+        "save_action_observations",
+        True,
+        _first_cfg_value(
+            cfg,
+            "save_action_observations",
+            "eval.save_action_observations",
+        ),
+    )
+
+    if args.action_observation_dir is None:
+        action_observation_dir = _first_cfg_value(
+            cfg,
+            "action_observation_dir",
+            "eval.action_observation_dir",
+        )
+        if isinstance(action_observation_dir, str) and action_observation_dir.strip():
+            args.action_observation_dir = action_observation_dir
 
     if args.disable_content_scenes is None:
         disable_content = _first_cfg_value(cfg, "disable_content_scenes", "dataset.disable_content_scenes")
@@ -636,6 +677,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional scene filter by scene basename or parent dir.",
+    )
+    parser.add_argument(
+        "--scene-start-index",
+        type=int,
+        default=None,
+        help="Inclusive scene index in sorted scene list.",
+    )
+    parser.add_argument(
+        "--scene-end-index",
+        type=int,
+        default=None,
+        help="Exclusive scene index in sorted scene list.",
     )
     parser.add_argument(
         "--num-episodes",
@@ -754,6 +807,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional directory for saved image-goal prompt references.",
     )
+    parser.add_argument(
+        "--save-action-observations",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Save RGB and semantic snapshots when policy executes submit/stop.",
+    )
+    parser.add_argument(
+        "--action-observation-dir",
+        type=str,
+        default=None,
+        help="Directory for submit/stop RGB+semantic snapshots (default: <run_dir>/action_observations).",
+    )
     return parser.parse_args()
 
 
@@ -787,12 +852,16 @@ def build_config(args: argparse.Namespace) -> habitat.Config:
         agent_sensors.append("RGB_SENSOR")
     if "DEPTH_SENSOR" not in agent_sensors:
         agent_sensors.append("DEPTH_SENSOR")
+    if "SEMANTIC_SENSOR" not in agent_sensors:
+        agent_sensors.append("SEMANTIC_SENSOR")
     agent_cfg.SENSORS = agent_sensors
 
     if hasattr(cfg.SIMULATOR, "RGB_SENSOR") and hasattr(cfg.SIMULATOR.RGB_SENSOR, "UUID"):
         cfg.SIMULATOR.RGB_SENSOR.UUID = "rgb"
     if hasattr(cfg.SIMULATOR, "DEPTH_SENSOR") and hasattr(cfg.SIMULATOR.DEPTH_SENSOR, "UUID"):
         cfg.SIMULATOR.DEPTH_SENSOR.UUID = "depth"
+    if hasattr(cfg.SIMULATOR, "SEMANTIC_SENSOR") and hasattr(cfg.SIMULATOR.SEMANTIC_SENSOR, "UUID"):
+        cfg.SIMULATOR.SEMANTIC_SENSOR.UUID = "semantic"
 
     if args.video_audio and "AUDIOGOAL_SENSOR" not in cfg.TASK.SENSORS:
         cfg.TASK.SENSORS.append("AUDIOGOAL_SENSOR")
@@ -873,16 +942,90 @@ def _scene_key(scene_id: str) -> str:
     return scene_parent or scene_base
 
 
+def _all_scene_names(episodes: List[Any]) -> List[str]:
+    scene_names = {
+        _scene_key(str(getattr(ep, "scene_id", "")))
+        for ep in episodes
+        if str(getattr(ep, "scene_id", "")).strip()
+    }
+    return sorted(scene_names)
+
+
+def _resolve_scene_subset(
+    all_scene_names: List[str],
+    args: argparse.Namespace,
+) -> Tuple[int, int, List[str]]:
+    if args.scene and (
+        args.scene_start_index is not None or args.scene_end_index is not None
+    ):
+        raise RuntimeError(
+            "Use either --scene or --scene-start-index/--scene-end-index, not both."
+        )
+
+    total_scenes = len(all_scene_names)
+    if args.scene:
+        scene_name = str(args.scene)
+        if scene_name not in all_scene_names:
+            return 0, 0, []
+        scene_index = all_scene_names.index(scene_name)
+        return scene_index, scene_index + 1, [scene_name]
+
+    start_index = 0 if args.scene_start_index is None else int(args.scene_start_index)
+    end_index = (
+        total_scenes if args.scene_end_index is None else int(args.scene_end_index)
+    )
+
+    if start_index < 0 or start_index > total_scenes:
+        raise RuntimeError(
+            f"scene_start_index={start_index} out of range for {total_scenes} scenes"
+        )
+    if end_index < 0 or end_index > total_scenes:
+        raise RuntimeError(
+            f"scene_end_index={end_index} out of range for {total_scenes} scenes"
+        )
+    if end_index < start_index:
+        raise RuntimeError(
+            f"scene_end_index={end_index} must be >= scene_start_index={start_index}"
+        )
+
+    return start_index, end_index, all_scene_names[start_index:end_index]
+
+
+def _scene_subset_label(
+    all_scene_names: List[str],
+    args: argparse.Namespace,
+) -> str:
+    start_index, end_index, _ = _resolve_scene_subset(all_scene_names, args)
+    return f"[{start_index}:{end_index}]"
+
+
 def _prepare_episode_list(env: habitat.Env, args: argparse.Namespace) -> List[Any]:
     episodes = list(env.episodes)
+    episodes.sort(
+        key=lambda ep: (
+            _scene_key(str(getattr(ep, "scene_id", ""))),
+            int(getattr(ep, "episode_id", 0)),
+        )
+    )
+
+    all_scene_names = _all_scene_names(episodes)
+    _, _, selected_scene_names = _resolve_scene_subset(all_scene_names, args)
     if args.scene:
+        scene_name = str(args.scene)
         episodes = [
             ep
             for ep in episodes
-            if _scene_key(ep.scene_id) == args.scene
-            or os.path.basename(ep.scene_id).split(".")[0] == args.scene
+            if _scene_key(ep.scene_id) == scene_name
+            or os.path.basename(ep.scene_id).split(".")[0] == scene_name
         ]
-    episodes.sort(key=lambda ep: int(getattr(ep, "episode_id", 0)))
+    else:
+        selected_scene_name_set = set(selected_scene_names)
+        episodes = [
+            ep
+            for ep in episodes
+            if _scene_key(str(getattr(ep, "scene_id", ""))) in selected_scene_name_set
+        ]
+
     if args.num_episodes is not None and args.num_episodes >= 0:
         episodes = episodes[: args.num_episodes]
     return episodes

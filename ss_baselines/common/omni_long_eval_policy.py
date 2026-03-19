@@ -189,6 +189,12 @@ def _goal_target_positions(goal: Any, follow_view_points: bool) -> List[np.ndarr
         for view in getattr(goal, "view_points", None) or []:
             agent_state = getattr(view, "agent_state", None)
             position = getattr(agent_state, "position", None)
+            if position is None and isinstance(view, dict):
+                nested_state = view.get("agent_state")
+                if isinstance(nested_state, dict):
+                    position = nested_state.get("position")
+                if position is None:
+                    position = view.get("position")
             if position is None:
                 continue
             targets.append(np.asarray(position, dtype=np.float32))
@@ -199,6 +205,57 @@ def _goal_target_positions(goal: Any, follow_view_points: bool) -> List[np.ndarr
     if position is None:
         return []
     return [np.asarray(position, dtype=np.float32)]
+
+
+def _goal_semantic_id(goal: Any) -> Optional[int]:
+    if isinstance(goal, dict):
+        for key in ("object_id_raw", "object_id"):
+            semantic_id = _as_int_or_none(goal.get(key))
+            if semantic_id is not None:
+                return int(semantic_id)
+        return None
+
+    for attr_name in ("object_id_raw", "object_id"):
+        semantic_id = _as_int_or_none(getattr(goal, attr_name, None))
+        if semantic_id is not None:
+            return int(semantic_id)
+    return None
+
+
+def _current_semantic_observation(observations: Optional[Dict[str, Any]]) -> Optional[np.ndarray]:
+    if not isinstance(observations, dict):
+        return None
+
+    for key in ("semantic", "SEMANTIC_SENSOR", "semantic_sensor"):
+        semantic = observations.get(key)
+        if semantic is not None:
+            semantic = np.asarray(semantic)
+            if semantic.ndim == 3:
+                semantic = semantic[:, :, 0]
+            if semantic.ndim == 2:
+                return semantic
+
+    for key, value in observations.items():
+        if "semantic" not in str(key).lower():
+            continue
+        semantic = np.asarray(value)
+        if semantic.ndim == 3:
+            semantic = semantic[:, :, 0]
+        if semantic.ndim == 2:
+            return semantic
+
+    return None
+
+
+def _goal_visible_in_observations(goal: Any, observations: Optional[Dict[str, Any]]) -> bool:
+    semantic_id = _goal_semantic_id(goal)
+    if semantic_id is None:
+        return False
+    semantic = _current_semantic_observation(observations)
+    if semantic is None:
+        return False
+    semantic_mask = semantic.astype(np.int64, copy=False) == int(semantic_id)
+    return bool(np.count_nonzero(semantic_mask) > 0)
 
 
 def _nearest_target_position(
@@ -468,6 +525,7 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
         submit_probability: float = 0.0,
         seed: int = 0,
         goal_order_mode: Optional[Any] = None,
+        max_visibility_scan_turns: int = 11,
         **_: Any,
     ):
         self._submit_action_name = str(submit_action_name)
@@ -479,9 +537,14 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
         self._min_submit_steps = int(min_submit_steps)
         self._submit_probability = float(submit_probability)
         self._seed = int(seed)
+        self._rng = np.random.default_rng(self._seed)
         self._goal_order_mode = _normalize_goal_order_mode(goal_order_mode)
+        self._max_visibility_scan_turns = max(int(max_visibility_scan_turns), 1)
         self._follower: Optional[ShortestPathFollower] = None
         self._goal_signature: Optional[Any] = None
+        self._goal_target_indices: Dict[Any, int] = {}
+        self._goal_visibility_scan: Dict[Any, Dict[str, int]] = {}
+        self._goal_blocked_target_indices: Dict[Any, set] = {}
 
     def _reset_follower(self, env: Any) -> None:
         self._follower = ShortestPathFollower(
@@ -503,6 +566,11 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
                 )
         else:
             self._submitted_goal_indices.add(int(goal_index))
+        for key in list(self._goal_target_indices.keys()):
+            if isinstance(key, tuple) and len(key) >= 1 and key[0] == int(goal_index):
+                self._goal_target_indices.pop(key, None)
+                self._goal_visibility_scan.pop(key, None)
+                self._goal_blocked_target_indices.pop(key, None)
         self._goal_signature = None
 
     def reset(self, *, env: Any, episode: Any, observations: Dict[str, Any]) -> None:
@@ -515,6 +583,9 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
         self._episode_goals = tuple(goals)
         self._ordered_goal_index = 0
         self._submitted_goal_indices = set()
+        self._goal_target_indices = {}
+        self._goal_visibility_scan = {}
+        self._goal_blocked_target_indices = {}
 
     def _reached_goal(
         self,
@@ -530,6 +601,84 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
             threshold = _task_success_distance(env, default=1.0)
         return float(distance) <= float(threshold)
 
+    def _snap_target_position(self, env: Any, target_position: Any) -> Optional[np.ndarray]:
+        candidate = np.asarray(target_position, dtype=np.float32)
+        if candidate.shape != (3,) or not np.all(np.isfinite(candidate)):
+            return None
+        if hasattr(env.sim, "_snap_to_navmesh"):
+            candidate = np.asarray(env.sim._snap_to_navmesh(candidate), dtype=np.float32)
+        elif hasattr(env.sim, "pathfinder") and hasattr(env.sim.pathfinder, "snap_point"):
+            candidate = np.asarray(env.sim.pathfinder.snap_point(candidate), dtype=np.float32)
+        if candidate.shape != (3,) or not np.all(np.isfinite(candidate)):
+            return None
+        return candidate
+
+    def _prepared_target_positions(self, env: Any, goal: Any) -> List[np.ndarray]:
+        prepared: List[np.ndarray] = []
+        for target_position in _goal_target_positions(goal, self._follow_view_points):
+            snapped = self._snap_target_position(env, target_position)
+            if snapped is not None:
+                prepared.append(snapped)
+        return prepared
+
+    def _clear_goal_scan_state(self, goal_signature: Any) -> None:
+        self._goal_visibility_scan.pop(goal_signature, None)
+        self._goal_blocked_target_indices.pop(goal_signature, None)
+
+    def _advance_visibility_scan(
+        self,
+        goal_signature: Any,
+        target_index: int,
+    ) -> Optional[Dict[str, str]]:
+        state = self._goal_visibility_scan.get(goal_signature)
+        if not isinstance(state, dict) or int(state.get("target_index", -1)) != int(target_index):
+            state = {"target_index": int(target_index), "turns_done": 0}
+
+        turns_done = int(state.get("turns_done", 0))
+        if turns_done >= self._max_visibility_scan_turns:
+            self._goal_visibility_scan.pop(goal_signature, None)
+            blocked = self._goal_blocked_target_indices.setdefault(goal_signature, set())
+            blocked.add(int(target_index))
+            if self._goal_target_indices.get(goal_signature) == int(target_index):
+                self._goal_target_indices.pop(goal_signature, None)
+            return None
+
+        state["turns_done"] = turns_done + 1
+        self._goal_visibility_scan[goal_signature] = state
+        self._goal_target_indices[goal_signature] = int(target_index)
+        return _build_named_action("TURN_LEFT")
+
+    def _select_target_index(
+        self,
+        goal_signature: Any,
+        num_targets: int,
+        blocked_indices: Optional[Sequence[int]] = None,
+    ) -> Optional[int]:
+        if num_targets <= 0:
+            return None
+
+        blocked = {int(index) for index in (blocked_indices or [])}
+        blocked.update(int(index) for index in self._goal_blocked_target_indices.get(goal_signature, set()))
+        current_index = self._goal_target_indices.get(goal_signature)
+        if current_index is not None and current_index not in blocked and 0 <= int(current_index) < num_targets:
+            return int(current_index)
+
+        candidates = [index for index in range(num_targets) if index not in blocked]
+        if not candidates:
+            return None
+        selected_index = int(self._rng.choice(candidates))
+        self._goal_target_indices[goal_signature] = selected_index
+        return selected_index
+
+    def _follower_action_for_target(self, env: Any, target_position: np.ndarray) -> Optional[Any]:
+        if self._follower is None:
+            self._reset_follower(env)
+        assert self._follower is not None
+        try:
+            return self._follower.get_next_action(target_position)
+        except Exception:
+            return None
+
     def act(
         self,
         *,
@@ -542,38 +691,92 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
         if goal is None:
             return _build_named_action(self._stop_action_name)
 
-        if self._reached_goal(env, episode, goal):
+        goal_signature = _goal_signature(goal_index, goal)
+        visible = _goal_visible_in_observations(goal, observations)
+        if visible and self._reached_goal(env, episode, goal):
+            self._clear_goal_scan_state(goal_signature)
+            self._goal_target_indices.pop(goal_signature, None)
             self._mark_goal_submitted(env, goal_index)
             return _build_named_action(self._submit_action_name)
 
-        target_positions = _goal_target_positions(goal, self._follow_view_points)
-        target_position = _nearest_target_position(env, episode, target_positions)
-        if target_position is None:
+        target_positions = self._prepared_target_positions(env, goal)
+
+        if not target_positions:
             return _build_named_action(self._stop_action_name)
 
-        goal_signature = _goal_signature(goal_index, goal)
         if self._follower is None:
             self._reset_follower(env)
         elif goal_signature != self._goal_signature:
             self._reset_follower(env)
 
-        assert self._follower is not None
         self._goal_signature = goal_signature
-        action = self._follower.get_next_action(target_position)
-        if action is None:
-            return _heading_fallback_action(env, target_position)
-        if int(action) == int(HabitatSimActions.STOP):
-            if self._reached_goal(env, episode, goal):
-                self._mark_goal_submitted(env, goal_index)
-                return _build_named_action(self._submit_action_name)
+
+        tried_indices: List[int] = []
+        scan_state = self._goal_visibility_scan.get(goal_signature)
+        if isinstance(scan_state, dict):
+            target_index = _as_int_or_none(scan_state.get("target_index"))
+        else:
+            target_index = None
+
+        if target_index is not None and not (0 <= int(target_index) < len(target_positions)):
+            self._goal_visibility_scan.pop(goal_signature, None)
+            target_index = None
+
+        if target_index is not None:
+            scan_action = self._advance_visibility_scan(goal_signature, int(target_index))
+            if scan_action is not None:
+                return scan_action
+            tried_indices.append(int(target_index))
             self._reset_follower(env)
-            assert self._follower is not None
             self._goal_signature = goal_signature
-            retry_action = self._follower.get_next_action(target_position)
-            if retry_action is not None and int(retry_action) != int(HabitatSimActions.STOP):
-                return _sim_action_to_named_action(retry_action)
-            return _heading_fallback_action(env, target_position)
-        return _sim_action_to_named_action(action)
+
+        target_index = self._select_target_index(
+            goal_signature,
+            len(target_positions),
+            blocked_indices=tried_indices,
+        )
+        if target_index is None:
+            self._goal_blocked_target_indices.pop(goal_signature, None)
+            target_index = self._select_target_index(goal_signature, len(target_positions))
+            if target_index is None:
+                return _build_named_action(self._stop_action_name)
+
+        while target_index is not None:
+            target_position = target_positions[target_index]
+            action = self._follower_action_for_target(env, target_position)
+            if action is None:
+                tried_indices.append(target_index)
+            elif int(action) == int(HabitatSimActions.STOP):
+                if visible and self._reached_goal(env, episode, goal):
+                    self._clear_goal_scan_state(goal_signature)
+                    self._goal_target_indices.pop(goal_signature, None)
+                    self._mark_goal_submitted(env, goal_index)
+                    return _build_named_action(self._submit_action_name)
+                scan_action = self._advance_visibility_scan(goal_signature, target_index)
+                if scan_action is not None:
+                    return scan_action
+                tried_indices.append(target_index)
+            else:
+                self._goal_visibility_scan.pop(goal_signature, None)
+                self._goal_target_indices[goal_signature] = target_index
+                return _sim_action_to_named_action(action)
+
+            self._reset_follower(env)
+            self._goal_signature = goal_signature
+            target_index = self._select_target_index(
+                goal_signature,
+                len(target_positions),
+                blocked_indices=tried_indices,
+            )
+
+        fallback_index = self._goal_target_indices.get(goal_signature)
+        if fallback_index is not None and 0 <= int(fallback_index) < len(target_positions):
+            fallback_target = target_positions[int(fallback_index)]
+        elif tried_indices:
+            fallback_target = target_positions[int(tried_indices[-1])]
+        else:
+            fallback_target = target_positions[0]
+        return _heading_fallback_action(env, fallback_target)
 
 
 def build_lifelong_eval_context(

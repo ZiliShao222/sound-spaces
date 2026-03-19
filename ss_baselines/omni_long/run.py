@@ -12,6 +12,7 @@ import torch
 
 import soundspaces
 from ss_baselines.common.baseline_registry import baseline_registry
+from ss_baselines.omni_long.bc import OmniLongBCTrainer  # noqa: F401
 from ss_baselines.omni_long.config.default import get_config
 from ss_baselines.omni_long.ppo import OmniLongDDPPOTrainer, OmniLongPPOTrainer  # noqa: F401
 

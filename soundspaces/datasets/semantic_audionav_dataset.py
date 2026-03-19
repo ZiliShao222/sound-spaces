@@ -22,6 +22,66 @@ CONTENT_SCENES_PATH_FIELD = "content_scenes_path"
 DEFAULT_SCENE_PATH_PREFIX = "data/scene_dataset/"
 
 
+def _is_vec3(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 3
+        and all(isinstance(v, (int, float)) for v in value)
+    )
+
+
+def _is_quat4(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 4
+        and all(isinstance(v, (int, float)) for v in value)
+    )
+
+
+def _normalize_view_point_payload(
+    raw_view_point: Any,
+    fallback_position: Optional[List[float]] = None,
+) -> Optional[Dict[str, Any]]:
+    if _is_vec3(raw_view_point):
+        return {
+            "agent_state": {
+                "position": [float(v) for v in raw_view_point],
+            },
+            "iou": 0.0,
+        }
+
+    if not isinstance(raw_view_point, dict):
+        return None
+
+    raw_agent_state = raw_view_point.get("agent_state")
+    if isinstance(raw_agent_state, dict):
+        position = raw_agent_state.get("position")
+        rotation = raw_agent_state.get("rotation")
+    else:
+        position = None
+        rotation = None
+
+    if not _is_vec3(position):
+        position = raw_view_point.get("position")
+    if not _is_quat4(rotation):
+        rotation = raw_view_point.get("rotation")
+
+    if not _is_vec3(position):
+        position = fallback_position
+    if not _is_vec3(position):
+        return None
+
+    payload: Dict[str, Any] = {
+        "agent_state": {
+            "position": [float(v) for v in position],
+        },
+        "iou": float(raw_view_point.get("iou", 0.0)),
+    }
+    if _is_quat4(rotation):
+        payload["agent_state"]["rotation"] = [float(v) for v in rotation]
+    return payload
+
+
 @registry.register_dataset(name="SemanticAudioNav")
 class SemanticAudioNavDataset(Dataset):
     category_to_task_category_id: Dict[str, int]
@@ -145,8 +205,11 @@ class SemanticAudioNavDataset(Dataset):
         g = SemanticAudioGoal(**serialized_goal)
 
         for vidx, view in enumerate(g.view_points):
-            view_location = ObjectViewLocation(view, iou=0)
-            view_location.agent_state = AgentState(view_location.agent_state)
+            view_payload = _normalize_view_point_payload(view, g.position)
+            if not isinstance(view_payload, dict):
+                continue
+            view_location = ObjectViewLocation(**view_payload)  # type: ignore
+            view_location.agent_state = AgentState(**view_location.agent_state)  # type: ignore
             g.view_points[vidx] = view_location
 
         return g

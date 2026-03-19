@@ -235,7 +235,20 @@ class SemanticAudioNavigationTask(NavigationTask):
         distance_to_cfg = getattr(self._config, "DISTANCE_TO_GOAL", None)
         distance_to = getattr(distance_to_cfg, "DISTANCE_TO", "POINT")
         if distance_to == "VIEW_POINTS" and goal.view_points:
-            targets = [vp.agent_state.position for vp in goal.view_points]
+            targets = []
+            for view in goal.view_points:
+                agent_state = getattr(view, "agent_state", None)
+                position = getattr(agent_state, "position", None)
+                if position is None and isinstance(view, dict):
+                    nested_state = view.get("agent_state")
+                    if isinstance(nested_state, dict):
+                        position = nested_state.get("position")
+                    if position is None:
+                        position = view.get("position")
+                if position is not None:
+                    targets.append(position)
+            if not targets:
+                targets = [goal.position]
         else:
             targets = [goal.position]
         return self._sim.geodesic_distance(current_position, targets, episode)

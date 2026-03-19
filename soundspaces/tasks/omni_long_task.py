@@ -14,6 +14,7 @@ from PIL import Image
 from habitat.config import Config
 from habitat.core.dataset import Episode
 from habitat.core.embodied_task import SimulatorTaskAction
+from habitat.core.logging import logger
 from habitat.core.registry import registry
 from habitat.core.simulator import Sensor, SensorTypes, Simulator
 from habitat.tasks.nav.nav import DistanceToGoal, EmbodiedTask, Measure, NavigationEpisode, NavigationTask
@@ -26,6 +27,23 @@ def _optional_float(value: Any) -> Optional[float]:
         return None
     if isinstance(value, (int, float, np.integer, np.floating)):
         return float(value)
+    return None
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, str):
+        token = value.strip()
+        if token.startswith(("+", "-")):
+            sign = token[0]
+            digits = token[1:]
+            if digits.isdigit():
+                return int(sign + digits)
+        if token.isdigit():
+            return int(token)
     return None
 
 
@@ -152,6 +170,16 @@ def _task_active_goal_index(task: EmbodiedTask) -> Optional[int]:
     return int(goal_index)
 
 
+def _goal_state_pending(goal_state: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(goal_state, dict):
+        return False
+    if bool(goal_state.get("found", False)):
+        return False
+    if bool(goal_state.get("skipped", False)):
+        return False
+    return True
+
+
 def _finite_distance(value: Any) -> Optional[float]:
     distance = _optional_float(value)
     if distance is None:
@@ -175,6 +203,97 @@ def _is_quat4(value: Any) -> bool:
         and len(value) == 4
         and all(isinstance(v, (int, float)) for v in value)
     )
+
+
+def _agent_camera_world_position(sim: Simulator) -> Optional[np.ndarray]:
+    try:
+        agent_state = sim.get_agent_state()
+    except Exception:
+        return None
+
+    sensor_states = getattr(agent_state, "sensor_states", None)
+    if isinstance(sensor_states, dict):
+        for key in (
+            "rgb",
+            "RGB_SENSOR",
+            "rgb_sensor",
+            "semantic",
+            "SEMANTIC_SENSOR",
+            "semantic_sensor",
+            "depth",
+            "DEPTH_SENSOR",
+            "depth_sensor",
+        ):
+            sensor_state = sensor_states.get(key)
+            position = getattr(sensor_state, "position", None) if sensor_state is not None else None
+            if _is_vec3(position):
+                return np.asarray(position, dtype=np.float32)
+
+        for sensor_state in sensor_states.values():
+            position = getattr(sensor_state, "position", None)
+            if _is_vec3(position):
+                return np.asarray(position, dtype=np.float32)
+
+    position = getattr(agent_state, "position", None)
+    if _is_vec3(position):
+        return np.asarray(position, dtype=np.float32)
+    return None
+
+
+def _record_bbox_bounds(record: Dict[str, Any]) -> Optional[tuple]:
+    bbox_min = record.get("bbox_min")
+    bbox_max = record.get("bbox_max")
+    if _is_vec3(bbox_min) and _is_vec3(bbox_max):
+        lower = np.minimum(np.asarray(bbox_min, dtype=np.float32), np.asarray(bbox_max, dtype=np.float32))
+        upper = np.maximum(np.asarray(bbox_min, dtype=np.float32), np.asarray(bbox_max, dtype=np.float32))
+        return lower, upper
+
+    center = record.get("center")
+    bbox_size = record.get("bbox_size")
+    if _is_vec3(center) and _is_vec3(bbox_size):
+        center_arr = np.asarray(center, dtype=np.float32)
+        half_size = 0.5 * np.abs(np.asarray(bbox_size, dtype=np.float32))
+        return center_arr - half_size, center_arr + half_size
+
+    return None
+
+
+def _point_to_aabb_surface_distance(
+    point: np.ndarray,
+    bbox_min: np.ndarray,
+    bbox_max: np.ndarray,
+) -> float:
+    clamped = np.minimum(np.maximum(point, bbox_min), bbox_max)
+    outside_delta = point - clamped
+    outside_distance = float(np.linalg.norm(outside_delta, ord=2))
+
+    inside = bool(np.all(point >= bbox_min) and np.all(point <= bbox_max))
+    if not inside:
+        return outside_distance
+
+    face_clearances = np.minimum(bbox_max - point, point - bbox_min)
+    return float(max(0.0, np.min(face_clearances)))
+
+
+def _camera_to_record_surface_distance(
+    sim: Simulator,
+    record: Dict[str, Any],
+) -> Optional[float]:
+    camera_position = _agent_camera_world_position(sim)
+    if camera_position is None:
+        return None
+
+    bbox_bounds = _record_bbox_bounds(record)
+    if bbox_bounds is not None:
+        bbox_min, bbox_max = bbox_bounds
+        return _point_to_aabb_surface_distance(camera_position, bbox_min, bbox_max)
+
+    center = record.get("center")
+    if _is_vec3(center):
+        center_arr = np.asarray(center, dtype=np.float32)
+        return float(np.linalg.norm(camera_position - center_arr, ord=2))
+
+    return None
 
 
 def _extract_rgb_from_observations(observations: Dict[str, Any]) -> Optional[np.ndarray]:
@@ -201,6 +320,65 @@ def _extract_rgb_from_observations(observations: Dict[str, Any]) -> Optional[np.
     return None
 
 
+def _extract_semantic_from_observations(observations: Dict[str, Any]) -> Optional[np.ndarray]:
+    for key in ("semantic", "SEMANTIC_SENSOR", "semantic_sensor"):
+        if key not in observations:
+            continue
+        semantic = np.asarray(observations[key])
+        if semantic.ndim == 3:
+            semantic = semantic[:, :, 0]
+        if semantic.ndim == 2:
+            return semantic
+    return None
+
+
+def _semantic_instance_mask(semantic: np.ndarray, semantic_id: int) -> np.ndarray:
+    semantic_ids = semantic.astype(np.int64, copy=False)
+    return semantic_ids == int(semantic_id)
+
+
+def _current_semantic_observation(
+    sim: Simulator,
+    observations: Optional[Dict[str, Any]] = None,
+) -> Optional[np.ndarray]:
+    semantic_uuid = None
+    if hasattr(sim, "_get_semantic_uuid"):
+        try:
+            semantic_uuid = sim._get_semantic_uuid()
+        except Exception:
+            semantic_uuid = None
+
+    if isinstance(observations, dict):
+        if semantic_uuid is not None and semantic_uuid in observations:
+            semantic = np.asarray(observations[semantic_uuid])
+            if semantic.ndim == 3:
+                semantic = semantic[:, :, 0]
+            if semantic.ndim == 2:
+                return semantic
+        semantic = _extract_semantic_from_observations(observations)
+        if semantic is not None:
+            return semantic
+
+    try:
+        fresh_observations = sim.get_observations_at(
+            position=None,
+            rotation=None,
+            keep_agent_at_new_pose=True,
+        )
+    except Exception:
+        return None
+
+    if not isinstance(fresh_observations, dict):
+        return None
+    if semantic_uuid is not None and semantic_uuid in fresh_observations:
+        semantic = np.asarray(fresh_observations[semantic_uuid])
+        if semantic.ndim == 3:
+            semantic = semantic[:, :, 0]
+        if semantic.ndim == 2:
+            return semantic
+    return _extract_semantic_from_observations(fresh_observations)
+
+
 def _goal_target_positions(goal: SemanticAudioGoal, task_config: Config) -> List[Any]:
     distance_to_cfg = getattr(task_config, "DISTANCE_TO_GOAL", None)
     distance_to = getattr(distance_to_cfg, "DISTANCE_TO", "POINT")
@@ -209,6 +387,12 @@ def _goal_target_positions(goal: SemanticAudioGoal, task_config: Config) -> List
         for view in goal.view_points:
             agent_state = getattr(view, "agent_state", None)
             position = getattr(agent_state, "position", None)
+            if position is None and isinstance(view, dict):
+                nested_state = view.get("agent_state")
+                if isinstance(nested_state, dict):
+                    position = nested_state.get("position")
+                if position is None:
+                    position = view.get("position")
             if position is not None:
                 positions.append(position)
         if positions:
@@ -258,7 +442,7 @@ def _shortest_remaining_path_length(task: EmbodiedTask, episode: Episode) -> Opt
     goal_states = [
         goal_state
         for goal_state in getattr(task, "_goals_map", {}).values()
-        if not bool(goal_state.get("found", False))
+        if _goal_state_pending(goal_state)
     ]
     if not goal_states:
         return 0.0
@@ -320,7 +504,7 @@ def _ordered_inactive_goal_hits(task: EmbodiedTask, episode: Episode) -> int:
 
     hit_count = 0
     for goal_state in getattr(task, "_goals_map", {}).values():
-        if bool(goal_state.get("found", False)):
+        if not _goal_state_pending(goal_state):
             continue
         if active_goal_state is not None and int(goal_state["goal_index"]) == int(active_goal_state["goal_index"]):
             continue
@@ -511,10 +695,14 @@ class OmniLongNavigationTask(NavigationTask):
         matched_goal_state: Optional[Dict[str, Any]],
     ) -> None:
         goal_payload = self._goal_state_payload(matched_goal_state)
+        found_goal_this_step = bool(goal_payload is not None)
+        if goal_payload is None:
+            goal_payload = {"goal_index": -1}
+
         self._last_action_feedback = {
             "action_name": action_name,
-            "found_goal_this_step": bool(goal_payload is not None),
-            "found_goal_index": int(goal_payload.get("goal_index", -1)) if goal_payload else -1,
+            "found_goal_this_step": found_goal_this_step,
+            "found_goal_index": int(goal_payload.get("goal_index", -1)) if found_goal_this_step else -1,
             "remaining_submit_count": int(self.remaining_submit_count),
             "submit_count": int(self._submit_count),
             "submit_limit": int(self._submit_limit),
@@ -527,6 +715,275 @@ class OmniLongNavigationTask(NavigationTask):
         if not isinstance(goal_state, dict):
             return None
         return goal_state
+
+    def _scene_instance_records(self, episode: Episode) -> Optional[Dict[str, Dict[str, Any]]]:
+        dataset = getattr(self, "_dataset", None)
+        if dataset is None:
+            dataset = getattr(self, "dataset", None)
+        scene_instances = getattr(dataset, "instances_by_scene", None)
+        if not isinstance(scene_instances, dict):
+            return None
+        records = scene_instances.get(str(getattr(episode, "scene_id", "")))
+        if not isinstance(records, dict):
+            return None
+        return records
+
+    def _goal_state_instance_record(
+        self,
+        goal_state: Dict[str, Any],
+        episode: Episode,
+    ) -> Optional[Dict[str, Any]]:
+        records = self._scene_instance_records(episode)
+        if not isinstance(records, dict):
+            return None
+
+        descriptor = goal_state.get("descriptor")
+        if isinstance(descriptor, (list, tuple)) and len(descriptor) >= 1:
+            record = records.get(str(descriptor[0]))
+            if isinstance(record, dict):
+                return record
+
+        goal = goal_state.get("goal")
+        object_id = getattr(goal, "object_id", None)
+        if object_id is None:
+            return None
+        for record in records.values():
+            if not isinstance(record, dict):
+                continue
+            semantic_id = record.get("semantic_id")
+            if semantic_id is not None and str(semantic_id) == str(object_id):
+                return record
+        return None
+
+    def _goal_state_success_distance(
+        self,
+        goal_state: Optional[Dict[str, Any]],
+        episode: Episode,
+    ) -> Optional[float]:
+        if not isinstance(goal_state, dict):
+            return None
+
+        record = self._goal_state_instance_record(goal_state, episode)
+        if isinstance(record, dict):
+            surface_distance = _finite_distance(_camera_to_record_surface_distance(self._sim, record))
+            if surface_distance is not None:
+                return surface_distance
+
+        return _finite_distance(self._goal_state_distance(goal_state, episode))
+
+    def _goal_state_semantic_id(
+        self,
+        goal_state: Optional[Dict[str, Any]],
+        episode: Episode,
+    ) -> Optional[int]:
+        if not isinstance(goal_state, dict):
+            return None
+
+        goal = goal_state.get("goal")
+        semantic_id = _optional_int(getattr(goal, "object_id_raw", None))
+        if semantic_id is None:
+            semantic_id = _optional_int(getattr(goal, "object_id", None))
+        if semantic_id is not None:
+            return int(semantic_id)
+
+        record = self._goal_state_instance_record(goal_state, episode)
+        if isinstance(record, dict):
+            semantic_id = _optional_int(record.get("semantic_id"))
+            if semantic_id is not None:
+                return int(semantic_id)
+        return None
+
+    def _goal_state_visible(
+        self,
+        goal_state: Optional[Dict[str, Any]],
+        episode: Episode,
+        observations: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        semantic_id = self._goal_state_semantic_id(goal_state, episode)
+        if semantic_id is None:
+            return False
+
+        semantic = _current_semantic_observation(self._sim, observations=observations)
+        if semantic is None:
+            return False
+
+        semantic_mask = _semantic_instance_mask(semantic, int(semantic_id))
+        return bool(np.count_nonzero(semantic_mask) > 0)
+
+    def _goal_state_debug_name(self, goal_state: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(goal_state, dict):
+            return "<none>"
+
+        descriptor = goal_state.get("descriptor")
+        if isinstance(descriptor, (list, tuple)) and len(descriptor) >= 2:
+            return f"{descriptor[0]}:{descriptor[1]}"
+        if isinstance(descriptor, (list, tuple)) and len(descriptor) >= 1:
+            return str(descriptor[0])
+        if descriptor is not None:
+            return str(descriptor)
+        return "goal_{:03d}".format(int(goal_state.get("goal_index", -1)))
+
+    def _goal_match_diagnostics(
+        self,
+        episode: Episode,
+        observations: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        diagnostics: Dict[str, Any] = {
+            "mode": str(self._mode),
+            "success_distance": float(_goal_success_distance(self._config)),
+        }
+
+        if not self._goals_map:
+            diagnostics["reason"] = "no_goals"
+            return None, diagnostics
+
+        if self._mode == "ordered":
+            active_goal_state = self._ordered_active_goal_state()
+            if active_goal_state is None:
+                diagnostics["reason"] = "no_active_goal"
+                return None, diagnostics
+
+            diagnostics["goal"] = self._goal_state_debug_name(active_goal_state)
+            diagnostics["goal_index"] = int(active_goal_state.get("goal_index", -1))
+
+            distance = self._goal_state_success_distance(active_goal_state, episode)
+            diagnostics["distance"] = _finite_distance(distance)
+            if distance is None:
+                diagnostics["reason"] = "distance_unavailable"
+                return None, diagnostics
+            if float(distance) >= float(diagnostics["success_distance"]):
+                diagnostics["reason"] = "distance_too_far"
+                return None, diagnostics
+
+            visible = bool(self._goal_state_visible(active_goal_state, episode, observations=observations))
+            diagnostics["visible"] = visible
+            if not visible:
+                diagnostics["reason"] = "not_visible"
+                return None, diagnostics
+
+            diagnostics["reason"] = "matched"
+            return active_goal_state, diagnostics
+
+        winner_state = None
+        winner_distance: Optional[float] = None
+        total_unfound = 0
+        within_distance = 0
+        visible_within_distance = 0
+        nearest_goal_name: Optional[str] = None
+        nearest_goal_distance: Optional[float] = None
+        first_not_visible_goal: Optional[str] = None
+        first_not_visible_distance: Optional[float] = None
+
+        for goal_state in self._iter_unfound_goal_states():
+            total_unfound += 1
+            distance = self._goal_state_success_distance(goal_state, episode)
+            if distance is not None and (
+                nearest_goal_distance is None or float(distance) < float(nearest_goal_distance)
+            ):
+                nearest_goal_distance = float(distance)
+                nearest_goal_name = self._goal_state_debug_name(goal_state)
+            if distance is None:
+                continue
+            if float(distance) >= float(diagnostics["success_distance"]):
+                continue
+            within_distance += 1
+
+            visible = bool(self._goal_state_visible(goal_state, episode, observations=observations))
+            if not visible:
+                if first_not_visible_goal is None:
+                    first_not_visible_goal = self._goal_state_debug_name(goal_state)
+                    first_not_visible_distance = float(distance)
+                continue
+
+            visible_within_distance += 1
+            if winner_distance is None or float(distance) < float(winner_distance):
+                winner_distance = float(distance)
+                winner_state = goal_state
+
+        diagnostics["total_unfound_goals"] = int(total_unfound)
+        diagnostics["within_distance_goals"] = int(within_distance)
+        diagnostics["visible_within_distance_goals"] = int(visible_within_distance)
+        diagnostics["nearest_goal"] = nearest_goal_name
+        diagnostics["nearest_goal_distance"] = nearest_goal_distance
+        diagnostics["first_not_visible_goal"] = first_not_visible_goal
+        diagnostics["first_not_visible_distance"] = first_not_visible_distance
+
+        if winner_state is not None:
+            diagnostics["reason"] = "matched"
+            diagnostics["goal"] = self._goal_state_debug_name(winner_state)
+            diagnostics["goal_index"] = int(winner_state.get("goal_index", -1))
+            diagnostics["distance"] = float(winner_distance)
+            diagnostics["visible"] = True
+            return winner_state, diagnostics
+
+        if total_unfound <= 0:
+            diagnostics["reason"] = "no_unfound_goals"
+        elif within_distance <= 0:
+            diagnostics["reason"] = "distance_too_far"
+        elif visible_within_distance <= 0:
+            diagnostics["reason"] = "not_visible"
+        else:
+            diagnostics["reason"] = "no_match"
+        return None, diagnostics
+
+    def _log_goal_match_failure(
+        self,
+        action_name: str,
+        episode: Episode,
+        diagnostics: Dict[str, Any],
+    ) -> None:
+        current_position = getattr(self._sim.get_agent_state(), "position", None)
+        if _is_vec3(current_position):
+            agent_position = [round(float(v), 3) for v in current_position]
+        else:
+            agent_position = None
+
+        message = (
+            "[goal_match_fail] action={action} scene={scene} episode={episode_id} "
+            "mode={mode} reason={reason} goal={goal} distance={distance} "
+            "success_distance={success_distance} visible={visible} agent_position={agent_position}"
+        ).format(
+            action=str(action_name),
+            scene=str(getattr(episode, "scene_id", "")),
+            episode_id=str(getattr(episode, "episode_id", "")),
+            mode=str(diagnostics.get("mode", self._mode)),
+            reason=str(diagnostics.get("reason", "unknown")),
+            goal=str(diagnostics.get("goal", diagnostics.get("nearest_goal", "<none>"))),
+            distance=(
+                "{:.3f}".format(float(diagnostics["distance"]))
+                if _finite_distance(diagnostics.get("distance")) is not None
+                else (
+                    "{:.3f}".format(float(diagnostics["nearest_goal_distance"]))
+                    if _finite_distance(diagnostics.get("nearest_goal_distance")) is not None
+                    else "<none>"
+                )
+            ),
+            success_distance="{:.3f}".format(float(diagnostics.get("success_distance", 0.0))),
+            visible=(
+                str(bool(diagnostics.get("visible")))
+                if diagnostics.get("visible") is not None
+                else "<none>"
+            ),
+            agent_position=agent_position,
+        )
+
+        if diagnostics.get("first_not_visible_goal") is not None:
+            message += " first_not_visible_goal={} first_not_visible_distance={}".format(
+                str(diagnostics.get("first_not_visible_goal")),
+                (
+                    "{:.3f}".format(float(diagnostics["first_not_visible_distance"]))
+                    if _finite_distance(diagnostics.get("first_not_visible_distance")) is not None
+                    else "<none>"
+                ),
+            )
+        if diagnostics.get("total_unfound_goals") is not None:
+            message += " total_unfound_goals={} within_distance_goals={} visible_within_distance_goals={}".format(
+                int(diagnostics.get("total_unfound_goals", 0)),
+                int(diagnostics.get("within_distance_goals", 0)),
+                int(diagnostics.get("visible_within_distance_goals", 0)),
+            )
+        print(message)
+        logger.info(message)
 
     def _goal_state_distance(
         self,
@@ -550,7 +1007,7 @@ class OmniLongNavigationTask(NavigationTask):
         if self._unordered_goal_lock_index is None:
             return None
         goal_state = self._goal_state_by_index(self._unordered_goal_lock_index)
-        if goal_state is None or bool(goal_state.get("found", False)):
+        if not _goal_state_pending(goal_state):
             return None
         return goal_state
 
@@ -658,20 +1115,20 @@ class OmniLongNavigationTask(NavigationTask):
         self._set_last_action_feedback(action_name=None, matched_goal_state=None)
         if getattr(self, "is_stop_called", False):
             self.is_stop_called = False  # type: ignore
-            matched_goal_state = self._handle_stop(episode)
+            matched_goal_state = self._handle_stop(episode, observations=observations)
             self._set_last_action_feedback(action_name="STOP", matched_goal_state=matched_goal_state)
             return False
         if getattr(self, "is_submit_called", False):
             self.is_submit_called = False  # type: ignore
             if self._submit_count >= self._submit_limit:
-                matched_goal_state = self._handle_stop(episode)
+                matched_goal_state = self._handle_stop(episode, observations=observations)
                 self._set_last_action_feedback(
                     action_name="LIFELONG_SUBMIT",
                     matched_goal_state=matched_goal_state,
                 )
                 return False
             self._submit_count += 1
-            is_active, matched_goal_state = self._handle_submit(episode)
+            is_active, matched_goal_state = self._handle_submit(episode, observations=observations)
             self._set_last_action_feedback(
                 action_name="LIFELONG_SUBMIT",
                 matched_goal_state=matched_goal_state,
@@ -679,9 +1136,20 @@ class OmniLongNavigationTask(NavigationTask):
             return is_active
         return True
 
-    def _handle_submit(self, episode: Episode) -> Any:
-        goal_state = self._match_goal_state(episode)
+    def _handle_submit(self, episode: Episode, observations: Optional[Dict[str, Any]] = None) -> Any:
+        goal_state, diagnostics = self._goal_match_diagnostics(
+            episode,
+            observations=observations,
+        )
         if goal_state is None:
+            self._log_goal_match_failure("LIFELONG_SUBMIT", episode, diagnostics)
+            if self._mode == "ordered":
+                active_goal_state = self._ordered_active_goal_state()
+                if isinstance(active_goal_state, dict):
+                    self._mark_goal_skipped(active_goal_state)
+                    if self._ordered_active_goal_state() is None:
+                        return False, None
+                    self._refresh_episode_goals(episode, apply_to_sim=True)
             return True, None
         self._mark_goal_found(goal_state)
         if all(bool(state["found"]) for state in self._goals_map.values()):
@@ -689,10 +1157,15 @@ class OmniLongNavigationTask(NavigationTask):
         self._refresh_episode_goals(episode, apply_to_sim=True)
         return True, goal_state
 
-    def _handle_stop(self, episode: Episode):
-        goal_state = self._match_goal_state(episode)
+    def _handle_stop(self, episode: Episode, observations: Optional[Dict[str, Any]] = None):
+        goal_state, diagnostics = self._goal_match_diagnostics(
+            episode,
+            observations=observations,
+        )
         if goal_state is not None:
             self._mark_goal_found(goal_state)
+        else:
+            self._log_goal_match_failure("STOP", episode, diagnostics)
         return goal_state
 
     def _distance_to_goal(self, goal: SemanticAudioGoal, episode: Episode) -> Optional[float]:
@@ -700,7 +1173,7 @@ class OmniLongNavigationTask(NavigationTask):
         distance_to_cfg = getattr(self._config, "DISTANCE_TO_GOAL", None)
         distance_to = getattr(distance_to_cfg, "DISTANCE_TO", "POINT")
         if distance_to == "VIEW_POINTS" and goal.view_points:
-            targets = [view.agent_state.position for view in goal.view_points]
+            targets = _goal_target_positions(goal, self._config)
         else:
             targets = [goal.position]
         return self._sim.geodesic_distance(current_position, targets, episode)
@@ -734,12 +1207,13 @@ class OmniLongNavigationTask(NavigationTask):
                 "goal": goal,
                 "descriptor": descriptor,
                 "found": False,
+                "skipped": False,
             }
         return goals_map
 
     def _iter_unfound_goal_states(self):
         for goal_state in self._goals_map.values():
-            if not bool(goal_state["found"]):
+            if _goal_state_pending(goal_state):
                 yield goal_state
 
     def _ordered_active_goal_state(self):
@@ -761,35 +1235,22 @@ class OmniLongNavigationTask(NavigationTask):
             return self._ordered_active_goal_state()
         return self._unordered_active_goal_state(episode)
 
-    def _match_goal_state(self, episode: Episode):
-        if not self._goals_map:
-            return None
-
-        success_distance = _goal_success_distance(self._config)
-        if self._mode == "ordered":
-            active_goal_state = self._ordered_active_goal_state()
-            if active_goal_state is None:
-                return None
-            distance = self._distance_to_goal(active_goal_state["goal"], episode)
-            if distance is None or float(distance) >= success_distance:
-                return None
-            return active_goal_state
-
-        winner_state = None
-        winner_distance: Optional[float] = None
-        for goal_state in self._iter_unfound_goal_states():
-            distance = self._distance_to_goal(goal_state["goal"], episode)
-            if distance is None:
-                continue
-            if float(distance) >= success_distance:
-                continue
-            if winner_distance is None or float(distance) < winner_distance:
-                winner_distance = float(distance)
-                winner_state = goal_state
-        return winner_state
+    def _match_goal_state(self, episode: Episode, observations: Optional[Dict[str, Any]] = None):
+        goal_state, _ = self._goal_match_diagnostics(episode, observations=observations)
+        return goal_state
 
     def _mark_goal_found(self, goal_state: Dict[str, Any]) -> None:
         goal_state["found"] = True
+        goal_state["skipped"] = False
+        goal_index = int(goal_state.get("goal_index", -1))
+        if self._unordered_goal_lock_index is not None and int(self._unordered_goal_lock_index) == goal_index:
+            self._clear_unordered_goal_lock()
+        if self._unordered_lock_candidate_index is not None and int(self._unordered_lock_candidate_index) == goal_index:
+            self._unordered_lock_candidate_index = None
+            self._unordered_lock_candidate_anchor_distance = None
+
+    def _mark_goal_skipped(self, goal_state: Dict[str, Any]) -> None:
+        goal_state["skipped"] = True
         goal_index = int(goal_state.get("goal_index", -1))
         if self._unordered_goal_lock_index is not None and int(self._unordered_goal_lock_index) == goal_index:
             self._clear_unordered_goal_lock()
@@ -843,6 +1304,37 @@ class OmniLongDistanceToGoal(Measure):
     def _get_uuid(self, *args: Any, **kwargs: Any):
         return self.cls_uuid
 
+    def _last_matched_goal_distance(
+        self,
+        task: EmbodiedTask,
+        episode: Episode,
+    ) -> Optional[float]:
+        if not hasattr(task, "get_last_action_feedback"):
+            return None
+
+        feedback = task.get_last_action_feedback()
+        if not isinstance(feedback, dict):
+            return None
+
+        goal_index = int(feedback.get("found_goal_index", -1))
+        if goal_index < 0:
+            return None
+
+        if not hasattr(task, "_goal_state_by_index"):
+            return None
+
+        goal_state = task._goal_state_by_index(goal_index)
+        if not isinstance(goal_state, dict):
+            return None
+
+        if hasattr(task, "_goal_state_distance"):
+            return task._goal_state_distance(goal_state, episode)
+
+        goal = goal_state.get("goal")
+        if goal is None or not hasattr(task, "_distance_to_goal"):
+            return None
+        return task._distance_to_goal(goal, episode)
+
     def _state_signature(self, task: EmbodiedTask, episode: Episode) -> tuple:
         mode = getattr(task, "goal_order_mode", _resolve_goal_order_mode(episode, task=task))
         if str(mode).strip().lower() == "ordered":
@@ -852,7 +1344,7 @@ class OmniLongDistanceToGoal(Measure):
             sorted(
                 int(goal_state.get("goal_index", -1))
                 for goal_state in getattr(task, "_goals_map", {}).values()
-                if not bool(goal_state.get("found", False))
+                if _goal_state_pending(goal_state)
             )
         )
         return (str(mode), remaining_goal_indices)
@@ -867,6 +1359,10 @@ class OmniLongDistanceToGoal(Measure):
         distance_value = _finite_distance(distance)
         if distance_value is not None:
             return float(max(0.0, distance_value))
+
+        matched_goal_distance = _finite_distance(self._last_matched_goal_distance(task, episode))
+        if matched_goal_distance is not None:
+            return float(max(0.0, matched_goal_distance))
 
         previous_value = _finite_distance(self._metric)
         if previous_value is not None:
@@ -1407,7 +1903,7 @@ class OmniLongGoalMaskSensor(_OmniLongRawGoalSensorBase):
 
             for goal_state in goal_states:
                 goal_index = int(goal_state.get("goal_index", -1))
-                if 0 <= goal_index < self._max_goals and not bool(goal_state.get("found", False)):
+                if 0 <= goal_index < self._max_goals and _goal_state_pending(goal_state):
                     goal_mask[goal_index] = 1.0
             return goal_mask
 

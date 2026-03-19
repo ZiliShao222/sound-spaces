@@ -33,6 +33,14 @@ def _is_vec3(value: Any) -> bool:
     )
 
 
+def _is_quat4(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 4
+        and all(isinstance(v, (int, float)) for v in value)
+    )
+
+
 def _safe_int_from_instance_key(instance_key: str) -> Optional[int]:
     if not isinstance(instance_key, str):
         return None
@@ -125,6 +133,73 @@ def _view_point_from_instance(record: Dict[str, Any], goal_position: List[float]
     return [float(v) for v in goal_position]
 
 
+def _normalize_view_point_payload(
+    raw_view_point: Any,
+    fallback_position: List[float],
+) -> Optional[Dict[str, Any]]:
+    if _is_vec3(raw_view_point):
+        return {
+            "agent_state": {
+                "position": [float(v) for v in raw_view_point],
+            },
+            "iou": 0.0,
+        }
+
+    if not isinstance(raw_view_point, dict):
+        return None
+
+    raw_agent_state = raw_view_point.get("agent_state")
+    if isinstance(raw_agent_state, dict):
+        position = raw_agent_state.get("position")
+        rotation = raw_agent_state.get("rotation")
+    else:
+        position = None
+        rotation = None
+
+    if not _is_vec3(position):
+        position = raw_view_point.get("position")
+    if not _is_quat4(rotation):
+        rotation = raw_view_point.get("rotation")
+
+    if not _is_vec3(position):
+        position = fallback_position
+    if not _is_vec3(position):
+        return None
+
+    payload: Dict[str, Any] = {
+        "agent_state": {
+            "position": [float(v) for v in position],
+        },
+        "iou": float(raw_view_point.get("iou", 0.0)),
+    }
+    if _is_quat4(rotation):
+        payload["agent_state"]["rotation"] = [float(v) for v in rotation]
+    return payload
+
+
+def _view_points_from_instance(
+    record: Dict[str, Any],
+    goal_position: List[float],
+) -> List[Dict[str, Any]]:
+    raw_view_points = record.get("view_points")
+    normalized: List[Dict[str, Any]] = []
+    if isinstance(raw_view_points, list):
+        for raw_view_point in raw_view_points:
+            payload = _normalize_view_point_payload(raw_view_point, goal_position)
+            if isinstance(payload, dict):
+                normalized.append(payload)
+    if normalized:
+        return normalized
+
+    fallback_view_point = _view_point_from_instance(record, goal_position)
+    fallback_payload = _normalize_view_point_payload(
+        fallback_view_point, goal_position
+    )
+    if isinstance(fallback_payload, dict):
+        return [fallback_payload]
+    return []
+
+
 def _build_goal_dict_from_instance(instance_key: str, record: Dict[str, Any]) -> Dict[str, Any]:
     category = record.get("category")
     if not isinstance(category, str) or not category.strip():
@@ -137,7 +212,7 @@ def _build_goal_dict_from_instance(instance_key: str, record: Dict[str, Any]) ->
         semantic_id = 0
 
     goal_position = _goal_position_from_instance(record)
-    view_point = _view_point_from_instance(record, goal_position)
+    view_points = _view_points_from_instance(record, goal_position)
 
     return {
         "position": [float(v) for v in goal_position],
@@ -148,7 +223,7 @@ def _build_goal_dict_from_instance(instance_key: str, record: Dict[str, Any]) ->
         "object_category": category,
         "room_id": None,
         "room_name": None,
-        "view_points": [view_point],
+        "view_points": view_points,
     }
 
 
@@ -278,8 +353,11 @@ class OmniLongNavDataset(Dataset):
     def __deserialize_goal(serialized_goal: Dict[str, Any]) -> SemanticAudioGoal:
         goal = SemanticAudioGoal(**serialized_goal)
         for view_idx, view in enumerate(goal.view_points or []):
-            view_location = ObjectViewLocation(view, iou=0)
-            view_location.agent_state = AgentState(view_location.agent_state)
+            view_payload = _normalize_view_point_payload(view, goal.position)
+            if not isinstance(view_payload, dict):
+                continue
+            view_location = ObjectViewLocation(**view_payload)
+            view_location.agent_state = AgentState(**view_location.agent_state)
             goal.view_points[view_idx] = view_location
         return goal
 

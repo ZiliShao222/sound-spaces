@@ -12,10 +12,12 @@ import habitat
 import numpy as np
 import soundspaces  # noqa: F401 - register datasets/tasks/sims
 from habitat.utils.visualizations.utils import images_to_video
+from PIL import Image
 
 from ss_baselines.common.omni_long_eval_policy import build_lifelong_eval_context
 from ss_baselines.common.utils import observations_to_image, images_to_video_with_audio
 from soundspaces.tasks.omni_long_eval_utils import (
+    _all_scene_names,
     _build_goal_input_payload,
     _build_policy,
     _episode_goal_count,
@@ -25,7 +27,10 @@ from soundspaces.tasks.omni_long_eval_utils import (
     _load_dataset_payload,
     _normalize_task_specs,
     _prepare_episode_list,
+    _resolve_scene_subset,
     _save_goal_input_image_if_needed,
+    _scene_key,
+    _scene_subset_label,
     _summarize_goal_input_payload,
     apply_eval_config,
     build_config,
@@ -35,6 +40,56 @@ from soundspaces.tasks.omni_long_eval_utils import (
 
 WEIGHTED_METRIC_NAMES = ("success", "spl", "softspl")
 RUNNING_MEAN_METRIC_NAMES = ("na",)
+
+
+def _new_metric_accumulator() -> Dict[str, Any]:
+    return {
+        "sum_metrics": {},
+        "weighted_metric_sums": {name: 0.0 for name in WEIGHTED_METRIC_NAMES},
+        "total_goal_weight": 0.0,
+        "episodes_done": 0,
+        "episodes_truncated": 0,
+    }
+
+
+def _update_metric_accumulator(
+    accumulator: Dict[str, Any],
+    metrics: Dict[str, float],
+    goal_weight: float,
+    truncated: bool,
+) -> None:
+    sum_metrics = accumulator["sum_metrics"]
+    for key, value in metrics.items():
+        sum_metrics[key] = sum_metrics.get(key, 0.0) + float(value)
+
+    accumulator["total_goal_weight"] += float(goal_weight)
+    weighted_metric_sums = accumulator["weighted_metric_sums"]
+    for key in WEIGHTED_METRIC_NAMES:
+        weighted_metric_sums[key] += float(metrics.get(key, 0.0)) * float(goal_weight)
+
+    accumulator["episodes_done"] += 1
+    if truncated:
+        accumulator["episodes_truncated"] += 1
+
+
+def _mean_metrics_from_accumulator(accumulator: Dict[str, Any]) -> Dict[str, float]:
+    episodes_done = int(accumulator["episodes_done"])
+    if episodes_done <= 0:
+        return {}
+    return {
+        key: value / float(episodes_done)
+        for key, value in accumulator["sum_metrics"].items()
+    }
+
+
+def _weighted_metrics_from_accumulator(accumulator: Dict[str, Any]) -> Dict[str, float]:
+    total_goal_weight = float(accumulator["total_goal_weight"])
+    if total_goal_weight <= 0.0:
+        return {name: 0.0 for name in WEIGHTED_METRIC_NAMES}
+    return {
+        key: accumulator["weighted_metric_sums"][key] / total_goal_weight
+        for key in WEIGHTED_METRIC_NAMES
+    }
 
 
 def _optional_metric_float(value: Any) -> Optional[float]:
@@ -84,6 +139,97 @@ def _is_submit_action(action: Any, submit_action_name: str) -> bool:
         return action.strip().upper() == action_name
     return False
 
+
+def _is_stop_action(action: Any, stop_action_name: str) -> bool:
+    action_name = str(stop_action_name).strip().upper()
+    if isinstance(action, dict):
+        value = action.get("action")
+        return isinstance(value, str) and value.strip().upper() == action_name
+    if isinstance(action, str):
+        return action.strip().upper() == action_name
+    return False
+
+
+def _observation_image(observations: Optional[Dict[str, Any]], *keys: str) -> Optional[np.ndarray]:
+    if not isinstance(observations, dict):
+        return None
+    for key in keys:
+        value = observations.get(key)
+        if value is None:
+            continue
+        image = np.asarray(value)
+        if image.ndim == 3 and image.shape[2] == 1:
+            image = image[:, :, 0]
+        if image.ndim in {2, 3}:
+            return image
+    return None
+
+
+def _semantic_color(semantic_id: int) -> Tuple[int, int, int]:
+    sid = int(semantic_id)
+    if sid == 0:
+        return (0, 0, 0)
+    return (
+        (sid * 37) % 256,
+        (sid * 67) % 256,
+        (sid * 97) % 256,
+    )
+
+
+def _semantic_to_rgb(semantic: np.ndarray) -> np.ndarray:
+    semantic_ids = np.asarray(semantic).astype(np.int64, copy=False)
+    if semantic_ids.ndim == 3:
+        semantic_ids = semantic_ids[:, :, 0]
+    semantic_rgb = np.zeros((*semantic_ids.shape, 3), dtype=np.uint8)
+    for semantic_id in np.unique(semantic_ids):
+        semantic_rgb[semantic_ids == semantic_id] = _semantic_color(int(semantic_id))
+    return semantic_rgb
+
+
+def _save_observation_png(image: np.ndarray, output_path: Path) -> Optional[str]:
+    array = np.asarray(image)
+    if array.ndim == 2:
+        array = np.clip(array, 0, 255).astype(np.uint8)
+    elif array.ndim == 3:
+        if array.shape[2] > 3:
+            array = array[:, :, :3]
+        array = np.clip(array, 0, 255).astype(np.uint8)
+    else:
+        return None
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(array).save(output_path)
+    return str(output_path)
+
+
+def _save_action_observation_bundle(
+    root_dir: Path,
+    *,
+    scene_name: str,
+    episode_index: int,
+    episode_id: str,
+    step_idx: int,
+    action_name: str,
+    phase: str,
+    observations: Optional[Dict[str, Any]],
+) -> Dict[str, Optional[str]]:
+    phase_token = str(phase).strip().lower()
+    action_dir = root_dir / scene_name / f"episode_{episode_index}_id_{episode_id}" / (
+        f"step_{int(step_idx):04d}_{str(action_name).strip().lower()}"
+    )
+
+    rgb = _observation_image(observations, "rgb", "RGB_SENSOR", "rgb_sensor")
+    semantic = _observation_image(observations, "semantic", "SEMANTIC_SENSOR", "semantic_sensor")
+
+    payload: Dict[str, Optional[str]] = {"rgb": None, "semantic": None}
+    if rgb is not None:
+        payload["rgb"] = _save_observation_png(rgb, action_dir / f"{phase_token}_rgb.png")
+    if semantic is not None:
+        payload["semantic"] = _save_observation_png(
+            _semantic_to_rgb(semantic),
+            action_dir / f"{phase_token}_semantic.png",
+        )
+    return payload
+
 def main() -> None:
     args = parse_args()
     args = apply_eval_config(args)
@@ -107,11 +253,28 @@ def main() -> None:
     env = habitat.Env(config=cfg)
     policy = _build_policy(args)
 
+    all_scene_names = _all_scene_names(list(env.episodes))
+    scene_range_label = _scene_subset_label(all_scene_names, args)
+    scene_range_start, scene_range_end, selected_scene_names = _resolve_scene_subset(
+        all_scene_names,
+        args,
+    )
+    print("scene_range_in_use={}".format(scene_range_label))
+    print("selected_scenes_in_use={}".format(selected_scene_names))
+
+    episodes = _prepare_episode_list(env, args)
+    if not episodes:
+        policy.close()
+        env.close()
+        print("No episodes selected.")
+        return
+
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     if args.episode_log is None or args.mean_log is None:
         run_base_dir = os.path.join(
             str(args.output_parent_dir),
             str(args.exp_name),
+            scene_range_label,
             timestamp,
         )
         os.makedirs(run_base_dir, exist_ok=True)
@@ -127,13 +290,18 @@ def main() -> None:
         args.video_dir = default_video_dir
     if args.prompt_image_dir is None:
         args.prompt_image_dir = os.path.join(run_base_dir, "prompt_images")
+    if args.save_action_observations and args.action_observation_dir is None:
+        args.action_observation_dir = os.path.join(run_base_dir, "action_observations")
 
     os.makedirs(os.path.dirname(args.episode_log) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(args.mean_log) or ".", exist_ok=True)
     if args.video:
         os.makedirs(str(args.video_dir), exist_ok=True)
     os.makedirs(str(args.prompt_image_dir), exist_ok=True)
+    if args.save_action_observations and args.action_observation_dir is not None:
+        os.makedirs(str(args.action_observation_dir), exist_ok=True)
     prompt_image_dir = Path(args.prompt_image_dir)
+    action_observation_dir = Path(args.action_observation_dir) if args.action_observation_dir is not None else None
     if args.video_dir is not None:
         metric_log_dir = str(Path(args.video_dir).resolve().parent / "logs")
     else:
@@ -141,43 +309,49 @@ def main() -> None:
     os.makedirs(metric_log_dir, exist_ok=True)
     episode_metric_txt = os.path.join(metric_log_dir, "episode_metrics.txt")
     running_metric_txt = os.path.join(metric_log_dir, "running_weighted_mean.txt")
+    scene_mean_log = os.path.join(run_base_dir, "scene_mean.json")
+    scene_metric_txt = os.path.join(metric_log_dir, "scene_metrics.txt")
 
     episode_writer = open(args.episode_log, "w", encoding="utf-8")
     episode_metric_writer = open(episode_metric_txt, "w", encoding="utf-8")
     running_metric_writer = open(running_metric_txt, "w", encoding="utf-8")
 
-    episodes = _prepare_episode_list(env, args)
-    if not episodes:
-        episode_writer.close()
-        episode_metric_writer.close()
-        running_metric_writer.close()
-        policy.close()
-        env.close()
-        print("No episodes selected.")
-        return
+    all_metrics = _new_metric_accumulator()
+    scene_metrics: Dict[str, Dict[str, Any]] = {}
+    scene_order: List[str] = []
+    scene_episode_budget: Dict[str, int] = {}
+    for episode in episodes:
+        scene_name = _scene_key(str(getattr(episode, "scene_id", "")))
+        if scene_name not in scene_episode_budget:
+            scene_order.append(scene_name)
+            scene_episode_budget[scene_name] = 0
+        scene_episode_budget[scene_name] += 1
 
-    episodes_by_id = {int(getattr(ep, "episode_id", 0)): ep for ep in episodes}
-    ordered_episode_ids = sorted(episodes_by_id.keys())
-
-    sum_metrics: Dict[str, float] = {}
-    weighted_metric_sums = {name: 0.0 for name in WEIGHTED_METRIC_NAMES}
-    total_goal_weight = 0.0
-    episodes_done = 0
-    episodes_truncated = 0
+    current_scene_name: Optional[str] = None
 
     if True:
-        for episode_index, episode_id in enumerate(ordered_episode_ids):
-            target_episode = episodes_by_id[episode_id]
+        for episode_index, target_episode in enumerate(episodes):
             env.current_episode = target_episode
             observations = env.reset()
             episode = env.current_episode
 
             episode_id_text = str(getattr(episode, "episode_id", ""))
+            scene_name = _scene_key(str(getattr(episode, "scene_id", "")))
+            episode_uid = f"{scene_name}:{episode_id_text}"
+            if scene_name != current_scene_name:
+                current_scene_name = scene_name
+                print(
+                    "[scene] {scene} ({count} episodes)".format(
+                        scene=scene_name,
+                        count=scene_episode_budget.get(scene_name, 0),
+                    )
+                )
             goal_specs = _normalize_task_specs(getattr(episode, "tasks", None))
             goal_summary = [f"{instance_key}:{modality}" for instance_key, modality in goal_specs]
 
             goal_payloads: List[Dict[str, Any]] = []
             goal_input_summaries: List[Dict[str, Any]] = []
+            scene_prompt_image_dir = prompt_image_dir / scene_name
             for goal_idx, (instance_key, modality) in enumerate(goal_specs):
                 instance_record = instance_index.get(instance_key)
                 goal_payload = _build_goal_input_payload(
@@ -190,7 +364,7 @@ def main() -> None:
                 goal_input_summary = _summarize_goal_input_payload(goal_idx, goal_payload)
                 image_path = _save_goal_input_image_if_needed(
                     payload=goal_payload,
-                    prompt_image_dir=prompt_image_dir,
+                    prompt_image_dir=scene_prompt_image_dir,
                     episode_id=episode_id_text,
                     goal_index=goal_idx,
                     instance_key=instance_key,
@@ -233,8 +407,73 @@ def main() -> None:
                     context=context,
                 )
 
+                should_dump_action_obs = bool(
+                    args.save_action_observations
+                    and action_observation_dir is not None
+                    and (
+                        _is_submit_action(action, args.submit_action_name)
+                        or _is_stop_action(action, "STOP")
+                    )
+                )
+                action_name = None
+                if _is_submit_action(action, args.submit_action_name):
+                    action_name = str(args.submit_action_name)
+                elif _is_stop_action(action, "STOP"):
+                    action_name = "STOP"
+
+                action_snapshot: Dict[str, Any] = {}
+                if should_dump_action_obs and action_name is not None:
+                    action_snapshot["before"] = _save_action_observation_bundle(
+                        action_observation_dir,
+                        scene_name=scene_name,
+                        episode_index=episode_index,
+                        episode_id=episode_id_text,
+                        step_idx=step_idx,
+                        action_name=action_name,
+                        phase="before",
+                        observations=observations,
+                    )
+
                 observations = env.step(action)
                 done = bool(env.episode_over)
+
+                if should_dump_action_obs and action_name is not None:
+                    action_snapshot["after"] = _save_action_observation_bundle(
+                        action_observation_dir,
+                        scene_name=scene_name,
+                        episode_index=episode_index,
+                        episode_id=episode_id_text,
+                        step_idx=step_idx,
+                        action_name=action_name,
+                        phase="after",
+                        observations=observations,
+                    )
+                    feedback = {}
+                    if task is not None and hasattr(task, "get_last_action_feedback"):
+                        feedback = task.get_last_action_feedback()
+                    snapshot_dir = (
+                        action_observation_dir
+                        / scene_name
+                        / f"episode_{episode_index}_id_{episode_id_text}"
+                        / f"step_{int(step_idx):04d}_{str(action_name).strip().lower()}"
+                    )
+                    metadata_path = snapshot_dir / "metadata.json"
+                    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+                    metadata = {
+                        "scene": scene_name,
+                        "episode_index": int(episode_index),
+                        "episode_id": str(episode_id_text),
+                        "step": int(step_idx),
+                        "action": str(action_name),
+                        "done_after_action": bool(done),
+                        "before": action_snapshot.get("before", {}),
+                        "after": action_snapshot.get("after", {}),
+                        "feedback": feedback,
+                    }
+                    metadata_path.write_text(
+                        json.dumps(metadata, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
 
                 if args.video:
                     frame = observations_to_image(observations, env.get_metrics())
@@ -264,9 +503,6 @@ def main() -> None:
                     info=None,
                 )
                 step_idx += 1
-
-            if not done:
-                episodes_truncated += 1
 
             if args.video_audio:
                 audio_frame_count = len(audios)
@@ -314,24 +550,34 @@ def main() -> None:
                     )
                 )
             goal_weight = float(metrics.get("num_goals", 1.0))
-            for key, value in metrics.items():
-                sum_metrics[key] = sum_metrics.get(key, 0.0) + float(value)
-            total_goal_weight += goal_weight
-            for key in WEIGHTED_METRIC_NAMES:
-                weighted_metric_sums[key] += float(metrics.get(key, 0.0)) * goal_weight
-            running_weighted_mean = {
-                key: (weighted_metric_sums[key] / total_goal_weight if total_goal_weight > 0 else 0.0)
-                for key in WEIGHTED_METRIC_NAMES
-            }
-            episodes_seen = episodes_done + 1
+            _update_metric_accumulator(
+                all_metrics,
+                metrics,
+                goal_weight=goal_weight,
+                truncated=bool(not done),
+            )
+            if scene_name not in scene_metrics:
+                scene_metrics[scene_name] = _new_metric_accumulator()
+            _update_metric_accumulator(
+                scene_metrics[scene_name],
+                metrics,
+                goal_weight=goal_weight,
+                truncated=bool(not done),
+            )
+
+            episodes_done = int(all_metrics["episodes_done"])
+            episodes_truncated = int(all_metrics["episodes_truncated"])
+            running_weighted_mean = _weighted_metrics_from_accumulator(all_metrics)
             running_logged_metrics = dict(running_weighted_mean)
             for key in RUNNING_MEAN_METRIC_NAMES:
-                if key in sum_metrics:
-                    running_logged_metrics[key] = sum_metrics[key] / float(episodes_seen)
+                if key in all_metrics["sum_metrics"]:
+                    running_logged_metrics[key] = all_metrics["sum_metrics"][key] / float(episodes_done)
 
             row = {
                 "episode_index": episode_index,
                 "episode_id": str(getattr(episode, "episode_id", "")),
+                "episode_uid": episode_uid,
+                "scene": scene_name,
                 "scene_id": str(getattr(episode, "scene_id", "")),
                 "steps": int(step_idx),
                 "truncated": bool(not done),
@@ -347,9 +593,9 @@ def main() -> None:
             episode_writer.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
             episode_writer.flush()
             episode_metric_writer.write(
-                "[episode {idx}] id={eid} agent_episode_distance_m={agent} reference_distance_m={ref} metrics={metrics}\n".format(
+                "[episode {idx}] uid={uid} agent_episode_distance_m={agent} reference_distance_m={ref} metrics={metrics}\n".format(
                     idx=episode_index,
-                    eid=row["episode_id"],
+                    uid=row["episode_uid"],
                     agent=(
                         "{:.3f}".format(agent_episode_distance_m)
                         if agent_episode_distance_m is not None
@@ -365,20 +611,19 @@ def main() -> None:
             )
             episode_metric_writer.flush()
             running_metric_writer.write(
-                "[episode {idx}] id={eid} weighted_mean={metrics}\n".format(
+                "[episode {idx}] uid={uid} weighted_mean={metrics}\n".format(
                     idx=episode_index,
-                    eid=row["episode_id"],
+                    uid=row["episode_uid"],
                     metrics=json.dumps(running_logged_metrics, sort_keys=True),
                 )
             )
             running_metric_writer.flush()
 
-            episodes_done += 1
             if episode_index % max(1, args.print_every) == 0:
                 print(
-                    "[episode {idx}] id={eid} steps={steps} truncated={tr} goals={goals} metrics={metrics}".format(
+                    "[episode {idx}] uid={uid} steps={steps} truncated={tr} goals={goals} metrics={metrics}".format(
                         idx=episode_index,
-                        eid=row["episode_id"],
+                        uid=row["episode_uid"],
                         steps=row["steps"],
                         tr=row["truncated"],
                         goals=goal_summary,
@@ -393,6 +638,7 @@ def main() -> None:
                     fps = int(round(1.0 / step_time)) if step_time > 1e-6 else 4
                     fps = max(1, fps)
                 video_name = "episode_{}_id_{}".format(episode_index, row["episode_id"])
+                scene_video_dir = os.path.join(str(args.video_dir), scene_name)
                 if args.video_audio:
                     if len(audios) == 0:
                         raise RuntimeError(
@@ -420,14 +666,14 @@ def main() -> None:
                     )
                     images_to_video_with_audio(
                         frames,
-                        str(args.video_dir),
+                        scene_video_dir,
                         video_name,
                         muxed_audios,
                         cfg.SIMULATOR.AUDIO.RIR_SAMPLING_RATE,
                         fps=int(fps),
                     )
                 else:
-                    images_to_video(frames, str(args.video_dir), video_name, fps=int(fps))
+                    images_to_video(frames, scene_video_dir, video_name, fps=int(fps))
 
     episode_writer.close()
     episode_metric_writer.close()
@@ -435,18 +681,63 @@ def main() -> None:
     policy.close()
     env.close()
 
+    episodes_done = int(all_metrics["episodes_done"])
+    episodes_truncated = int(all_metrics["episodes_truncated"])
     if episodes_done == 0:
         print("No episodes evaluated.")
         return
 
-    mean_metrics = {k: v / float(episodes_done) for k, v in sum_metrics.items()}
+    mean_metrics = _mean_metrics_from_accumulator(all_metrics)
+    weighted_mean_metrics = _weighted_metrics_from_accumulator(all_metrics)
+    scene_summaries: List[Dict[str, Any]] = []
+    for scene_name in scene_order:
+        accumulator = scene_metrics.get(scene_name)
+        if accumulator is None or int(accumulator["episodes_done"]) <= 0:
+            continue
+        scene_summary = {
+            "scene": scene_name,
+            "episodes": int(accumulator["episodes_done"]),
+            "truncated_episodes": int(accumulator["episodes_truncated"]),
+            "mean_metrics": _mean_metrics_from_accumulator(accumulator),
+            "weighted_mean_metrics": _weighted_metrics_from_accumulator(accumulator),
+        }
+        scene_summaries.append(scene_summary)
+
+    with open(scene_metric_txt, "w", encoding="utf-8") as handle:
+        for scene_summary in scene_summaries:
+            handle.write(json.dumps(scene_summary, ensure_ascii=False, sort_keys=True) + "\n")
+
+    with open(scene_mean_log, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "task_type": str(cfg.TASK.TYPE),
+                "dataset_path": str(cfg.DATASET.DATA_PATH),
+                "policy": str(args.policy),
+                "scene_range_label": scene_range_label,
+                "scene_range_start": int(scene_range_start),
+                "scene_range_end": int(scene_range_end),
+                "selected_scenes": list(selected_scene_names),
+                "scenes": scene_summaries,
+            },
+            handle,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+
     summary = {
         "episodes": int(episodes_done),
         "truncated_episodes": int(episodes_truncated),
         "task_type": str(cfg.TASK.TYPE),
         "dataset_path": str(cfg.DATASET.DATA_PATH),
         "policy": str(args.policy),
+        "scene_range_label": scene_range_label,
+        "scene_range_start": int(scene_range_start),
+        "scene_range_end": int(scene_range_end),
+        "selected_scenes": list(selected_scene_names),
         "mean_metrics": mean_metrics,
+        "weighted_mean_metrics": weighted_mean_metrics,
+        "scene_mean_log": scene_mean_log,
     }
 
     with open(args.mean_log, "w", encoding="utf-8") as handle:
@@ -457,8 +748,10 @@ def main() -> None:
     print("Mean metrics: {}".format(json.dumps(mean_metrics, sort_keys=True)))
     print("Episode log: {}".format(args.episode_log))
     print("Mean log: {}".format(args.mean_log))
+    print("Scene mean log: {}".format(scene_mean_log))
     print("Episode metric txt: {}".format(episode_metric_txt))
     print("Running mean txt: {}".format(running_metric_txt))
+    print("Scene metric txt: {}".format(scene_metric_txt))
 
 
 if __name__ == "__main__":

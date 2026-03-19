@@ -14,7 +14,9 @@ habitat_config_path: "configs/omni-long/mp3d/omni-long_semantic_audio.yaml"
 # Lifelong task controls
 task_type: "OmniLongSemanticAudioNav"
 goal_order_mode: "ordered"  # ordered / unordered
-num_episodes: 50
+# scene_start_index: 0  # inclusive scene index in sorted scene list
+# scene_end_index: 11   # exclusive scene index in sorted scene list
+# num_episodes: null  # omit/leave null to eval all selected val episodes
 print_every: 1
 
 # Policy (pluggable)
