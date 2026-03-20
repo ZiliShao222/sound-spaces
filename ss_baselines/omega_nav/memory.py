@@ -7,7 +7,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence
 import numpy as np
 
 from ss_baselines.omega_nav.perception.base import GoalSpec, PerceptionOutput, SemanticMapState
-from ss_baselines.omega_nav.utils import as_serializable, ensure_vec3
+from ss_baselines.omega_nav.utils import as_serializable, ensure_vec3, extract_pose, pose_to_position
 
 
 @dataclass
@@ -88,6 +88,7 @@ class HierarchicalMemory:
         *,
         step_index: int,
         env: Any,
+        observations: Optional[Dict[str, Any]] = None,
         perception: PerceptionOutput,
         pending_goal_ids: Sequence[str],
         order_mode: str,
@@ -123,10 +124,20 @@ class HierarchicalMemory:
                     step_index=step_index,
                 )
 
-        self._decay_nearby_entries(env, step_index)
+        self._decay_nearby_entries(env, step_index, observations=observations)
 
-    def _decay_nearby_entries(self, env: Any, step_index: int) -> None:
-        agent_position = np.asarray(env.sim.get_agent_state().position, dtype=np.float32)
+    def _decay_nearby_entries(
+        self,
+        env: Any,
+        step_index: int,
+        observations: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if env is not None and hasattr(env, "sim"):
+            agent_position = np.asarray(env.sim.get_agent_state().position, dtype=np.float32)
+        else:
+            agent_position = pose_to_position(extract_pose(observations))
+        if agent_position is None:
+            return
         for goal_id, entries in list(self._episodic_memory.items()):
             updated: List[EpisodicMemoryEntry] = []
             for entry in entries:

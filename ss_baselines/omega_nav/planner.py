@@ -7,7 +7,14 @@ import numpy as np
 
 from ss_baselines.omega_nav.memory import EpisodicMemoryEntry, HierarchicalMemory
 from ss_baselines.omega_nav.perception.base import GoalSpec, PerceptionOutput
-from ss_baselines.omega_nav.utils import as_serializable, coarse_direction_from_angle, relative_bearing_deg
+from ss_baselines.omega_nav.utils import (
+    as_serializable,
+    coarse_direction_from_angle,
+    extract_pose,
+    pose_to_position,
+    relative_bearing_deg,
+    relative_bearing_from_pose_deg,
+)
 
 
 @dataclass
@@ -52,14 +59,21 @@ class OmegaLLMPlanner:
         env: Any,
         episode: Any,
         hint: Optional[EpisodicMemoryEntry],
+        observations: Optional[Dict[str, Any]] = None,
     ) -> Optional[float]:
         if hint is None or hint.position is None:
             return None
-        current = np.asarray(env.sim.get_agent_state().position, dtype=np.float32)
-        distance = env.sim.geodesic_distance(current, [np.asarray(hint.position, dtype=np.float32)], episode)
-        if distance is None or not np.isfinite(distance):
+        target = np.asarray(hint.position, dtype=np.float32)
+        if env is not None and hasattr(env, "sim"):
+            current = np.asarray(env.sim.get_agent_state().position, dtype=np.float32)
+            distance = env.sim.geodesic_distance(current, [target], episode)
+            if distance is None or not np.isfinite(distance):
+                return None
+            return float(distance)
+        current = pose_to_position(extract_pose(observations))
+        if current is None:
             return None
-        return float(distance)
+        return float(np.linalg.norm((target - current)[[0, 2]]))
 
     def _observed_distance(
         self,
@@ -68,6 +82,7 @@ class OmegaLLMPlanner:
         goal: GoalSpec,
         perception: PerceptionOutput,
         memory: HierarchicalMemory,
+        observations: Optional[Dict[str, Any]] = None,
     ) -> Optional[float]:
         visual = perception.visual_match(goal.goal_id)
         if visual is not None and visual.estimated_distance_m is not None:
@@ -77,7 +92,7 @@ class OmegaLLMPlanner:
         if audio is not None and audio.distance_m is not None:
             return float(audio.distance_m)
 
-        return self._hint_distance(env, episode, memory.best_hint(goal.goal_id))
+        return self._hint_distance(env, episode, memory.best_hint(goal.goal_id), observations=observations)
 
     def _submit_candidate(
         self,
@@ -88,6 +103,7 @@ class OmegaLLMPlanner:
         memory: HierarchicalMemory,
         candidate_goal_ids: Sequence[str],
         submit_distance_m: float,
+        observations: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         winner = None
         winner_distance = None
@@ -114,7 +130,7 @@ class OmegaLLMPlanner:
             audio_distance = audio.distance_m
             if audio_distance is not None and float(audio_distance) > float(max(submit_distance_m, self._audio_submit_distance_cap)):
                 continue
-            hint_distance = self._hint_distance(env, episode, memory.best_hint(goal_id))
+            hint_distance = self._hint_distance(env, episode, memory.best_hint(goal_id), observations=observations)
             effective_distance = float(audio_distance) if audio_distance is not None else hint_distance
             if winner_distance is None or effective_distance is None or float(effective_distance) < float(winner_distance):
                 winner = goal_id
@@ -128,6 +144,7 @@ class OmegaLLMPlanner:
         goal: GoalSpec,
         perception: PerceptionOutput,
         memory: HierarchicalMemory,
+        observations: Optional[Dict[str, Any]] = None,
     ) -> float:
         score = 0.0
         visual = perception.visual_match(goal.goal_id)
@@ -146,7 +163,7 @@ class OmegaLLMPlanner:
         if hint is not None:
             score += self._hint_bonus * float(hint.confidence)
 
-        distance = self._observed_distance(env, episode, goal, perception, memory)
+        distance = self._observed_distance(env, episode, goal, perception, memory, observations=observations)
         if distance is not None:
             score -= self._distance_penalty * float(distance)
         return float(score)
@@ -164,6 +181,7 @@ class OmegaLLMPlanner:
         *,
         env: Any,
         episode: Any,
+        observations: Optional[Dict[str, Any]] = None,
         goal_specs: Sequence[GoalSpec],
         perception: PerceptionOutput,
         memory: HierarchicalMemory,
@@ -186,6 +204,7 @@ class OmegaLLMPlanner:
             memory,
             candidate_submit_ids,
             submit_distance,
+            observations=observations,
         )
         if submit_goal_id is not None:
             reasoning = f"{submit_goal_id} 已进入可提交范围，优先执行提交。"
@@ -215,13 +234,21 @@ class OmegaLLMPlanner:
                     goal_specs_by_id[next_goal_id],
                     perception,
                     memory,
+                    observations=observations,
                 )
         else:
             for goal_id in pending_goal_ids:
                 goal = goal_specs_by_id.get(goal_id)
                 if goal is None:
                     continue
-                goal_scores[goal_id] = self._goal_score(env, episode, goal, perception, memory)
+                goal_scores[goal_id] = self._goal_score(
+                    env,
+                    episode,
+                    goal,
+                    perception,
+                    memory,
+                    observations=observations,
+                )
             next_goal_id = max(goal_scores, key=goal_scores.get) if goal_scores else None
 
         if next_goal_id is None:
@@ -257,11 +284,14 @@ class OmegaLLMPlanner:
             action = "navigate_to_hint"
             target_positions = self._hint_target(hint)
             if hint.position is not None:
-                angle_deg = relative_bearing_deg(
-                    np.asarray(env.sim.get_agent_state().position, dtype=np.float32),
-                    env.sim.get_agent_state().rotation,
-                    np.asarray(hint.position, dtype=np.float32),
-                )
+                if env is not None and hasattr(env, "sim"):
+                    angle_deg = relative_bearing_deg(
+                        np.asarray(env.sim.get_agent_state().position, dtype=np.float32),
+                        env.sim.get_agent_state().rotation,
+                        np.asarray(hint.position, dtype=np.float32),
+                    )
+                else:
+                    angle_deg = relative_bearing_from_pose_deg(extract_pose(observations), np.asarray(hint.position, dtype=np.float32))
                 direction = coarse_direction_from_angle(angle_deg)
             else:
                 direction = "forward"

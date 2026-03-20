@@ -6,9 +6,13 @@ import numpy as np
 
 from ss_baselines.omega_nav.perception.base import SemanticMapState
 from ss_baselines.omega_nav.utils import (
+    extract_pose,
     extract_depth,
     grid_to_world,
     interpolate_grid_line,
+    pose_to_heading,
+    pose_to_position,
+    rotate_local_offset,
     rotate_vector,
     sector_free_space,
     world_to_grid,
@@ -39,8 +43,20 @@ class OracleDepthProcessor:
             self.reset(agent_position)
 
     def update(self, env: Any, observations: Dict[str, Any]) -> SemanticMapState:
-        agent_state = env.sim.get_agent_state()
-        agent_position = np.asarray(agent_state.position, dtype=np.float32)
+        agent_rotation = None
+        agent_heading = 0.0
+        if env is not None and hasattr(env, "sim"):
+            agent_state = env.sim.get_agent_state()
+            agent_position = np.asarray(agent_state.position, dtype=np.float32)
+            agent_rotation = getattr(agent_state, "rotation", None)
+        else:
+            pose = extract_pose(observations)
+            agent_position = pose_to_position(pose)
+            heading_value = pose_to_heading(pose)
+            if heading_value is not None:
+                agent_heading = float(heading_value)
+            if agent_position is None:
+                agent_position = np.zeros(3, dtype=np.float32)
         self._ensure_state(agent_position)
         assert self._occupancy is not None
         assert self._visited is not None
@@ -83,7 +99,10 @@ class OracleDepthProcessor:
                         ],
                         dtype=np.float32,
                     )
-                    world_endpoint = agent_position + rotate_vector(agent_state.rotation, local_endpoint)
+                    if agent_rotation is not None:
+                        world_endpoint = agent_position + rotate_vector(agent_rotation, local_endpoint)
+                    else:
+                        world_endpoint = agent_position + rotate_local_offset(agent_heading, local_endpoint)
                     endpoint_cell = world_to_grid(world_endpoint, self._origin_world, self._resolution_m, self._grid_size)
                     if endpoint_cell is None:
                         continue

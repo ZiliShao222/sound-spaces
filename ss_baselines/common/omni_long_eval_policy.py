@@ -7,10 +7,41 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
 
 import numpy as np
-from habitat.sims.habitat_simulator.actions import HabitatSimActions
-from habitat.utils.geometry_utils import quaternion_rotate_vector
 
-from soundspaces.tasks.shortest_path_follower import ShortestPathFollower
+
+STOP_ACTION_ID = 0
+MOVE_FORWARD_ACTION_ID = 1
+TURN_LEFT_ACTION_ID = 2
+TURN_RIGHT_ACTION_ID = 3
+
+
+def _quat_xyzw(rotation: Any) -> Tuple[float, float, float, float]:
+    if rotation is None:
+        return 0.0, 0.0, 0.0, 1.0
+    if isinstance(rotation, np.ndarray):
+        array = np.asarray(rotation, dtype=np.float32).reshape(-1)
+        if array.size >= 4:
+            return float(array[0]), float(array[1]), float(array[2]), float(array[3])
+        return 0.0, 0.0, 0.0, 1.0
+    if hasattr(rotation, "imag") and hasattr(rotation, "real"):
+        imag = np.asarray(rotation.imag, dtype=np.float32).reshape(-1)
+        if imag.size >= 3:
+            return float(imag[0]), float(imag[1]), float(imag[2]), float(rotation.real)
+    if all(hasattr(rotation, key) for key in ("x", "y", "z", "w")):
+        return float(rotation.x), float(rotation.y), float(rotation.z), float(rotation.w)
+    array = np.asarray(rotation, dtype=np.float32).reshape(-1)
+    if array.size >= 4:
+        return float(array[0]), float(array[1]), float(array[2]), float(array[3])
+    return 0.0, 0.0, 0.0, 1.0
+
+
+def quaternion_rotate_vector(rotation: Any, vector: Any) -> np.ndarray:
+    x_coord, y_coord, z_coord, w_coord = _quat_xyzw(rotation)
+    q_vec = np.asarray([x_coord, y_coord, z_coord], dtype=np.float32)
+    input_vec = np.asarray(vector, dtype=np.float32)
+    uv = np.cross(q_vec, input_vec)
+    uuv = np.cross(q_vec, uv)
+    return input_vec + 2.0 * (w_coord * uv + uuv)
 
 
 def _as_int_or_none(value: Any) -> Optional[int]:
@@ -75,13 +106,13 @@ def _sim_action_to_named_action(action: Any) -> Any:
     if action_id is None:
         return action
 
-    if action_id == int(HabitatSimActions.STOP):
+    if action_id == int(STOP_ACTION_ID):
         return _build_named_action("STOP")
-    if action_id == int(HabitatSimActions.MOVE_FORWARD):
+    if action_id == int(MOVE_FORWARD_ACTION_ID):
         return _build_named_action("MOVE_FORWARD")
-    if action_id == int(HabitatSimActions.TURN_LEFT):
+    if action_id == int(TURN_LEFT_ACTION_ID):
         return _build_named_action("TURN_LEFT")
-    if action_id == int(HabitatSimActions.TURN_RIGHT):
+    if action_id == int(TURN_RIGHT_ACTION_ID):
         return _build_named_action("TURN_RIGHT")
     return action
 
@@ -540,13 +571,15 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
         self._rng = np.random.default_rng(self._seed)
         self._goal_order_mode = _normalize_goal_order_mode(goal_order_mode)
         self._max_visibility_scan_turns = max(int(max_visibility_scan_turns), 1)
-        self._follower: Optional[ShortestPathFollower] = None
+        self._follower: Optional[Any] = None
         self._goal_signature: Optional[Any] = None
         self._goal_target_indices: Dict[Any, int] = {}
         self._goal_visibility_scan: Dict[Any, Dict[str, int]] = {}
         self._goal_blocked_target_indices: Dict[Any, set] = {}
 
     def _reset_follower(self, env: Any) -> None:
+        from soundspaces.tasks.shortest_path_follower import ShortestPathFollower
+
         self._follower = ShortestPathFollower(
             sim=env.sim,
             goal_radius=self._follower_goal_radius,
@@ -674,10 +707,7 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
         if self._follower is None:
             self._reset_follower(env)
         assert self._follower is not None
-        try:
-            return self._follower.get_next_action(target_position)
-        except Exception:
-            return None
+        return self._follower.get_next_action(target_position)
 
     def act(
         self,
@@ -746,7 +776,7 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
             action = self._follower_action_for_target(env, target_position)
             if action is None:
                 tried_indices.append(target_index)
-            elif int(action) == int(HabitatSimActions.STOP):
+            elif int(action) == int(STOP_ACTION_ID):
                 if visible and self._reached_goal(env, episode, goal):
                     self._clear_goal_scan_state(goal_signature)
                     self._goal_target_indices.pop(goal_signature, None)

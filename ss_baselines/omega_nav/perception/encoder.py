@@ -9,7 +9,7 @@ from ss_baselines.omega_nav.perception.clap_module import OracleCLAPMatcher
 from ss_baselines.omega_nav.perception.clip_module import OracleCLIPDetector
 from ss_baselines.omega_nav.perception.depth_module import OracleDepthProcessor
 from ss_baselines.omega_nav.perception.vlm_module import OracleVLMDescriptor
-from ss_baselines.omega_nav.utils import image_histogram_embedding, normalize_text
+from ss_baselines.omega_nav.utils import extract_pose, image_histogram_embedding, normalize_text, pose_to_position
 
 
 class PerceptionEncoder:
@@ -22,10 +22,17 @@ class PerceptionEncoder:
         self._vlm = OracleVLMDescriptor(config.get("visual", {}))
         self._prepared_goal_ids: Tuple[str, ...] = ()
 
-    def reset(self, env: Optional[Any] = None, goal_specs: Optional[Sequence[GoalSpec]] = None) -> None:
+    def reset(
+        self,
+        env: Optional[Any] = None,
+        goal_specs: Optional[Sequence[GoalSpec]] = None,
+        observations: Optional[Dict[str, Any]] = None,
+    ) -> None:
         agent_position = None
         if env is not None and hasattr(env, "sim"):
             agent_position = np.asarray(env.sim.get_agent_state().position, dtype=np.float32)
+        elif observations is not None:
+            agent_position = pose_to_position(extract_pose(observations))
         self._depth.reset(agent_position)
         self._vlm.reset()
         self._prepared_goal_ids = ()
@@ -40,7 +47,10 @@ class PerceptionEncoder:
     ) -> List[GoalSpec]:
         goal_specs: List[GoalSpec] = []
         task_specs = list(getattr(episode, "tasks", []) or [])
-        episode_goal_count = len(list(getattr(episode, "goals", []) or []))
+        if hasattr(episode, "goal_count"):
+            episode_goal_count = int(getattr(episode, "goal_count") or 0)
+        else:
+            episode_goal_count = len(list(getattr(episode, "goals", []) or []))
         embedding_bins = max(int(self._goal_encoder_cfg.get("image_histogram_bins", 8)), 2)
 
         total = max(len(goal_payloads), len(task_specs), episode_goal_count)

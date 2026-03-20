@@ -17,6 +17,15 @@ def _named_action(action_name: str) -> Dict[str, str]:
     return {"action": str(action_name)}
 
 
+def _direction_action(direction: str) -> Dict[str, str]:
+    token = str(direction).strip().lower()
+    if token == "left":
+        return _named_action("TURN_LEFT")
+    if token == "right":
+        return _named_action("TURN_RIGHT")
+    return _named_action("MOVE_FORWARD")
+
+
 def _normalize_goal_order_mode(value: Any) -> Optional[str]:
     if value is None:
         return None
@@ -69,6 +78,8 @@ class OmegaNavPolicy(LifelongEvalPolicy):
         goal_order_mode: Optional[Any] = None,
         config_path: Optional[str] = None,
         config_overrides: Optional[Dict[str, Any]] = None,
+        atomic_actions_only: bool = False,
+        use_local_navigator: bool = True,
         **_: Any,
     ):
         default_config_path = Path(__file__).resolve().parent / "configs" / "perception.yaml"
@@ -80,6 +91,8 @@ class OmegaNavPolicy(LifelongEvalPolicy):
         self._stop_action_name = str(stop_action_name or self._config.get("policy", {}).get("stop_action_name", "STOP"))
         self._submit_distance = float(submit_distance)
         self._goal_order_mode = _normalize_goal_order_mode(goal_order_mode)
+        self._atomic_actions_only = bool(atomic_actions_only)
+        self._use_local_navigator = bool(use_local_navigator) and not self._atomic_actions_only
 
         self._encoder = PerceptionEncoder(self._config)
         self._memory = HierarchicalMemory(self._config.get("memory", {}))
@@ -128,7 +141,7 @@ class OmegaNavPolicy(LifelongEvalPolicy):
         self._last_perception = None
         self._last_decision = None
         self._last_order_mode = _task_order_mode(env, override=self._goal_order_mode)
-        self._encoder.reset(env=env)
+        self._encoder.reset(env=env, observations=observations)
         self._navigator.reset()
 
     def act(
@@ -159,6 +172,7 @@ class OmegaNavPolicy(LifelongEvalPolicy):
         self._memory.update(
             step_index=int(context.step_index),
             env=env,
+            observations=observations,
             perception=perception,
             pending_goal_ids=pending_goal_ids,
             order_mode=order_mode,
@@ -169,6 +183,7 @@ class OmegaNavPolicy(LifelongEvalPolicy):
         decision = self._planner.decide(
             env=env,
             episode=episode,
+            observations=observations,
             goal_specs=self._goal_specs,
             perception=perception,
             memory=self._memory,
@@ -188,13 +203,16 @@ class OmegaNavPolicy(LifelongEvalPolicy):
             self._last_action_name = self._stop_action_name
             return _named_action(self._stop_action_name)
 
-        action = self._navigator.act(
-            env=env,
-            episode=episode,
-            target_positions=decision.target_positions,
-            target_signature=(str(decision.action), str(decision.next_goal)),
-            fallback_direction=decision.direction,
-        )
+        if self._use_local_navigator and env is not None and hasattr(env, "sim"):
+            action = self._navigator.act(
+                env=env,
+                episode=episode,
+                target_positions=decision.target_positions,
+                target_signature=(str(decision.action), str(decision.next_goal)),
+                fallback_direction=decision.direction,
+            )
+        else:
+            action = _direction_action(decision.direction)
         if isinstance(action, dict):
             self._last_action_name = str(action.get("action"))
         else:
@@ -214,8 +232,16 @@ class OmegaNavPolicy(LifelongEvalPolicy):
     ) -> None:
         task = getattr(env, "task", None) or getattr(env, "_task", None)
         order_mode = _task_order_mode(env, override=self._goal_order_mode)
-        if self._last_action_name == self._submit_action_name and task is not None and hasattr(task, "get_last_action_feedback"):
+        feedback = None
+        if isinstance(info, dict):
+            nested_feedback = info.get("feedback")
+            if isinstance(nested_feedback, dict):
+                feedback = nested_feedback
+            else:
+                feedback = info
+        if feedback is None and task is not None and hasattr(task, "get_last_action_feedback"):
             feedback = task.get_last_action_feedback()
+        if self._last_action_name == self._submit_action_name and isinstance(feedback, dict):
             found_goal = int(feedback.get("found_goal_index", -1)) if isinstance(feedback, dict) else -1
             if found_goal >= 0 and 0 <= found_goal < len(self._goal_specs):
                 goal_id = self._goal_specs[found_goal].goal_id

@@ -3,11 +3,14 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
-from habitat.sims.habitat_simulator.actions import HabitatSimActions
-
-from soundspaces.tasks.shortest_path_follower import ShortestPathFollower
 
 from ss_baselines.omega_nav.utils import coarse_direction_from_angle, relative_bearing_deg
+
+
+STOP_ACTION_ID = 0
+MOVE_FORWARD_ACTION_ID = 1
+TURN_LEFT_ACTION_ID = 2
+TURN_RIGHT_ACTION_ID = 3
 
 
 def _named_action(action_name: str) -> Dict[str, str]:
@@ -27,13 +30,13 @@ def _sim_action_to_named(action: Any) -> Any:
     if not isinstance(action, (int, np.integer)):
         return action
     action_id = int(action)
-    if action_id == int(HabitatSimActions.MOVE_FORWARD):
+    if action_id == int(MOVE_FORWARD_ACTION_ID):
         return _named_action("MOVE_FORWARD")
-    if action_id == int(HabitatSimActions.TURN_LEFT):
+    if action_id == int(TURN_LEFT_ACTION_ID):
         return _named_action("TURN_LEFT")
-    if action_id == int(HabitatSimActions.TURN_RIGHT):
+    if action_id == int(TURN_RIGHT_ACTION_ID):
         return _named_action("TURN_RIGHT")
-    if action_id == int(HabitatSimActions.STOP):
+    if action_id == int(STOP_ACTION_ID):
         return _named_action("STOP")
     return action
 
@@ -41,7 +44,7 @@ def _sim_action_to_named(action: Any) -> Any:
 class LocalNavigator:
     def __init__(self, config: Dict[str, Any]):
         self._follower_goal_radius = max(float(config.get("follower_goal_radius", 1e-3)), 1e-5)
-        self._follower: Optional[ShortestPathFollower] = None
+        self._follower: Optional[Any] = None
         self._target_signature: Optional[Tuple[str, str]] = None
 
     def reset(self) -> None:
@@ -49,6 +52,8 @@ class LocalNavigator:
         self._target_signature = None
 
     def _ensure_follower(self, env: Any) -> None:
+        from soundspaces.tasks.shortest_path_follower import ShortestPathFollower
+
         if self._follower is None:
             self._follower = ShortestPathFollower(
                 sim=env.sim,
@@ -84,6 +89,9 @@ class LocalNavigator:
         fallback_direction: str,
     ) -> Any:
         if not target_positions:
+            return _direction_action(fallback_direction)
+
+        if env is None or not hasattr(env, "sim"):
             return _direction_action(fallback_direction)
 
         self._ensure_follower(env)

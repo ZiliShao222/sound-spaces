@@ -151,6 +151,67 @@ def ensure_vec3(value: Any) -> Optional[np.ndarray]:
     return array
 
 
+def extract_pose(observations: Optional[Dict[str, Any]]) -> Optional[np.ndarray]:
+    if not isinstance(observations, dict):
+        return None
+    for key in ("pose", "POSE_SENSOR", "pose_sensor"):
+        value = observations.get(key)
+        if value is None:
+            continue
+        pose = np.asarray(value, dtype=np.float32).reshape(-1)
+        if pose.size >= 3 and np.all(np.isfinite(pose[:3])):
+            return pose
+    return None
+
+
+def pose_to_position(pose: Any) -> Optional[np.ndarray]:
+    if pose is None:
+        return None
+    array = np.asarray(pose, dtype=np.float32).reshape(-1)
+    if array.size < 2 or not np.all(np.isfinite(array[:2])):
+        return None
+    return np.asarray([float(array[1]), 0.0, float(-array[0])], dtype=np.float32)
+
+
+def pose_to_heading(pose: Any) -> Optional[float]:
+    if pose is None:
+        return None
+    array = np.asarray(pose, dtype=np.float32).reshape(-1)
+    if array.size < 3 or not np.isfinite(float(array[2])):
+        return None
+    return float(array[2])
+
+
+def rotate_local_offset(heading_rad: float, vector: Sequence[float]) -> np.ndarray:
+    offset = np.asarray(vector, dtype=np.float32).reshape(3)
+    angle = float(heading_rad)
+    cos_angle = float(math.cos(angle))
+    sin_angle = float(math.sin(angle))
+    x_coord = float(offset[0]) * cos_angle + float(offset[2]) * sin_angle
+    z_coord = -float(offset[0]) * sin_angle + float(offset[2]) * cos_angle
+    return np.asarray([x_coord, float(offset[1]), z_coord], dtype=np.float32)
+
+
+def relative_bearing_from_pose_deg(pose: Any, target_position: Any) -> float:
+    agent_position = pose_to_position(pose)
+    heading_rad = pose_to_heading(pose)
+    target = ensure_vec3(target_position)
+    if agent_position is None or heading_rad is None or target is None:
+        return 0.0
+    delta = np.asarray(target, dtype=np.float32) - np.asarray(agent_position, dtype=np.float32)
+    delta[1] = 0.0
+    norm = float(np.linalg.norm(delta[[0, 2]]))
+    if norm <= 1e-6:
+        return 0.0
+    target_heading = float(math.atan2(float(delta[0]), float(-delta[2])))
+    angle = float(np.degrees(target_heading - float(heading_rad)))
+    while angle <= -180.0:
+        angle += 360.0
+    while angle > 180.0:
+        angle -= 360.0
+    return angle
+
+
 def normalize_text(value: Any) -> str:
     if value is None:
         return ""
