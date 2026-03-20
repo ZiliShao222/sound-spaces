@@ -91,3 +91,83 @@ SoundSpaces is CC-BY-4.0 licensed, as found in the [LICENSE](LICENSE) file.
 The trained models and the task datasets are considered data derived from the correspondent scene datasets.
 - Matterport3D based task datasets and trained models are distributed with [Matterport3D Terms of Use](http://kaldir.vc.in.tum.de/matterport/MP_TOS.pdf) and under [CC BY-NC-SA 3.0 US license](https://creativecommons.org/licenses/by-nc-sa/3.0/us/).
 - Replica based task datasets, the code for generating such datasets, and trained models are under [Replica license](https://github.com/facebookresearch/Replica-Dataset/blob/master/LICENSE).
+
+## Omni-Long Notes
+
+### Ordered mode
+
+- The agent must find multiple goals in a fixed order.
+- If a task contains `N` goals, the agent can only issue `N-1` `submit` actions. The `N`-th `submit` is treated as `stop`.
+- Every `submit` or `stop` receives environment feedback indicating whether the current target is found.
+- We also use shaped rewards and they can be redefined as needed:
+  - each time step gives `-0.1`
+  - `submit` and `stop` receive a large penalty to discourage random submission
+  - decreasing geodesic distance gives positive reward, increasing distance gives negative reward
+  - finding a goal gives a large positive reward
+- A goal is considered found when:
+  - the Euclidean distance between the agent sensor and the goal surface is less than `1m`
+  - the goal also appears in the semantic sensor
+
+### Unordered mode
+
+- The agent can find multiple goals in any order.
+- If a task contains `N` goals, the agent can only issue `N-1` `submit` actions. The `N`-th `submit` is treated as `stop`.
+- On each `submit`, the environment checks whether there exists any goal within `1m` of the agent.
+- If such a nearby goal exists, the environment further checks whether that goal is also visible in the semantic sensor.
+
+### Evaluation modes
+
+#### Single-process mode
+
+This is mainly used by oracle baselines. Since the policy needs to call the environment shortest-path API internally, the policy and environment cannot be separated.
+
+```bash
+python scripts/omni_long_eval.py \
+  --policy oracle_shortest_submit \
+  --eval-config configs/omni-long/mp3d/eval_omni-long.yaml
+```
+
+#### Split env / policy mode
+
+In this mode, the environment and the policy run as two local processes.
+
+1. Start the environment server:
+
+```bash
+python scripts/env_server.py \
+  --eval-config configs/omni-long/mp3d/eval_omni-long.yaml \
+  --bind tcp://*:5555
+```
+
+2. Start the policy client:
+
+```bash
+python scripts/policy_client.py \
+  --connect tcp://127.0.0.1:5555 \
+  --policy omega_nav \
+  --policy-kwargs '{"config_path":"ss_baselines/omega_nav/configs/perception.yaml"}' \
+  --video
+```
+
+### How to extend baselines
+
+#### RL-based baselines
+
+- If you need online BC-assisted training, it is more suitable to use the single-process mode.
+- You can add new RL baselines under `ss_baselines` and follow the existing Omni-Long training pipeline.
+- A useful reference script is `scripts/train_omni_long_mp3d_bc.sh`.
+
+#### Module-based baselines
+
+- Prefer evaluation directly on the validation split without extra training when possible.
+- A good reference implementation is `ss_baselines/omega_nav`.
+- In particular, the main logic lives in `OmegaNavPolicy`, especially its `act` and `observe` functions in `ss_baselines/omega_nav/policy.py`.
+
+### TODO
+
+1. Add two RL baselines, referencing GOAT and SAVI / ENMuS:
+   - one baseline without audio, similar to GOAT
+   - one baseline without text / image, similar to SAVI or ENMuS
+2. Add two module-based baselines:
+   - one GOAT-style baseline without audio
+   - one baseline without text / image; this may need a custom design. The RILA paper can be used as a reference: [RILA: Reflective and Imaginative Language Agent for Zero-Shot Semantic Audio-Visual Navigation](https://openaccess.thecvf.com/content/CVPR2024/papers/Yang_RILA_Reflective_and_Imaginative_Language_Agent_for_Zero-Shot_Semantic_Audio-Visual_CVPR_2024_paper.pdf)
