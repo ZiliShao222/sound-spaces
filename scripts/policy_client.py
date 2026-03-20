@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
-import os
 import signal
 import time
 from types import SimpleNamespace
@@ -20,8 +19,8 @@ from ss_baselines.common.omni_long_eval_policy import (
     LifelongEvalPolicy,
     build_lifelong_eval_context,
     build_lifelong_eval_policy,
+    filter_policy_observations,
 )
-from ss_baselines.common.utils import images_to_video_with_audio, observations_to_image
 
 
 ARRAY_MARKER = "__ndarray__"
@@ -129,84 +128,8 @@ def _obs_to_torch(value: Any, device: torch.device) -> Any:
     return value
 
 
-def _normalize_action(value: Any) -> Any:
-    if isinstance(value, (dict, str, int, np.integer)):
-        return value
-    if isinstance(value, np.ndarray):
-        if value.size == 1:
-            return int(value.reshape(-1)[0].item())
-        return int(np.asarray(value).reshape(-1).argmax())
-    if torch.is_tensor(value):
-        tensor = value.detach()
-        if tensor.numel() == 1:
-            return int(tensor.item())
-        return int(torch.argmax(tensor.reshape(-1)).item())
-    if isinstance(value, (list, tuple)) and len(value) == 1:
-        return _normalize_action(value[0])
-    raise RuntimeError(f"Unsupported action output type: {type(value)!r}")
-
-
 def _episode_object(payload: Dict[str, Any]) -> SimpleNamespace:
     return SimpleNamespace(**payload)
-
-
-def _resolve_video_dir(args: argparse.Namespace, server_run_base_dir: Optional[str]) -> str:
-    if args.video_dir is not None and str(args.video_dir).strip():
-        return str(args.video_dir)
-    if server_run_base_dir is not None and str(server_run_base_dir).strip():
-        return os.path.join(str(server_run_base_dir), "videos")
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    return os.path.join("results", "policy_videos", timestamp)
-
-
-def _maybe_save_episode_video(
-    *,
-    args: argparse.Namespace,
-    episode: Any,
-    episode_index: int,
-    frames: Sequence[np.ndarray],
-    audios: Sequence[np.ndarray],
-    audio_sample_rate: int,
-    scene_name: str,
-    server_run_base_dir: Optional[str],
-    step_time: float,
-) -> Optional[str]:
-    if not bool(args.video) or len(frames) == 0:
-        return None
-
-    video_root = _resolve_video_dir(args, server_run_base_dir)
-    scene_video_dir = os.path.join(video_root, str(scene_name))
-    os.makedirs(scene_video_dir, exist_ok=True)
-    fps = args.video_fps
-    if fps is None:
-        fps = int(round(1.0 / float(step_time))) if float(step_time) > 1e-6 else 4
-        fps = max(1, int(fps))
-
-    episode_id = str(getattr(episode, "episode_id", ""))
-    video_name = f"episode_{int(episode_index)}_id_{episode_id}"
-    if len(audios) == 0:
-        raise RuntimeError("video enabled but no audio frames were collected")
-    muxed_audios = list(audios)
-    raw_peak = 0.0
-    for clip in audios:
-        if np.asarray(clip).size > 0:
-            raw_peak = max(raw_peak, float(np.max(np.abs(np.asarray(clip, dtype=np.float32)))))
-    if bool(args.video_audio_normalize) and raw_peak > 0.0:
-        gain = min(float(args.video_audio_max_gain), 0.8 / raw_peak)
-        if abs(gain - 1.0) > 1e-6:
-            muxed_audios = [
-                np.clip(np.asarray(clip, dtype=np.float32) * gain, -1.0, 1.0)
-                for clip in audios
-            ]
-    images_to_video_with_audio(
-        list(frames),
-        scene_video_dir,
-        video_name,
-        list(muxed_audios),
-        int(audio_sample_rate),
-        fps=int(fps),
-    )
-    return os.path.join(scene_video_dir, f"{video_name}.mp4")
 
 
 class PolicyAdapter:
@@ -224,17 +147,6 @@ class PolicyAdapter:
     ) -> Any:
         raise NotImplementedError
 
-    def observe(
-        self,
-        *,
-        episode: Any,
-        observations: Dict[str, Any],
-        reward: Optional[float],
-        done: bool,
-        info: Optional[Dict[str, Any]],
-    ) -> None:
-        return None
-
     def close(self) -> None:
         return None
 
@@ -244,8 +156,14 @@ class LifelongPolicyAdapter(PolicyAdapter):
         self._policy = build_lifelong_eval_policy(policy_name, **policy_kwargs)
 
     def reset(self, *, episode: Any, observations: Dict[str, Any], goal_payloads: Sequence[Dict[str, Any]]) -> None:
-        del goal_payloads
         self._policy.reset(env=None, episode=episode, observations=observations)
+        self._policy.start_episode(
+            env=None,
+            episode=episode,
+            observations=observations,
+            goal_payloads=goal_payloads,
+            order_mode=getattr(episode, "goal_order_mode", None),
+        )
 
     def act(
         self,
@@ -256,27 +174,8 @@ class LifelongPolicyAdapter(PolicyAdapter):
         step_index: int,
         info: Optional[Dict[str, Any]],
     ) -> Any:
-        del info
-        context = build_lifelong_eval_context(step_index, goal_payloads=goal_payloads)
+        context = build_lifelong_eval_context(step_index, goal_payloads=goal_payloads, info=info)
         return self._policy.act(env=None, episode=episode, observations=observations, context=context)
-
-    def observe(
-        self,
-        *,
-        episode: Any,
-        observations: Dict[str, Any],
-        reward: Optional[float],
-        done: bool,
-        info: Optional[Dict[str, Any]],
-    ) -> None:
-        self._policy.observe(
-            env=None,
-            episode=episode,
-            observations=observations,
-            reward=reward,
-            done=done,
-            info=info,
-        )
 
     def close(self) -> None:
         self._policy.close()
@@ -327,25 +226,7 @@ class TorchModuleAdapter(PolicyAdapter):
                 )
             else:
                 output = self._model(obs_torch)
-        return _normalize_action(output)
-
-    def observe(
-        self,
-        *,
-        episode: Any,
-        observations: Dict[str, Any],
-        reward: Optional[float],
-        done: bool,
-        info: Optional[Dict[str, Any]],
-    ) -> None:
-        if hasattr(self._model, "observe"):
-            self._model.observe(
-                episode=episode,
-                observations=observations,
-                reward=reward,
-                done=done,
-                info=info,
-            )
+        return output
 
 
 def parse_args() -> argparse.Namespace:
@@ -361,11 +242,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument("--request-timeout-ms", type=int, default=-1)
     parser.add_argument("--linger-ms", type=int, default=0)
-    parser.add_argument("--video", default=False, action=argparse.BooleanOptionalAction)
-    parser.add_argument("--video-dir", type=str, default=None)
-    parser.add_argument("--video-fps", type=int, default=None)
-    parser.add_argument("--video-audio-normalize", default=True, action=argparse.BooleanOptionalAction)
-    parser.add_argument("--video-audio-max-gain", type=float, default=200.0)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -393,6 +269,7 @@ def build_adapter(args: argparse.Namespace) -> PolicyAdapter:
 def main() -> None:
     args = parse_args()
     adapter = build_adapter(args)
+    policy_name_for_filter = None if args.module_class else str(args.policy).strip().lower()
 
     context = zmq.Context.instance()
     socket = context.socket(zmq.REQ)
@@ -402,7 +279,6 @@ def main() -> None:
     should_stop = False
 
     def _handle_signal(signum: int, frame: Any) -> None:
-        del signum, frame
         nonlocal should_stop
         should_stop = True
 
@@ -437,11 +313,9 @@ def main() -> None:
         episode = _episode_object(reply.get("episode", {}))
         observations = reply.get("observations")
         goal_payloads = reply.get("goal_payloads", [])
-        server_run_base_dir = str(reply.get("run_base_dir", "")).strip() or None
-        step_time = float(reply.get("step_time", 0.25))
-        audio_sample_rate = int(reply.get("audio_sample_rate", 16000))
         if not isinstance(observations, dict):
             raise RuntimeError("episode_start observations must be a dict")
+        observations = filter_policy_observations(policy_name_for_filter, observations)
 
         adapter.reset(episode=episode, observations=observations, goal_payloads=goal_payloads)
         done = False
@@ -449,8 +323,6 @@ def main() -> None:
         info: Optional[Dict[str, Any]] = None
         step_index = 0
         step_reply: Dict[str, Any] = {}
-        frames: List[np.ndarray] = []
-        audios: List[np.ndarray] = []
         episode_interrupted = False
         while not done and not should_stop:
             action = adapter.act(
@@ -460,7 +332,7 @@ def main() -> None:
                 step_index=step_index,
                 info=info,
             )
-            send_message(socket, {"op": "action", "action": _normalize_action(action)})
+            send_message(socket, {"op": "action", "action": action})
             step_reply = recv_message(
                 socket,
                 should_stop=lambda: should_stop,
@@ -477,30 +349,13 @@ def main() -> None:
                 raise RuntimeError(f"Unexpected server op during stepping: {step_op}")
 
             observations = step_reply.get("observations")
+            if not isinstance(observations, dict):
+                raise RuntimeError("step observations must be a dict")
+            observations = filter_policy_observations(policy_name_for_filter, observations)
             reward = step_reply.get("reward")
             done = bool(step_reply.get("done", False))
             info = step_reply.get("info") if isinstance(step_reply.get("info"), dict) else None
             step_index = int(step_reply.get("step_index", step_index + 1))
-
-            if bool(args.video):
-                frame_info = dict(info or {})
-                metrics = step_reply.get("metrics")
-                if isinstance(metrics, dict):
-                    frame_info.update(metrics)
-                frames.append(observations_to_image(observations, frame_info))
-                if "audiogoal" not in observations:
-                    raise RuntimeError(
-                        "video enabled but observation missing 'audiogoal'"
-                    )
-                audios.append(np.asarray(observations["audiogoal"], dtype=np.float32))
-
-            adapter.observe(
-                episode=episode,
-                observations=observations,
-                reward=reward,
-                done=done,
-                info=info,
-            )
 
             if args.verbose:
                 debug = {
@@ -512,17 +367,7 @@ def main() -> None:
                 }
                 print(json.dumps(debug, ensure_ascii=False))
 
-        video_path = _maybe_save_episode_video(
-            args=args,
-            episode=episode,
-            episode_index=int(reply.get("episode_index", episodes_done)),
-            frames=frames,
-            audios=audios,
-            audio_sample_rate=audio_sample_rate,
-            scene_name=str(reply.get("scene", getattr(episode, "scene_name", "scene"))),
-            server_run_base_dir=server_run_base_dir,
-            step_time=step_time,
-        )
+        video_path = step_reply.get("video_path")
         if video_path is not None:
             print(f"[policy_client] saved video: {video_path}")
 

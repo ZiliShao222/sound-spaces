@@ -14,7 +14,7 @@ import soundspaces  # noqa: F401 - register datasets/tasks/sims
 from habitat.utils.visualizations.utils import images_to_video
 from PIL import Image
 
-from ss_baselines.common.omni_long_eval_policy import build_lifelong_eval_context
+from ss_baselines.common.omni_long_eval_policy import build_lifelong_eval_context, filter_policy_observations
 from ss_baselines.common.utils import observations_to_image, images_to_video_with_audio
 from soundspaces.tasks.omni_long_eval_utils import (
     _all_scene_names,
@@ -130,26 +130,6 @@ def _spl_diagnostics(env: habitat.Env) -> Tuple[Optional[float], Optional[float]
     return agent_episode_distance_m, reference_distance_m
 
 
-def _is_submit_action(action: Any, submit_action_name: str) -> bool:
-    action_name = str(submit_action_name).strip().upper()
-    if isinstance(action, dict):
-        value = action.get("action")
-        return isinstance(value, str) and value.strip().upper() == action_name
-    if isinstance(action, str):
-        return action.strip().upper() == action_name
-    return False
-
-
-def _is_stop_action(action: Any, stop_action_name: str) -> bool:
-    action_name = str(stop_action_name).strip().upper()
-    if isinstance(action, dict):
-        value = action.get("action")
-        return isinstance(value, str) and value.strip().upper() == action_name
-    if isinstance(action, str):
-        return action.strip().upper() == action_name
-    return False
-
-
 def _observation_image(observations: Optional[Dict[str, Any]], *keys: str) -> Optional[np.ndarray]:
     if not isinstance(observations, dict):
         return None
@@ -252,6 +232,7 @@ def main() -> None:
 
     env = habitat.Env(config=cfg)
     policy = _build_policy(args)
+    policy_name_for_filter = str(args.policy).strip().lower()
 
     all_scene_names = _all_scene_names(list(env.episodes))
     scene_range_label = _scene_subset_label(all_scene_names, args)
@@ -375,7 +356,15 @@ def main() -> None:
                 goal_input_summaries.append(goal_input_summary)
 
             context_goal_payloads = tuple(goal_payloads)
+            observations = filter_policy_observations(policy_name_for_filter, observations)
             policy.reset(env=env, episode=episode, observations=observations)
+            policy.start_episode(
+                env=env,
+                episode=episode,
+                observations=observations,
+                goal_payloads=context_goal_payloads,
+                order_mode=getattr(episode, "goal_order_mode", None),
+            )
 
             print(
                 "[policy_task] episode={idx} id={eid} task={task}".format(
@@ -389,6 +378,7 @@ def main() -> None:
 
             done = False
             step_idx = 0
+            info = None
             frames = []
             audios = []
             audio_peak_max = 0.0
@@ -399,6 +389,7 @@ def main() -> None:
                 context = build_lifelong_eval_context(
                     step_idx,
                     goal_payloads=context_goal_payloads,
+                    info=info,
                 )
                 action = policy.act(
                     env=env,
@@ -406,19 +397,17 @@ def main() -> None:
                     observations=observations,
                     context=context,
                 )
+                env_action = {"action": {0: "STOP", 1: "MOVE_FORWARD", 2: "TURN_LEFT", 3: "TURN_RIGHT", 4: "LIFELONG_SUBMIT"}[int(action)]}
 
                 should_dump_action_obs = bool(
                     args.save_action_observations
                     and action_observation_dir is not None
-                    and (
-                        _is_submit_action(action, args.submit_action_name)
-                        or _is_stop_action(action, "STOP")
-                    )
+                    and int(action) in {0, 4}
                 )
                 action_name = None
-                if _is_submit_action(action, args.submit_action_name):
+                if int(action) == 4:
                     action_name = str(args.submit_action_name)
-                elif _is_stop_action(action, "STOP"):
+                elif int(action) == 0:
                     action_name = "STOP"
 
                 action_snapshot: Dict[str, Any] = {}
@@ -434,8 +423,10 @@ def main() -> None:
                         observations=observations,
                     )
 
-                observations = env.step(action)
+                observations = env.step(env_action)
+                observations = filter_policy_observations(policy_name_for_filter, observations)
                 done = bool(env.episode_over)
+                info = task.get_last_action_feedback() if task is not None and hasattr(task, "get_last_action_feedback") else None
 
                 if should_dump_action_obs and action_name is not None:
                     action_snapshot["after"] = _save_action_observation_bundle(
@@ -494,14 +485,6 @@ def main() -> None:
                         if peak > float(args.audio_active_threshold):
                             audio_active_steps += 1
 
-                policy.observe(
-                    env=env,
-                    episode=episode,
-                    observations=observations,
-                    reward=None,
-                    done=done,
-                    info=None,
-                )
                 step_idx += 1
 
             if args.video_audio:

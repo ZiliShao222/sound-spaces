@@ -97,8 +97,15 @@ def _is_named_action(action: Any, action_name: str) -> bool:
     return False
 
 
-def _build_named_action(action_name: str) -> Dict[str, str]:
-    return {"action": action_name}
+def _build_named_action(action_name: str) -> int:
+    return {
+        "STOP": 0,
+        "MOVE_FORWARD": 1,
+        "TURN_LEFT": 2,
+        "TURN_RIGHT": 3,
+        "LIFELONG_SUBMIT": 4,
+        "SUBMIT": 4,
+    }[str(action_name).strip().upper()]
 
 
 def _sim_action_to_named_action(action: Any) -> Any:
@@ -107,13 +114,13 @@ def _sim_action_to_named_action(action: Any) -> Any:
         return action
 
     if action_id == int(STOP_ACTION_ID):
-        return _build_named_action("STOP")
+        return 0
     if action_id == int(MOVE_FORWARD_ACTION_ID):
-        return _build_named_action("MOVE_FORWARD")
+        return 1
     if action_id == int(TURN_LEFT_ACTION_ID):
-        return _build_named_action("TURN_LEFT")
+        return 2
     if action_id == int(TURN_RIGHT_ACTION_ID):
-        return _build_named_action("TURN_RIGHT")
+        return 3
     return action
 
 
@@ -137,25 +144,11 @@ def _distance_to_specific_goal(env: Any, episode: Any, goal: Any) -> Optional[fl
     return _optional_float(distance)
 
 
-def _normalize_goal_order_mode(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return "ordered" if value else "unordered"
-
-    token = str(value).strip().lower()
-    if token in {"ordered", "order", "true", "1", "yes", "y"}:
-        return "ordered"
-    if token in {"unordered", "unorder", "false", "0", "no", "n"}:
-        return "unordered"
-    return None
-
-
 def _order_enforced(env: Any, policy: Optional["LifelongEvalPolicy"] = None) -> bool:
     if policy is not None:
-        override_mode = _normalize_goal_order_mode(getattr(policy, "_goal_order_mode", None))
+        override_mode = getattr(policy, "_goal_order_mode", None)
         if override_mode is not None:
-            return override_mode == "ordered"
+            return str(override_mode).strip().lower() == "ordered"
 
     task = _get_task(env)
     if task is None:
@@ -363,10 +356,22 @@ def _task_success_distance(env: Any, default: float = 1.0) -> float:
 class LifelongEvalContext:
     step_index: int
     goal_payloads: Tuple[Dict[str, Any], ...] = ()
+    info: Optional[Dict[str, Any]] = None
 
 
 class LifelongEvalPolicy:
     def reset(self, *, env: Any, episode: Any, observations: Dict[str, Any]) -> None:
+        return None
+
+    def start_episode(
+        self,
+        *,
+        env: Any,
+        episode: Any,
+        observations: Dict[str, Any],
+        goal_payloads: Sequence[Dict[str, Any]],
+        order_mode: Optional[Any] = None,
+    ) -> None:
         return None
 
     def act(
@@ -378,18 +383,6 @@ class LifelongEvalPolicy:
         context: LifelongEvalContext,
     ) -> Any:
         raise NotImplementedError
-
-    def observe(
-        self,
-        *,
-        env: Any,
-        episode: Any,
-        observations: Dict[str, Any],
-        reward: Optional[float],
-        done: bool,
-        info: Optional[Dict[str, Any]],
-    ) -> None:
-        return None
 
     def close(self) -> None:
         return None
@@ -438,6 +431,20 @@ def build_lifelong_eval_policy(name: str, **kwargs: Any) -> LifelongEvalPolicy:
         return _POLICY_REGISTRY[key](**kwargs)
     policy_cls = _load_external_policy(name)
     return policy_cls(**kwargs)
+
+
+def filter_policy_observations(policy_name: Optional[str], observations: Dict[str, Any]) -> Dict[str, Any]:
+    key = str(policy_name or "").strip().lower()
+    allow_semantic = key in {"oracle", "oracle_shortest_submit"}
+    filtered: Dict[str, Any] = {}
+    for sensor_name, value in observations.items():
+        token = str(sensor_name).strip().lower()
+        if "pointgoal_with_gps_compass" in token:
+            continue
+        if not allow_semantic and "semantic" in token:
+            continue
+        filtered[sensor_name] = value
+    return filtered
 
 
 @register_lifelong_eval_policy("random")
@@ -569,7 +576,7 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
         self._submit_probability = float(submit_probability)
         self._seed = int(seed)
         self._rng = np.random.default_rng(self._seed)
-        self._goal_order_mode = _normalize_goal_order_mode(goal_order_mode)
+        self._goal_order_mode = str(goal_order_mode) if goal_order_mode is not None else None
         self._max_visibility_scan_turns = max(int(max_visibility_scan_turns), 1)
         self._follower: Optional[Any] = None
         self._goal_signature: Optional[Any] = None
@@ -812,10 +819,12 @@ class OracleShortestSubmitLifelongEvalPolicy(LifelongEvalPolicy):
 def build_lifelong_eval_context(
     step_index: int,
     goal_payloads: Optional[Sequence[Dict[str, Any]]] = None,
+    info: Optional[Dict[str, Any]] = None,
 ) -> LifelongEvalContext:
     return LifelongEvalContext(
         step_index=int(step_index),
         goal_payloads=tuple(goal_payloads or ()),
+        info=info,
     )
 
 

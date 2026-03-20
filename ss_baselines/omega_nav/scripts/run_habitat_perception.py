@@ -16,7 +16,7 @@ from soundspaces.tasks.omni_long_eval_utils import (
     apply_eval_config,
     build_config,
 )
-from ss_baselines.common.omni_long_eval_policy import build_lifelong_eval_context
+from ss_baselines.common.omni_long_eval_policy import build_lifelong_eval_context, filter_policy_observations
 from ss_baselines.omega_nav.policy import OmegaNavPolicy
 
 
@@ -57,6 +57,7 @@ def main() -> None:
             return
         env.current_episode = episodes[0]
         observations = env.reset()
+        observations = filter_policy_observations("omega_nav", observations)
         episode = env.current_episode
 
         goal_payloads = []
@@ -69,19 +70,28 @@ def main() -> None:
                     instance_record=instance_index.get(instance_key),
                 )
             )
-
+        
         policy = OmegaNavPolicy(config_path=args.policy_config)
         policy.reset(env=env, episode=episode, observations=observations)
+        policy.start_episode(
+            env=env,
+            episode=episode,
+            observations=observations,
+            goal_payloads=goal_payloads,
+            order_mode=getattr(episode, "goal_order_mode", None),
+        )
         done = False
         step_index = 0
+        info = None
         while not done and step_index < int(args.steps):
-            context = build_lifelong_eval_context(step_index, goal_payloads=goal_payloads)
+            context = build_lifelong_eval_context(step_index, goal_payloads=goal_payloads, info=info)
             action = policy.act(env=env, episode=episode, observations=observations, context=context)
             debug_state = policy.get_debug_state()
             print(json.dumps({"step": step_index, "action": action, "debug": debug_state}, ensure_ascii=False, indent=2))
-            observations = env.step(action)
+            observations = env.step({"action": {0: "STOP", 1: "MOVE_FORWARD", 2: "TURN_LEFT", 3: "TURN_RIGHT", 4: "LIFELONG_SUBMIT"}[int(action)]})
+            observations = filter_policy_observations("omega_nav", observations)
             done = bool(env.episode_over)
-            policy.observe(env=env, episode=episode, observations=observations, reward=None, done=done, info=None)
+            info = env.task.get_last_action_feedback() if hasattr(env.task, "get_last_action_feedback") else None
             step_index += 1
 
 

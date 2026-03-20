@@ -31,3 +31,10 @@ distance_submit_threshold: 1.0
 # Optional overrides
 split: "val"
 disable_content_scenes: false
+
+# Video (env server side)
+video: true
+video_fps: null
+video_audio: true
+video_audio_normalize: true
+video_audio_max_gain: 200.0

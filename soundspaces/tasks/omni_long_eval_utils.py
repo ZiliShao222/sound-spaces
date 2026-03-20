@@ -136,9 +136,11 @@ def _render_reference_image(
     image_index: int,
 ) -> Optional[np.ndarray]:
     image_payload = instance_record.get("image")
-    if not isinstance(image_payload, dict):
-        return None
-    render_views = image_payload.get("render_views")
+    render_views = None
+    if isinstance(image_payload, dict):
+        render_views = image_payload.get("render_views")
+    if not isinstance(render_views, list) or len(render_views) == 0:
+        render_views = instance_record.get("render_view_points")
     if not isinstance(render_views, list) or len(render_views) == 0:
         return None
     if image_index < 0 or image_index >= len(render_views):
@@ -152,6 +154,12 @@ def _render_reference_image(
     if not _is_vec3(position):
         position = render_view.get("position")
     rotation = render_view.get("rotation")
+    agent_state = render_view.get("agent_state")
+    if isinstance(agent_state, dict):
+        if not _is_vec3(position):
+            position = agent_state.get("position")
+        if not _is_quat4(rotation):
+            rotation = agent_state.get("rotation")
     if not _is_vec3(position) or not _is_quat4(rotation):
         return None
 
