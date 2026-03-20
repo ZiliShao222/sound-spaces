@@ -56,9 +56,11 @@ def _goal_submit_distance(env: Any, default: float) -> float:
     return float(default)
 
 
+@register_lifelong_eval_policy("omega_nav")
+@register_lifelong_eval_policy("omega_nav_policy")
 @register_lifelong_eval_policy("omega_oracle")
 @register_lifelong_eval_policy("omega_nav_oracle")
-class OmegaNavOraclePolicy(LifelongEvalPolicy):
+class OmegaNavPolicy(LifelongEvalPolicy):
     def __init__(
         self,
         submit_action_name: str = "LIFELONG_SUBMIT",

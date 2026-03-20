@@ -17,11 +17,11 @@ from soundspaces.tasks.omni_long_eval_utils import (
     build_config,
 )
 from ss_baselines.common.omni_long_eval_policy import build_lifelong_eval_context
-from ss_baselines.omega_nav.policy import OmegaNavOraclePolicy
+from ss_baselines.omega_nav.policy import OmegaNavPolicy
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run OmegaNav oracle perception/planning demo in Habitat.")
+    parser = argparse.ArgumentParser(description="Run OmegaNav perception/planning demo in Habitat.")
     parser.add_argument("--eval-config", type=str, default=None)
     parser.add_argument("--exp-config", type=str, default="configs/omni-long/mp3d/omni-long_semantic_audio.yaml")
     parser.add_argument("--split", type=str, default="val")
@@ -70,7 +70,7 @@ def main() -> None:
                 )
             )
 
-        policy = OmegaNavOraclePolicy(config_path=args.policy_config)
+        policy = OmegaNavPolicy(config_path=args.policy_config)
         policy.reset(env=env, episode=episode, observations=observations)
         done = False
         step_index = 0
