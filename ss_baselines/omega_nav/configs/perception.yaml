@@ -1,0 +1,48 @@
+goal_encoder:
+  embedding_dim: 32
+  image_histogram_bins: 8
+
+visual:
+  describe_every: 5
+  top_m: 3
+  min_visible_pixels: 24
+  max_summary_objects: 4
+
+audio:
+  anchor_count: 5
+  aggregation_window: 10
+  detection_threshold: 0.65
+  embedding_dim: 32
+  ear_distance_m: 0.18
+  speed_of_sound_mps: 343.0
+  reference_rms: 0.05
+
+depth:
+  map_resolution_m: 0.25
+  map_size_cells: 256
+  max_depth_m: 6.0
+  min_depth_m: 0.1
+  sample_stride: 16
+  hfov_deg: 90.0
+  frontier_max_points: 24
+  assume_normalized_depth: true
+
+memory:
+  working_window: 8
+  episodic_decay: 0.2
+  episodic_prune_threshold: 0.05
+  revisit_radius_m: 1.5
+
+planner:
+  submit_distance_m: 1.0
+  distance_penalty: 0.05
+  visible_priority_bonus: 2.0
+  audio_priority_bonus: 1.2
+  hint_priority_bonus: 0.8
+
+navigator:
+  follower_goal_radius: 0.001
+
+policy:
+  submit_action_name: LIFELONG_SUBMIT
+  stop_action_name: STOP

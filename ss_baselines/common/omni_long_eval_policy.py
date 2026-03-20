@@ -787,3 +787,6 @@ def build_lifelong_eval_context(
         step_index=int(step_index),
         goal_payloads=tuple(goal_payloads or ()),
     )
+
+
+import ss_baselines.omega_nav.policy  # noqa: F401

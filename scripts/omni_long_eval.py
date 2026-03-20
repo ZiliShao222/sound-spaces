@@ -236,7 +236,7 @@ def main() -> None:
 
     if args.dataset_path is None or not str(args.dataset_path).strip():
         raise RuntimeError(
-            "dataset_path is required. Pass --dataset-path or provide it in --eval-config."
+            "dataset_path is required. Provide it in --eval-config."
         )
 
     cfg = build_config(args)

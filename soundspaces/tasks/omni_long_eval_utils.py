@@ -394,6 +394,8 @@ def _set_arg_if_default(args: argparse.Namespace, name: str, default: Any, value
 
 
 def apply_eval_config(args: argparse.Namespace) -> argparse.Namespace:
+    if not hasattr(args, "dataset_path"):
+        args.dataset_path = None
     if args.eval_config is None:
         return args
 
@@ -628,12 +630,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULT_CONFIG,
         help="Task config path.",
-    )
-    parser.add_argument(
-        "--dataset-path",
-        type=str,
-        default=None,
-        help="Path to dataset .json.gz.",
     )
     parser.add_argument(
         "--task-type",

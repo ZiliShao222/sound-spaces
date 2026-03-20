@@ -25,67 +25,67 @@ VAL_SCENES=(
 )
 
 TRAIN_SCENES=(
-  "sT4fr6TAbpF"
-  "E9uDoFAP3SH"
-  "VzqfbhrpDEA"
-  "kEZ7cmS4wCh"
-  "29hnd4uzFmX"
-  "ac26ZMwG7aT"
-  "i5noydFURQK"
-  "s8pcmisQ38h"
-  "rPc6DW4iMge"
-  "EDJbREhghzL"
-  "mJXqzFtmKg4"
-  "B6ByNegPMKs"
-  "JeFG25nYj2p"
-  "82sE5b5pLXE"
-  "D7N2EKCX4Sj"
-  "7y3sRwLe3Va"
-  "HxpKQynjfin"
-  "5LpN3gDmAk7"
-  "gTV8FGcVJC9"
-  "ur6pFq6Qu1A"
-  "qoiz87JEwZ2"
-  "PuKPg4mmafe"
-  "VLzqgDo317F"
-  "aayBHfsNo7d"
-  "JmbYfDe2QKZ"
-  "XcA2TqTSSAj"
-  "8WUmhLawc2A"
-  "sKLMLpTHeUy"
-  "r47D5H71a5s"
-  "Uxmj2M2itWa"
-  "Pm6F8kyY3z2"
-  "p5wJjkQkbXX"
-  "759xd9YjKW5"
-  "JF19kD82Mey"
-  "V2XKFyX4ASd"
-  "1LXtFkjw3qL"
-  "17DRP5sb8fy"
-  "5q7pvUzZiYa"
-  "VVfe2KiqLaN"
-  "Vvot9Ly1tCj"
-  "ULsKaCPVFJR"
-  "D7G3Y4RVNrH"
-  "uNb9QFRL6hY"
-  "ZMojNkEp431"
-  "2n8kARJN3HM"
-  "vyrNrziPKCB"
-  "e9zR4mvMWw7"
-  "r1Q1Z4BcV1o"
-  "PX4nDJXEHrG"
-  "YmJkqBEsHnH"
-  "b8cTxDM8gDG"
-  "GdvgFV5R1Z5"
-  "pRbA3pwrgk9"
-  "jh4fc5c5qoQ"
-  "dhjEzFoUFzH"
+  # "sT4fr6TAbpF"
+  # "E9uDoFAP3SH"
+  # "VzqfbhrpDEA"
+  # "kEZ7cmS4wCh"
+  # "29hnd4uzFmX"
+  # "ac26ZMwG7aT"
+  # "i5noydFURQK"
+  # "s8pcmisQ38h"
+  # "rPc6DW4iMge"
+  # "EDJbREhghzL"
+  # "mJXqzFtmKg4"
+  # "B6ByNegPMKs"
+  # "JeFG25nYj2p"
+  # "82sE5b5pLXE"
+  # "D7N2EKCX4Sj"
+  # "7y3sRwLe3Va"
+  # "HxpKQynjfin"
+  # "5LpN3gDmAk7"
+  # "gTV8FGcVJC9"
+  # "ur6pFq6Qu1A"
+  # "qoiz87JEwZ2"
+  # "PuKPg4mmafe"
+  # "VLzqgDo317F"
+  # "aayBHfsNo7d"
+  # "JmbYfDe2QKZ"
+  # "XcA2TqTSSAj"
+  # "8WUmhLawc2A"
+  # "sKLMLpTHeUy"
+  # "r47D5H71a5s"
+  # "Uxmj2M2itWa"
+  # "Pm6F8kyY3z2"
+  # "p5wJjkQkbXX"
+  # "759xd9YjKW5"
+  # "JF19kD82Mey"
+  # "V2XKFyX4ASd"
+  # "1LXtFkjw3qL"
+  # "17DRP5sb8fy"
+  # "5q7pvUzZiYa"
+  # "VVfe2KiqLaN"
+  # "Vvot9Ly1tCj"
+  # "ULsKaCPVFJR"
+  # "D7G3Y4RVNrH"
+  # "uNb9QFRL6hY"
+  # "ZMojNkEp431"
+  # "2n8kARJN3HM"
+  # "vyrNrziPKCB"
+  # "e9zR4mvMWw7"
+  # "r1Q1Z4BcV1o"
+  # "PX4nDJXEHrG"
+  # "YmJkqBEsHnH"
+  # "b8cTxDM8gDG"
+  # "GdvgFV5R1Z5"
+  # "pRbA3pwrgk9"
+  # "jh4fc5c5qoQ"
+  # "dhjEzFoUFzH"
   "gZ6f7yhEvPG"
-  "1pXnuDYAj8r"
-  "S9hNv5qa7GM"
-  "VFuaQ6m2Qom"
-  "cV4RVeZvu5T"
-  "SN83YJsR3w2"
+  # "1pXnuDYAj8r"
+  # "S9hNv5qa7GM"
+  # "VFuaQ6m2Qom"
+  # "cV4RVeZvu5T"
+  # "SN83YJsR3w2"
 )
 
 TEST_SCENES=(
@@ -144,13 +144,13 @@ EXPORT_ARGS=(
 TRAJ_ARGS=(
   --num-trajectories "${NUM_TRAJECTORIES}"
   --min-goals 2
-  --max-goals 5
+  --max-goals 2
   --seed 0
   --sim-start
   --start-min-clearance 0.01
   --start-distance-retries "${START_DISTANCE_RETRIES}"
   --distance-max-attempts "${DISTANCE_MAX_ATTEMPTS}"
-  --min-goal-distance 4
+  --min-goal-distance 2
 )
 
 cd "${REPO_ROOT}"
@@ -183,13 +183,13 @@ run_scene() {
     echo "[pipeline] scene=${scene} gpu=${gpu_id}"
 
 
-    echo "[1/3] export instances"
-    python scripts/export_instances.py \
-      "${scene}" \
-      --yolo-device cuda:0 \
-      --output-root "${OUTPUT_ROOT}" \
-      "${EXPORT_ARGS[@]}" \
-      "$@"
+    # echo "[1/3] export instances"
+    # python scripts/export_instances.py \
+    #   "${scene}" \
+    #   --yolo-device cuda:0 \
+    #   --output-root "${OUTPUT_ROOT}" \
+    #   "${EXPORT_ARGS[@]}" \
+    #   "$@"
 
     echo "[2/3] build trajectory dataset"
     python scripts/build_trajectories_from_valid_instances.py \
