@@ -53,12 +53,41 @@ class SemanticVoxelMapState:
 
 
 @dataclass
+class AudioPerceptionState:
+    is_active: bool = False
+    rms: float = 0.0
+    peak: float = 0.0
+    label: str = ""
+    score: float = 0.0
+    score_threshold: float = 0.0
+    scores: Dict[str, float] = field(default_factory=dict)
+    scope: str = ""
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "is_active": bool(self.is_active),
+            "rms": float(self.rms),
+            "peak": float(self.peak),
+            "label": str(self.label),
+            "score": float(self.score),
+            "score_threshold": float(self.score_threshold),
+            "scope": str(self.scope),
+            "scores": {str(key): float(value) for key, value in self.scores.items()},
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return as_serializable(self.summary())
+
+
+@dataclass
 class PerceptionOutput:
     step_index: int
     map_state: SemanticVoxelMapState
+    audio_state: AudioPerceptionState = field(default_factory=AudioPerceptionState)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "step_index": int(self.step_index),
             "map_state": self.map_state.to_dict(),
+            "audio_state": self.audio_state.to_dict(),
         }

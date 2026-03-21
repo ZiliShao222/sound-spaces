@@ -241,6 +241,8 @@ class OfflineAcousticPrototypeLibrary:
         mono = np.asarray(waveform, dtype=np.float32).reshape(-1)
         mono = mono - float(np.mean(mono))
         peak = float(np.max(np.abs(mono)))
+        if peak <= 1e-8:
+            return np.zeros_like(mono, dtype=np.float32)
         mono = mono / peak
         return mono.astype(np.float32)
 

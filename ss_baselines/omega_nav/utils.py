@@ -23,7 +23,7 @@ DEFAULT_OMEGA_CONFIG: Dict[str, Any] = {
         "visible_similarity_threshold": 0.5,
     },
     "audio": {
-        "aggregation_window": 10,
+        "aggregation_window": 2,
         "detection_threshold": 0.65,
         "ear_distance_m": 0.18,
         "speed_of_sound_mps": 343.0,
@@ -64,18 +64,6 @@ DEFAULT_OMEGA_CONFIG: Dict[str, Any] = {
     "policy": {
         "submit_action_name": "LIFELONG_SUBMIT",
         "stop_action_name": "STOP",
-    },
-    "qwen": {
-        "enabled": False,
-        "api_base": "http://127.0.0.1:8000/v1",
-        "api_key": "EMPTY",
-        "model": "Qwen2.5-VL-7B-Instruct",
-        "timeout_sec": 8,
-        "temperature": 0.1,
-        "max_tokens": 192,
-        "top_k_candidates": 3,
-        "modalities": ["description", "image"],
-        "disable_on_failure": True,
     },
 }
 
@@ -137,6 +125,16 @@ def extract_depth(
     if assume_normalized and float(np.nanmax(depth)) <= 1.0 + 1e-6:
         depth = depth * float(max_depth_m)
     return np.clip(depth, 0.0, float(max_depth_m))
+
+
+def extract_audio(observations: Optional[Dict[str, Any]]) -> Optional[np.ndarray]:
+    if not isinstance(observations, dict):
+        return None
+    for key in ("audiogoal", "AUDIOGOAL_SENSOR", "audio", "audio_sensor"):
+        value = observations.get(key)
+        if value is not None:
+            return np.asarray(value, dtype=np.float32)
+    return None
 
 
 def extract_semantic(observations: Optional[Dict[str, Any]]) -> Optional[np.ndarray]:

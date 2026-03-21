@@ -135,18 +135,7 @@ def _render_reference_image(
     instance_record: Dict[str, Any],
     image_index: int,
 ) -> Optional[np.ndarray]:
-    image_payload = instance_record.get("image")
-    render_views = None
-    if isinstance(image_payload, dict):
-        render_views = image_payload.get("render_views")
-    if not isinstance(render_views, list) or len(render_views) == 0:
-        render_views = instance_record.get("render_view_points")
-    if not isinstance(render_views, list) or len(render_views) == 0:
-        return None
-    if image_index < 0 or image_index >= len(render_views):
-        return None
-
-    render_view = render_views[image_index]
+    render_view = _goal_render_view(instance_record, image_index)
     if not isinstance(render_view, dict):
         return None
 
@@ -172,6 +161,45 @@ def _render_reference_image(
     if observations is None:
         return None
     return _extract_rgb_from_observations(observations)
+
+
+def _goal_render_view(
+    instance_record: Dict[str, Any],
+    image_index: int,
+) -> Optional[Dict[str, Any]]:
+    image_payload = instance_record.get("image")
+    render_views = None
+    if isinstance(image_payload, dict):
+        render_views = image_payload.get("render_views")
+    if not isinstance(render_views, list) or len(render_views) == 0:
+        render_views = instance_record.get("render_view_points")
+    if not isinstance(render_views, list) or len(render_views) == 0:
+        return None
+    if image_index < 0 or image_index >= len(render_views):
+        return None
+    render_view = render_views[image_index]
+    return render_view if isinstance(render_view, dict) else None
+
+
+def _goal_render_view_yolo_objects(render_view: Optional[Dict[str, Any]]) -> List[str]:
+    if not isinstance(render_view, dict):
+        return []
+    detections = render_view.get("yolo_matched_detections")
+    if not isinstance(detections, list):
+        return []
+    scored: Dict[str, float] = {}
+    for detection in detections:
+        if not isinstance(detection, dict):
+            continue
+        class_name = detection.get("class_name")
+        if not isinstance(class_name, str) or not class_name.strip():
+            continue
+        confidence = float(detection.get("confidence", 0.0))
+        key = class_name.strip()
+        if confidence > scored.get(key, -1.0):
+            scored[key] = confidence
+    ranked = sorted(scored.items(), key=lambda item: item[1], reverse=True)
+    return [label for label, _ in ranked]
 
 
 def _sound_id_for_goal(episode: Any, goal_index: int) -> Optional[str]:
@@ -216,7 +244,13 @@ def _build_goal_input_payload(
     if normalized_modality == "image":
         image_index = _parse_image_modality_index(modality)
         rgb = None
+        detected_objects: List[str] = []
         if isinstance(instance_record, dict):
+            render_view = _goal_render_view(
+                instance_record,
+                0 if image_index is None else int(image_index),
+            )
+            detected_objects = _goal_render_view_yolo_objects(render_view)
             rgb = _render_reference_image(
                 env,
                 instance_record,
@@ -225,6 +259,7 @@ def _build_goal_input_payload(
         return {
             "modality": "image",
             "image": np.asarray(rgb, dtype=np.uint8).copy() if rgb is not None else None,
+            "detected_objects": list(detected_objects),
         }
 
     if normalized_modality == "description":
