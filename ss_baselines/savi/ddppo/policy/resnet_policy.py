@@ -23,7 +23,7 @@ from ss_baselines.common.rnn_state_encoder import RNNStateEncoder
 from ss_baselines.savi.ppo.policy import Net, Policy
 from ss_baselines.savi.models.visual_cnn import VisualCNN
 from ss_baselines.savi.models.audio_cnn import AudioCNN
-from soundspaces.tasks.nav import PoseSensor, SpectrogramSensor, Category
+from soundspaces.tasks.nav import FullPoseSensor, SpectrogramSensor, Category
 
 
 class AudioNavResNetPolicy(Policy):
@@ -218,7 +218,7 @@ class AudioNavResNetNet(Net):
                 normalize_visual_inputs=normalize_visual_inputs,
                 obs_transform=obs_transform,
             )
-        if PoseSensor.cls_uuid in observation_space.spaces:
+        if FullPoseSensor.cls_uuid in observation_space.spaces:
             self.pose_encoder = nn.Linear(5, 16)
             pose_feature_dims = 16
             rnn_input_size += pose_feature_dims
@@ -287,8 +287,8 @@ class AudioNavResNetNet(Net):
         if SpectrogramSensor.cls_uuid in observations:
             x.append(self.audio_encoder(observations))
 
-        if PoseSensor.cls_uuid in observations:
-            pose_formatted = self._format_pose(observations[PoseSensor.cls_uuid])
+        if FullPoseSensor.cls_uuid in observations:
+            pose_formatted = self._format_pose(observations[FullPoseSensor.cls_uuid])
             pose_encoded = self.pose_encoder(pose_formatted)
             x.append(pose_encoded)
 
@@ -302,12 +302,17 @@ class AudioNavResNetNet(Net):
         return x, rnn_hidden_states, ext_memory_feats
 
     def _format_pose(self, pose):
-        """
-        Args:
-            pose: (N, 4) Tensor containing x, y, heading, time
-        """
+        if pose.size(1) == 7:
+            pose = self._full_pose_to_pose(pose)
         x, y, theta, time = torch.unbind(pose, dim=1)
         cos_theta, sin_theta = torch.cos(theta), torch.sin(theta)
         e_time = torch.exp(-time)
         formatted_pose = torch.stack([x, y, cos_theta, sin_theta, e_time], 1)
         return formatted_pose
+
+    def _full_pose_to_pose(self, pose):
+        x, y, z, qx, qy, qz, qw = torch.unbind(pose, dim=1)
+        del y
+        heading = torch.atan2(-2.0 * (qx * qz + qw * qy), 1.0 - 2.0 * (qx * qx + qy * qy))
+        time = torch.zeros_like(x)
+        return torch.stack([-z, x, heading, time], dim=1)

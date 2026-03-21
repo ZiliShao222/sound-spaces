@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import torchvision.models as models
-from soundspaces.tasks.nav import SpectrogramSensor, LocationBelief, CategoryBelief, Category
+from soundspaces.tasks.nav import FullPoseSensor, SpectrogramSensor, LocationBelief, CategoryBelief, Category
 from ss_baselines.savi.models.smt_resnet import custom_resnet18
 
 
@@ -148,7 +148,7 @@ class BeliefPredictor(nn.Module):
                 pointgoals = self.cnn_forward(observations).cpu().numpy()
 
             for i in range(batch_size):
-                pose = observations['pose'][i].cpu().numpy()
+                pose = full_pose_to_planar_pose(observations[FullPoseSensor.cls_uuid][i].cpu().numpy())
                 pointgoal = pointgoals[i]
                 if dones is not None and dones[i]:
                     self.last_pointgoal[i] = None
@@ -224,3 +224,11 @@ def odom_to_base(pointgoal_odom, pose):
 
     pointgoal_base = np.array([d * np.cos(delta_theta), d * np.sin(delta_theta)])
     return pointgoal_base
+
+
+def full_pose_to_planar_pose(pose):
+    array = np.asarray(pose, dtype=np.float32).reshape(-1)
+    if array.size < 7:
+        return array[:3]
+    heading = np.arctan2(-2.0 * (array[3] * array[5] + array[6] * array[4]), 1.0 - 2.0 * (array[3] * array[3] + array[4] * array[4]))
+    return np.asarray([-array[2], array[0], heading], dtype=np.float32)

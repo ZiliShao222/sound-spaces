@@ -24,11 +24,6 @@ from habitat.core.simulator import (
     SensorTypes,
     Simulator,
 )
-from habitat.utils.geometry_utils import (
-    quaternion_from_coeff,
-    quaternion_rotate_vector,
-)
-from habitat.tasks.utils import cartesian_to_polar
 from soundspaces.mp3d_utils import CATEGORY_INDEX_MAPPING
 from soundspaces.utils import convert_semantic_object_to_rgb
 from soundspaces.mp3d_utils import HouseReader
@@ -694,26 +689,24 @@ class SemanticObjectSensor(Sensor):
         return convert_semantic_object_to_rgb(semantic_map)
 
 
-@registry.register_sensor(name="PoseSensor")
-class PoseSensor(Sensor):
-    r"""The agents current location and heading in the coordinate frame defined by the
-    episode, i.e. the axis it faces along and the origin is defined by its state at
-    t=0. Additionally contains the time-step of the episode.
+def _quat_to_coeffs(quat: Any) -> np.ndarray:
+    if hasattr(quat, "imag") and hasattr(quat, "real"):
+        imag = np.asarray(quat.imag, dtype=np.float32).reshape(-1)
+        return np.asarray([imag[0], imag[1], imag[2], float(quat.real)], dtype=np.float32)
+    if hasattr(quat, "components"):
+        coeffs = np.asarray(quat.components, dtype=np.float32).reshape(-1)
+        return np.asarray([coeffs[1], coeffs[2], coeffs[3], coeffs[0]], dtype=np.float32)
+    return np.asarray([quat.x, quat.y, quat.z, quat.w], dtype=np.float32)
 
-    Args:
-        sim: reference to the simulator for calculating task observations.
-        config: Contains the DIMENSIONALITY field for the number of dimensions to express the agents position
-    Attributes:
-        _dimensionality: number of dimensions used to specify the agents position
-    """
-    cls_uuid: str = "pose"
+
+@registry.register_sensor(name="FullPoseSensor")
+class FullPoseSensor(Sensor):
+    cls_uuid: str = "full_pose_sensor"
 
     def __init__(
         self, sim: Simulator, config: Config, *args: Any, **kwargs: Any
     ):
         self._sim = sim
-        self._episode_time = 0
-        self._current_episode_id = None
         super().__init__(config=config)
 
     def _get_uuid(self, *args: Any, **kwargs: Any) -> str:
@@ -726,50 +719,23 @@ class PoseSensor(Sensor):
         return spaces.Box(
             low=np.finfo(np.float32).min,
             high=np.finfo(np.float32).max,
-            shape=(4,),
+            shape=(7,),
             dtype=np.float32,
         )
-
-    def _quat_to_xy_heading(self, quat):
-        direction_vector = np.array([0, 0, -1])
-
-        heading_vector = quaternion_rotate_vector(quat, direction_vector)
-
-        phi = cartesian_to_polar(-heading_vector[2], heading_vector[0])[1]
-        return np.array([phi], dtype=np.float32)
 
     def get_observation(
         self, observations, episode, *args: Any, **kwargs: Any
     ):
-        episode_uniq_id = f"{episode.scene_id} {episode.episode_id}"
-        if episode_uniq_id != self._current_episode_id:
-            self._episode_time = 0.0
-            self._current_episode_id = episode_uniq_id
-
+        del observations, episode
         agent_state = self._sim.get_agent_state()
+        position = np.asarray(agent_state.position, dtype=np.float32)
+        rotation = _quat_to_coeffs(agent_state.rotation)
+        return np.concatenate([position, rotation], axis=0).astype(np.float32)
 
-        origin = np.array(episode.start_position, dtype=np.float32)
-        rotation_world_start = quaternion_from_coeff(episode.start_rotation)
 
-        agent_position_xyz = agent_state.position
-        rotation_world_agent = agent_state.rotation
-
-        agent_position_xyz = quaternion_rotate_vector(
-            rotation_world_start.inverse(), agent_position_xyz - origin
-        )
-
-        agent_heading = self._quat_to_xy_heading(
-            rotation_world_agent.inverse() * rotation_world_start
-        )
-
-        ep_time = self._episode_time
-        self._episode_time += 1.0
-
-        return np.array(
-            # Flatten heading to scalar to avoid creating an inhomogeneous array.
-            [-agent_position_xyz[2], agent_position_xyz[0], agent_heading.item(), ep_time],
-            dtype=np.float32
-        )
+@registry.register_sensor(name="PoseSensor")
+class PoseSensor(FullPoseSensor):
+    pass
 
 
 @registry.register_sensor

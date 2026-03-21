@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torchsummary import summary
 
-from soundspaces.tasks.nav import PoseSensor, SpectrogramSensor, LocationBelief, CategoryBelief, Category
+from soundspaces.tasks.nav import FullPoseSensor, SpectrogramSensor, LocationBelief, CategoryBelief, Category
 from ss_baselines.common.utils import CategoricalNet
 from ss_baselines.common.rnn_state_encoder import RNNStateEncoder
 from ss_baselines.savi.models.visual_cnn import VisualCNN
@@ -331,9 +331,9 @@ class AudioNavSMTNet(Net):
             nfeats += 21
 
         # Add pose observations to the memory
-        assert PoseSensor.cls_uuid in observation_space.spaces
-        if PoseSensor.cls_uuid in observation_space.spaces:
-            pose_dims = observation_space.spaces[PoseSensor.cls_uuid].shape[0]
+        assert FullPoseSensor.cls_uuid in observation_space.spaces
+        if FullPoseSensor.cls_uuid in observation_space.spaces:
+            pose_dims = observation_space.spaces[FullPoseSensor.cls_uuid].shape[0]
             # Specify which part of the memory corresponds to pose_dims
             pose_indices = (nfeats, nfeats + pose_dims)
             nfeats += pose_dims
@@ -444,7 +444,7 @@ class AudioNavSMTNet(Net):
         if self._use_category_input:
             x.append(observations[Category.cls_uuid])
 
-        x.append(observations[PoseSensor.cls_uuid])
+        x.append(observations[FullPoseSensor.cls_uuid])
 
         x = torch.cat(x, dim=1)
 

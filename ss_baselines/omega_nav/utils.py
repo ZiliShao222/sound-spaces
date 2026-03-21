@@ -65,6 +65,18 @@ DEFAULT_OMEGA_CONFIG: Dict[str, Any] = {
         "submit_action_name": "LIFELONG_SUBMIT",
         "stop_action_name": "STOP",
     },
+    "qwen": {
+        "enabled": False,
+        "api_base": "http://127.0.0.1:8000/v1",
+        "api_key": "EMPTY",
+        "model": "Qwen2.5-VL-7B-Instruct",
+        "timeout_sec": 8,
+        "temperature": 0.1,
+        "max_tokens": 192,
+        "top_k_candidates": 3,
+        "modalities": ["description", "image"],
+        "disable_on_failure": True,
+    },
 }
 
 
@@ -151,16 +163,31 @@ def ensure_vec3(value: Any) -> Optional[np.ndarray]:
     return array
 
 
+def rotate_vector_by_quaternion(quaternion_xyzw: Any, vector: Any) -> np.ndarray:
+    quat = np.asarray(quaternion_xyzw, dtype=np.float32).reshape(4)
+    vec = np.asarray(vector, dtype=np.float32).reshape(3)
+    quat_xyz = quat[:3]
+    quat_w = float(quat[3])
+    uv = np.cross(quat_xyz, vec)
+    uuv = np.cross(quat_xyz, uv)
+    return vec + 2.0 * (quat_w * uv + uuv)
+
+
+def heading_from_quaternion(quaternion_xyzw: Any) -> float:
+    heading_vector = rotate_vector_by_quaternion(quaternion_xyzw, np.asarray([0.0, 0.0, -1.0], dtype=np.float32))
+    return float(np.arctan2(float(heading_vector[0]), float(-heading_vector[2])))
+
+
 def extract_pose(observations: Optional[Dict[str, Any]]) -> Optional[np.ndarray]:
     if not isinstance(observations, dict):
         return None
-    for key in ("pose", "POSE_SENSOR", "pose_sensor"):
+    for key in ("full_pose_sensor", "FULL_POSE_SENSOR"):
         value = observations.get(key)
         if value is None:
             continue
         pose = np.asarray(value, dtype=np.float32).reshape(-1)
-        if pose.size >= 3 and np.all(np.isfinite(pose[:3])):
-            return pose
+        if pose.size >= 7 and np.all(np.isfinite(pose[:7])):
+            return pose[:7]
     return None
 
 
@@ -168,18 +195,18 @@ def pose_to_position(pose: Any) -> Optional[np.ndarray]:
     if pose is None:
         return None
     array = np.asarray(pose, dtype=np.float32).reshape(-1)
-    if array.size < 2 or not np.all(np.isfinite(array[:2])):
+    if array.size < 3 or not np.all(np.isfinite(array[:3])):
         return None
-    return np.asarray([float(array[1]), 0.0, float(-array[0])], dtype=np.float32)
+    return np.asarray(array[:3], dtype=np.float32)
 
 
 def pose_to_heading(pose: Any) -> Optional[float]:
     if pose is None:
         return None
     array = np.asarray(pose, dtype=np.float32).reshape(-1)
-    if array.size < 3 or not np.isfinite(float(array[2])):
+    if array.size < 7 or not np.all(np.isfinite(array[3:7])):
         return None
-    return float(array[2])
+    return heading_from_quaternion(array[3:7])
 
 
 def rotate_local_offset(heading_rad: float, vector: Sequence[float]) -> np.ndarray:

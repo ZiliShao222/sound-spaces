@@ -1,18 +1,22 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import json
 import os
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
 import numpy as np
 import torch
-import torch.nn.functional as F
-from PIL import Image
 
 from ss_baselines.common.omni_long_eval_policy import (
     LifelongEvalContext,
     LifelongEvalPolicy,
+    TURN_RIGHT_ACTION_ID,
     register_lifelong_eval_policy,
 )
+from ss_baselines.omega_nav.audio_prototypes import OfflineAcousticPrototypeLibrary
+from ss_baselines.omega_nav.perception import PerceptionEncoder, PerceptionOutput
+from ss_baselines.omega_nav.qwen_service import chat_completion, extract_json_object, extract_message_text, image_array_to_data_url
+from ss_baselines.omega_nav.utils import load_omega_config, normalize_text
 
 
 @register_lifelong_eval_policy("omega_nav")
@@ -22,32 +26,56 @@ from ss_baselines.common.omni_long_eval_policy import (
 class OmegaNavPolicy(LifelongEvalPolicy):
     def __init__(
         self,
-        seed: int = 0,
-        goal_order_mode: str = "ordered",
-        siglip_model_name: str = "google/siglip-base-patch16-224",
         device: Optional[str] = None,
+        look_around_steps: int = 11,
+        audio_clean_sound_dir: str = "data/sounds/semantic_splits/val",
+        audio_encoder_model_name: str = "laion/clap-htsat-unfused",
+        audio_sampling_rate_hz: int = 16000,
+        audio_embedding_sampling_rate_hz: int = 16000,
+        audio_prototype_window_sec: float = 1.0,
+        audio_prototype_hop_sec: float = 0.5,
+        config_path: Optional[str] = None,
+        config_overrides: Optional[Dict[str, Any]] = None,
+        goal_encoder_model_name: str = "google/siglip-base-patch16-224",
         **_: Any,
-    ):
-        self._rng = np.random.default_rng(int(seed))
-        self._goal_order_mode = str(goal_order_mode)
-        self._siglip_model_name = str(siglip_model_name)
+    ) -> None:
+        cfg = load_omega_config(config_path=config_path, overrides=config_overrides) if config_path or config_overrides else load_omega_config()
+        qwen_cfg = dict(cfg.get("qwen", {}))
         self._device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self._siglip_processor = None
-        self._siglip_model = None
-        self._goal_embeddings: Optional[np.ndarray] = None
-        self._goal_mask: Optional[np.ndarray] = None
-        self._active_goal_embeddings: Optional[np.ndarray] = None
-        self._last_pose: Any = None
-        self._last_info: Optional[Dict[str, Any]] = None
-        self._last_action: Optional[int] = None
+        self._look_around_steps = max(int(look_around_steps), 0)
+        self._qwen_enabled = bool(qwen_cfg.get("enabled", False))
+        self._qwen_api_base = str(qwen_cfg.get("api_base", "http://127.0.0.1:8000/v1"))
+        self._qwen_api_key = str(qwen_cfg.get("api_key") or os.environ.get("QWEN_API_KEY") or os.environ.get("OPENAI_API_KEY") or "EMPTY")
+        self._qwen_model = str(qwen_cfg.get("model", "Qwen2.5-VL-7B-Instruct"))
+        self._qwen_timeout = int(qwen_cfg.get("timeout_sec", 8))
+        self._perception = PerceptionEncoder(cfg, self._device, goal_encoder_model_name)
+        self._audio_prototype_library = OfflineAcousticPrototypeLibrary(
+            clean_sound_dir=str(audio_clean_sound_dir),
+            observation_sampling_rate_hz=max(int(audio_sampling_rate_hz), 1),
+            encoder_model_name=str(audio_encoder_model_name),
+            encoder_sampling_rate_hz=max(int(audio_embedding_sampling_rate_hz), 1),
+            prototype_window_sec=max(float(audio_prototype_window_sec), 0.1),
+            prototype_hop_sec=max(float(audio_prototype_hop_sec), 0.05),
+            device=self._device,
+        )
+        self._audio_prototype_library.ensure_loaded()
+        labels = tuple(self._audio_prototype_library.prototype_labels)
+        matrix = np.asarray(self._audio_prototype_library.prototype_matrix, dtype=np.float32)
+        self._audio_global = {str(label): np.asarray(matrix[i], dtype=np.float32) for i, label in enumerate(labels)}
+        self.reset(env=None, episode=None, observations={})
 
     def reset(self, *, env: Any, episode: Any, observations: Dict[str, Any]) -> None:
-        self._goal_embeddings = None
-        self._goal_mask = None
-        self._active_goal_embeddings = None
-        self._last_pose = None
-        self._last_info = None
-        self._last_action = None
+        del env, episode, observations
+        self._goal_ids: Tuple[str, ...] = ()
+        self._goal_modalities: Dict[str, str] = {}
+        self._goal_embeddings: Dict[str, np.ndarray] = {}
+        self._audio_goal_labels: Dict[str, Tuple[str, ...]] = {}
+        self._audio_episode_dict: Dict[str, np.ndarray] = {}
+        self._unsupported_audio_goals: List[Dict[str, Any]] = []
+        self._trajectory_step_index = 0
+        self._last_action: Optional[int] = None
+        self._last_info: Optional[Dict[str, Any]] = None
+        self._last_perception: Optional[PerceptionOutput] = None
 
     def start_episode(
         self,
@@ -55,88 +83,136 @@ class OmegaNavPolicy(LifelongEvalPolicy):
         env: Any,
         episode: Any,
         observations: Dict[str, Any],
-        goal_payloads,
+        goal_payloads: Sequence[Dict[str, Any]],
         order_mode: Optional[Any] = None,
     ) -> None:
-        if self._siglip_processor is None or self._siglip_model is None:
-            from transformers import AutoModel, AutoProcessor
+        del env, episode, order_mode
+        self.reset(env=None, episode=None, observations={})
+        self._perception.reset(observations)
+        self._goal_ids = tuple(f"goal_{i:03d}" for i in range(len(goal_payloads)))
+        self._goal_embeddings = self._perception.encode_goals(self._goal_ids, goal_payloads)
+        for goal_id, payload in zip(self._goal_ids, goal_payloads):
+            modality = str(payload.get("modality", "")).lower() or "object"
+            self._goal_modalities[goal_id] = modality
+            inferred_nodes = self._infer_graph_nodes(payload) if self._qwen_enabled and modality in {"description", "text", "image"} else []
+            labels = self._resolve_labels(payload, inferred_nodes=inferred_nodes)
+            if not labels:
+                self._unsupported_audio_goals.append(
+                    {
+                        "goal_id": goal_id,
+                        "modality": modality,
+                        "has_embedding": goal_id in self._goal_embeddings,
+                    }
+                )
+                continue
+            self._audio_goal_labels[goal_id] = (labels[0],)
+            episode_labels = labels if modality == "image" else (labels[0],)
+            for label in episode_labels:
+                self._audio_episode_dict.setdefault(label, self._audio_global[label])
+        print(
+            "[omega_nav][start_episode] "
+            + json.dumps(
+                {
+                    "goal_modalities": dict(self._goal_modalities),
+                    "goal_embedding_dims": self._perception.goal_embedding_dims(),
+                    "audio_goal_labels": {k: list(v) for k, v in self._audio_goal_labels.items()},
+                },
+                ensure_ascii=False,
+            )
+        )
 
-            self._siglip_processor = AutoProcessor.from_pretrained(self._siglip_model_name)
-            self._siglip_model = AutoModel.from_pretrained(self._siglip_model_name)
-            self._siglip_model.eval()
-            self._siglip_model.to(self._device)
-
-        goal_count = len(goal_payloads)
-
-        embeddings = [None] * goal_count
-        text_indices = []
-        text_inputs = []
-        image_indices = []
-        image_inputs = []
-
-        for goal_index, payload in enumerate(goal_payloads):
-            modality = str(payload.get("modality", "object"))
-            if modality == "image":
-                image = np.asarray(payload.get("image"), dtype=np.uint8)
-                image_inputs.append(Image.fromarray(image))
-                image_indices.append(goal_index)
-            elif modality == "description":
-                text_inputs.append(str(payload.get("text", "")))
-                text_indices.append(goal_index)
-            else:
-                text_inputs.append(str(payload.get("category", "")))
-                text_indices.append(goal_index)
-
-        with torch.inference_mode():
-            if text_inputs:
-                text_batch = self._siglip_processor(text=text_inputs, padding=True, truncation=True, return_tensors="pt")
-                text_batch = {key: value.to(self._device) for key, value in text_batch.items()}
-                text_features = self._siglip_model.get_text_features(**text_batch)
-                if not isinstance(text_features, torch.Tensor):
-                    text_features = text_features.pooler_output
-                text_features = F.normalize(text_features, dim=-1).detach().cpu().numpy().astype(np.float32)
-                for row_index, goal_index in enumerate(text_indices):
-                    embeddings[goal_index] = text_features[row_index]
-
-            if image_inputs:
-                image_batch = self._siglip_processor(images=image_inputs, return_tensors="pt")
-                image_batch = {key: value.to(self._device) for key, value in image_batch.items()}
-                image_features = self._siglip_model.get_image_features(**image_batch)
-                if not isinstance(image_features, torch.Tensor):
-                    image_features = image_features.pooler_output
-                image_features = F.normalize(image_features, dim=-1).detach().cpu().numpy().astype(np.float32)
-                for row_index, goal_index in enumerate(image_indices):
-                    embeddings[goal_index] = image_features[row_index]
-
-        self._goal_embeddings = np.stack(embeddings, axis=0)
-        self._goal_mask = np.ones((goal_count,), dtype=np.float32)
-        if self._goal_order_mode == "ordered":
-            self._goal_mask[1:] = 0.0
-        self._active_goal_embeddings = self._goal_embeddings * self._goal_mask[:, None]
-        self._last_pose = observations.get("pose")
-        self._last_info = None
-        self._last_action = None
-
-    def act(
-        self,
-        *,
-        env: Any,
-        episode: Any,
-        observations: Dict[str, Any],
-        context: LifelongEvalContext,
-    ) -> Any:
-        self._last_pose = observations.get("pose")
+    def act(self, *, env: Any, episode: Any, observations: Dict[str, Any], context: LifelongEvalContext) -> Any:
+        del env, episode
         self._last_info = context.info
-        self._last_action = int(self._rng.integers(0, 5))
+        self._last_perception = self._perception.percept(observations, context.step_index)
+        self._last_action = int(TURN_RIGHT_ACTION_ID)
+        self._trajectory_step_index += 1
         return self._last_action
 
     def get_debug_state(self) -> Dict[str, Any]:
         return {
-            "goal_order_mode": self._goal_order_mode,
-            "goal_embeddings_shape": None if self._goal_embeddings is None else list(self._goal_embeddings.shape),
-            "goal_mask": None if self._goal_mask is None else self._goal_mask.tolist(),
-            "active_goal_embeddings_shape": None if self._active_goal_embeddings is None else list(self._active_goal_embeddings.shape),
-            "pose": self._last_pose,
-            "info": self._last_info,
+            "goal_ids": list(self._goal_ids),
+            "goal_modalities": dict(self._goal_modalities),
+            "goal_embedding_dims": self._perception.goal_embedding_dims(),
+            "audio_goal_labels": {k: list(v) for k, v in self._audio_goal_labels.items()},
+            "audio_episode_labels": list(self._audio_episode_dict.keys()),
+            "unsupported_audio_goals": list(self._unsupported_audio_goals),
+            "map_summary": self._last_perception.map_state.summary() if self._last_perception is not None else {},
+            "qwen_enabled": bool(self._qwen_enabled),
             "action": self._last_action,
+            "info": self._last_info,
         }
+
+    def _resolve_labels(self, payload: Dict[str, Any], inferred_nodes: Optional[Sequence[str]] = None) -> Tuple[str, ...]:
+        modality = str(payload.get("modality", "")).lower()
+        if modality == "object":
+            return self._match_labels([payload.get("category")])
+        if self._qwen_enabled and modality in {"description", "text", "image"}:
+            labels = self._match_labels(inferred_nodes if inferred_nodes is not None else self._infer_graph_nodes(payload))
+            if labels:
+                return labels
+        if modality in {"description", "text"}:
+            return self._match_labels([payload.get("text")])
+        return ()
+
+    def _match_labels(self, values: Sequence[Any]) -> Tuple[str, ...]:
+        hits: List[str] = []
+        for value in values:
+            label = self._match_label(value)
+            if label and label not in hits:
+                hits.append(label)
+            if len(hits) >= 4:
+                break
+        return tuple(hits)
+
+    def _match_label(self, value: Any) -> Optional[str]:
+        text = normalize_text(value).lower().replace("_", " ")
+        if not text:
+            return None
+        for alias, label in self._audio_prototype_library.alias_to_category.items():
+            token = normalize_text(alias).lower().replace("_", " ")
+            if token and token in text and label in self._audio_global:
+                return str(label)
+        label = self._audio_prototype_library.resolve_category(text)
+        return str(label) if label in self._audio_global else None
+
+    def _infer_graph_nodes(self, payload: Dict[str, Any]) -> List[str]:
+        modality = str(payload.get("modality", "")).lower()
+        prompt = (
+            'Return JSON only as {"nodes": []}. '
+            'Build a text scene graph using only the relation "next to". '
+            'Put the most likely goal object in nodes[0]. '
+            'Put nearby context objects in later nodes. '
+            'Each node must be an object noun only, with no attributes, rooms, or explanations. '
+            'If uncertain, still place the most likely goal first. '
+            'If nothing is identifiable, return {"nodes": []}. '
+            + (
+                'For images, only use objects that are clearly visible and salient in the foreground. '
+                'Prioritize movable, interactable, or furniture-like objects that would matter for navigation. '
+                'Ignore background structure and scene layout elements such as wall, floor, ceiling, window, door, doorway, hallway, stairs, room, shadow, and lighting unless one of them is the main target. '
+                'Prefer concrete foreground objects over structural context. '
+                if modality == "image"
+                else 'For text, infer the goal and nearby context objects from the description. '
+            )
+            + f"modality={payload.get('modality', '')}"
+        )
+        if modality in {"description", "text"}:
+            prompt += f"\ntext={payload.get('text', '')}"
+        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        if modality == "image" and isinstance(payload.get("image"), np.ndarray):
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_array_to_data_url(np.asarray(payload["image"], dtype=np.uint8))},
+                }
+            )
+        resp = chat_completion(
+            api_base=self._qwen_api_base,
+            api_key=self._qwen_api_key,
+            model=self._qwen_model,
+            messages=[{"role": "user", "content": content}],
+            timeout_sec=self._qwen_timeout,
+        )
+        data = extract_json_object(extract_message_text(resp))
+        nodes = data.get("nodes", []) if isinstance(data, dict) else []
+        return [str(node) for node in nodes[:4]] if isinstance(nodes, list) else []

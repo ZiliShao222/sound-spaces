@@ -390,6 +390,15 @@ class SoundSpacesSim(Simulator, ABC):
     def current_source_sound(self):
         return self._source_sound_dict[self._current_sound]
 
+    def _offset_start_second(self, sound_id: str) -> int:
+        waveform = np.asarray(self._source_sound_dict[sound_id], dtype=np.float32).reshape(-1)
+        sampling_rate = int(self.config.AUDIO.RIR_SAMPLING_RATE)
+        required_samples = max(int(self._duration), 1) * sampling_rate
+        requested_start_second = max(int(self._offset), 0)
+        max_start_sample = max(int(waveform.shape[0]) - int(required_samples), 0)
+        max_start_second = max_start_sample // sampling_rate
+        return min(requested_start_second, max_start_second)
+
     @property
     def is_silent(self):
         return self._episode_step_count > self._duration
@@ -457,6 +466,7 @@ class SoundSpacesSim(Simulator, ABC):
         if not is_same_scene or not is_same_sound:
             self._audiogoal_cache = dict()
             self._spectrogram_cache = dict()
+        self._audio_index = self._offset_start_second(self._current_sound)
 
         self._episode_step_count = 0
 

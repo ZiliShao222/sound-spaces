@@ -374,6 +374,20 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
     def current_source_sound(self):
         return self._source_sound_dict[self._current_sound]
 
+    def _sound_schedule_interval_steps(self) -> int:
+        if self._sound_schedule and isinstance(self._sound_schedule, list) and len(self._sound_schedule) > 1:
+            return max(int(self._sound_schedule[1]), 1)
+        return max(int(self._duration), 1)
+
+    def _offset_start_index(self, sound_id: str, playback_steps: int) -> int:
+        waveform = np.asarray(self._source_sound_dict[sound_id], dtype=np.float32).reshape(-1)
+        sampling_rate = int(self.config.AUDIO.RIR_SAMPLING_RATE)
+        samples_per_step = int(round(sampling_rate * float(self.config.STEP_TIME)))
+        required_samples = max(int(playback_steps), 1) * max(samples_per_step, 1)
+        requested_start = max(int(self._offset), 0) * sampling_rate
+        max_start_index = max(int(waveform.shape[0]) - int(required_samples), 0)
+        return min(requested_start, max_start_index)
+
     @property
     def is_silent(self):
         return self._episode_step_count > self._duration
@@ -449,7 +463,10 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
             )
         self._episode_step_count = 0
         self._last_rir = None
-        self._current_sample_index = np.random.randint(self.config.AUDIO.RIR_SAMPLING_RATE * self.config.STEP_TIME)
+        self._current_sample_index = self._offset_start_index(
+            self._current_sound,
+            playback_steps=self._sound_schedule_interval_steps(),
+        )
 
     def _snap_to_navmesh(self, position):
         if hasattr(self.pathfinder, "snap_point"):
@@ -550,7 +567,10 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
             return
         self._active_sound_idx = idx
         self._current_sound = self._sound_ids[idx]
-        self._current_sample_index = 0
+        self._current_sample_index = self._offset_start_index(
+            self._current_sound,
+            playback_steps=self._sound_schedule_interval_steps(),
+        )
         # print("interval in use:", interval)
 
         audio_sensor = self._sim.get_agent(0)._sensors["audio_sensor"]

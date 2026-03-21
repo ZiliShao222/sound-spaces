@@ -132,6 +132,11 @@ def _episode_object(payload: Dict[str, Any]) -> SimpleNamespace:
     return SimpleNamespace(**payload)
 
 
+def _episode_goal_inputs(episode: Any) -> Sequence[Dict[str, Any]]:
+    goal_inputs = getattr(episode, "goal_inputs", ())
+    return goal_inputs if isinstance(goal_inputs, (list, tuple)) else ()
+
+
 class PolicyAdapter:
     def reset(self, *, episode: Any, observations: Dict[str, Any], goal_payloads: Sequence[Dict[str, Any]]) -> None:
         return None
@@ -312,12 +317,12 @@ def main() -> None:
 
         episode = _episode_object(reply.get("episode", {}))
         observations = reply.get("observations")
-        goal_payloads = reply.get("goal_payloads", [])
         if not isinstance(observations, dict):
             raise RuntimeError("episode_start observations must be a dict")
         observations = filter_policy_observations(policy_name_for_filter, observations)
+        goal_inputs = _episode_goal_inputs(episode)
 
-        adapter.reset(episode=episode, observations=observations, goal_payloads=goal_payloads)
+        adapter.reset(episode=episode, observations=observations, goal_payloads=goal_inputs)
         done = False
         reward = None
         info: Optional[Dict[str, Any]] = None
@@ -328,7 +333,7 @@ def main() -> None:
             action = adapter.act(
                 episode=episode,
                 observations=observations,
-                goal_payloads=goal_payloads,
+                goal_payloads=goal_inputs,
                 step_index=step_index,
                 info=info,
             )

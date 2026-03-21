@@ -213,7 +213,6 @@ def _build_goal_input_payload(
     instance_record: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     normalized_modality = _normalize_goal_input_modality(modality)
-
     if normalized_modality == "image":
         image_index = _parse_image_modality_index(modality)
         rgb = None
@@ -242,6 +241,7 @@ def _build_goal_input_payload(
         category = instance_record.get("category")
     if not isinstance(category, str) or not category.strip():
         category = _fallback_object_category(instance_key)
+
     return {
         "modality": "object",
         "category": str(category).strip(),
@@ -273,10 +273,7 @@ def _save_goal_input_image_if_needed(
 
 def _summarize_goal_input_payload(goal_index: int, payload: Dict[str, Any]) -> Dict[str, Any]:
     modality = str(payload.get("modality", "object"))
-    summary: Dict[str, Any] = {
-        "goal_index": int(goal_index),
-        "modality": modality,
-    }
+    summary: Dict[str, Any] = {"goal_index": int(goal_index), "modality": modality}
     if modality == "image":
         image = payload.get("image")
         summary["image_shape"] = list(image.shape) if isinstance(image, np.ndarray) else None
@@ -285,7 +282,6 @@ def _summarize_goal_input_payload(goal_index: int, payload: Dict[str, Any]) -> D
     if modality == "description":
         summary["text"] = str(payload.get("text", ""))
         return summary
-    summary["category"] = str(payload.get("category", ""))
     return summary
 
 
@@ -297,9 +293,7 @@ def _format_goal_input_summary(summary: Dict[str, Any]) -> str:
             path=summary.get("image_path", None),
         )
     if modality == "description":
-        return "modality=description | text={text}".format(
-            text=summary.get("text", "")
-        )
+        return "modality=description | text={text}".format(text=summary.get("text", ""))
     return "modality=object | category={category}".format(
         category=summary.get("category", "")
     )
@@ -878,15 +872,18 @@ def build_config(args: argparse.Namespace) -> habitat.Config:
         "CATEGORY": "Category",
         "CATEGORY_BELIEF": "CategoryBelief",
         "LOCATION_BELIEF": "LocationBelief",
-        "POSE_SENSOR": "PoseSensor",
+        "POSE_SENSOR": "FullPoseSensor",
+        "FULL_POSE_SENSOR": "FullPoseSensor",
         "POINTGOAL_WITH_GPS_COMPASS_SENSOR": "PointGoalWithGPSCompassSensor",
     }
 
     normalized_sensors: List[str] = []
     for sensor_name in list(cfg.TASK.SENSORS):
-        token = str(sensor_name)
+        token = "FULL_POSE_SENSOR" if str(sensor_name) == "POSE_SENSOR" else str(sensor_name)
         if token not in normalized_sensors:
             normalized_sensors.append(token)
+        if token == "FULL_POSE_SENSOR" and hasattr(cfg.TASK, "POSE_SENSOR") and not hasattr(cfg.TASK, "FULL_POSE_SENSOR"):
+            cfg.TASK.FULL_POSE_SENSOR = cfg.TASK.POSE_SENSOR
         if not hasattr(cfg.TASK, token):
             cfg.TASK[token] = Config()
         if hasattr(cfg.TASK[token], "TYPE") and str(getattr(cfg.TASK[token], "TYPE")):

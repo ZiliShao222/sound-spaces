@@ -177,11 +177,9 @@ class SMTStateEncoder(nn.Module):
         return self.single_forward(x, memory, *args, **kwargs)
 
     def _encode_pose(self, agent_pose, memory_pose):
-        """
-        Args:
-            agent_pose: (bs, 4) Tensor containing x, y, heading, time
-            memory_pose: (M, bs, 4) Tensor containing x, y, heading, time
-        """
+        if agent_pose.size(-1) == 7:
+            agent_pose = self._full_pose_to_pose(agent_pose)
+            memory_pose = self._full_pose_to_pose(memory_pose)
         agent_xyh, agent_t = agent_pose[..., :3], agent_pose[..., 3:4]
         memory_xyh, memory_t = memory_pose[..., :3], memory_pose[..., 3:4]
 
@@ -203,6 +201,17 @@ class SMTStateEncoder(nn.Module):
         ).view(M, bs, -1)
 
         return agent_pose_encoded, memory_pose_encoded
+
+    def _full_pose_to_pose(self, pose):
+        x = pose[..., 0]
+        z = pose[..., 2]
+        qx = pose[..., 3]
+        qy = pose[..., 4]
+        qz = pose[..., 5]
+        qw = pose[..., 6]
+        heading = torch.atan2(-2.0 * (qx * qz + qw * qy), 1.0 - 2.0 * (qx * qx + qy * qy))
+        time = torch.zeros_like(x)
+        return torch.stack([-z, x, heading, time], dim=-1)
 
     def _compute_relative_pose(self, pose_a, pose_b):
         """
@@ -236,7 +245,7 @@ class SMTStateEncoder(nn.Module):
     def _format_pose(self, pose):
         """
         Args:
-            pose: (..., 4) Tensor containing x, y, heading, time
+            pose: (..., 4) Tensor containing planar x, planar y, heading, time
         """
         x, y, heading, time = torch.unbind(pose, dim=-1)
         cos_heading, sin_heading = torch.cos(heading), torch.sin(heading)

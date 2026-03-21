@@ -198,10 +198,10 @@ _TC.TASK.LOCATION_BELIEF.TYPE = "LocationBelief"
 _TC.TASK.SUCCESS_WHEN_SILENT = CN()
 _TC.TASK.SUCCESS_WHEN_SILENT.TYPE = "SWS"
 # -----------------------------------------------------------------------------
-# POSE SENSOR
+# FULL POSE SENSOR
 # -----------------------------------------------------------------------------
-_TC.TASK.POSE_SENSOR = CN()
-_TC.TASK.POSE_SENSOR.TYPE = "PoseSensor"
+_TC.TASK.FULL_POSE_SENSOR = CN()
+_TC.TASK.FULL_POSE_SENSOR.TYPE = "FullPoseSensor"
 # -----------------------------------------------------------------------------
 # SEMANTIC OBJECT SENSOR
 # -----------------------------------------------------------------------------

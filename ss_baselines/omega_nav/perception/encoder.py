@@ -1,165 +1,84 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
+import torch
 
-from ss_baselines.omega_nav.perception.base import GoalSpec, PerceptionOutput
-from ss_baselines.omega_nav.perception.clap_module import OracleCLAPMatcher
-from ss_baselines.omega_nav.perception.clip_module import OracleCLIPDetector
-from ss_baselines.omega_nav.perception.depth_module import OracleDepthProcessor
-from ss_baselines.omega_nav.perception.vlm_module import OracleVLMDescriptor
-from ss_baselines.omega_nav.utils import extract_pose, image_histogram_embedding, normalize_text, pose_to_position
+from ss_baselines.omega_nav.perception.base import MapObservation, PerceptionOutput
+from ss_baselines.omega_nav.perception.siglip_encoder import SigLIPEncoder
+from ss_baselines.omega_nav.perception.voxel_map import SemanticVoxelMap
+from ss_baselines.omega_nav.utils import extract_depth, extract_pose, extract_rgb, pose_to_heading, pose_to_position
 
 
 class PerceptionEncoder:
-    def __init__(self, config: Dict[str, Any]):
-        self._config = config
-        self._goal_encoder_cfg = dict(config.get("goal_encoder", {}))
-        self._clip = OracleCLIPDetector({**config.get("visual", {}), **config.get("goal_encoder", {})})
-        self._clap = OracleCLAPMatcher(config.get("audio", {}))
-        self._depth = OracleDepthProcessor(config.get("depth", {}))
-        self._vlm = OracleVLMDescriptor(config.get("visual", {}))
-        self._prepared_goal_ids: Tuple[str, ...] = ()
+    def __init__(self, config: Dict[str, Any], device: torch.device, goal_encoder_model_name: str) -> None:
+        self._depth_cfg = dict(config.get("depth", {}))
+        self._max_depth_m = float(self._depth_cfg.get("max_depth_m", 6.0))
+        self._assume_normalized_depth = bool(self._depth_cfg.get("assume_normalized_depth", True))
+        self._siglip = SigLIPEncoder(goal_encoder_model_name, device)
+        self._map = SemanticVoxelMap(self._depth_cfg, self._siglip)
+        self._goal_embeddings: Dict[str, np.ndarray] = {}
+        self._last_output: Optional[PerceptionOutput] = None
 
-    def reset(
-        self,
-        env: Optional[Any] = None,
-        goal_specs: Optional[Sequence[GoalSpec]] = None,
-        observations: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        agent_position = None
-        if env is not None and hasattr(env, "sim"):
-            agent_position = np.asarray(env.sim.get_agent_state().position, dtype=np.float32)
-        elif observations is not None:
-            agent_position = pose_to_position(extract_pose(observations))
-        self._depth.reset(agent_position)
-        self._vlm.reset()
-        self._prepared_goal_ids = ()
-        self._clap.reset(goal_specs or ())
-        if goal_specs:
-            self._prepared_goal_ids = tuple(goal.goal_id for goal in goal_specs)
+    def reset(self, observations: Optional[Dict[str, Any]] = None) -> None:
+        position = np.zeros(3, dtype=np.float32)
+        if observations is not None:
+            pose = extract_pose(observations)
+            position = np.asarray(pose_to_position(pose), dtype=np.float32)
+        self._map.reset(position)
+        self._goal_embeddings = {}
+        self._last_output = None
 
-    def build_goal_specs(
-        self,
-        episode: Any,
-        goal_payloads: Sequence[Dict[str, Any]],
-    ) -> List[GoalSpec]:
-        goal_specs: List[GoalSpec] = []
-        task_specs = list(getattr(episode, "tasks", []) or [])
-        if hasattr(episode, "goal_count"):
-            episode_goal_count = int(getattr(episode, "goal_count") or 0)
+    def encode_goals(self, goal_ids: Sequence[str], goal_payloads: Sequence[Dict[str, Any]]) -> Dict[str, np.ndarray]:
+        self._goal_embeddings = {}
+        for goal_id, payload in zip(goal_ids, goal_payloads):
+            embedding = self._encode_goal_payload(payload)
+            if embedding is not None:
+                self._goal_embeddings[str(goal_id)] = embedding
+        return dict(self._goal_embeddings)
+
+    def percept(self, observations: Dict[str, Any], step_index: int) -> PerceptionOutput:
+        observation = self._build_observation(observations, step_index)
+        self._map.update(observation)
+        output = PerceptionOutput(int(step_index), self._map.build_state(self._goal_embeddings))
+        self._last_output = output
+        return output
+
+    def goal_embedding_dims(self) -> Dict[str, int]:
+        return {goal_id: int(embedding.shape[0]) for goal_id, embedding in self._goal_embeddings.items()}
+
+    def _encode_goal_payload(self, payload: Dict[str, Any]) -> Optional[np.ndarray]:
+        modality = str(payload.get("modality", "")).lower()
+        if modality == "image" and isinstance(payload.get("image"), np.ndarray):
+            return self._siglip.encode_image(np.asarray(payload["image"], dtype=np.uint8))
+        if modality == "object":
+            text = str(payload.get("category", ""))
         else:
-            episode_goal_count = len(list(getattr(episode, "goals", []) or []))
-        embedding_bins = max(int(self._goal_encoder_cfg.get("image_histogram_bins", 8)), 2)
+            text = str(payload.get("text") or payload.get("category") or "")
+        text = text.strip()
+        if not text:
+            return None
+        return self._siglip.encode_text(text)
 
-        total = max(len(goal_payloads), len(task_specs), episode_goal_count)
-        for goal_index in range(total):
-            payload = goal_payloads[goal_index] if goal_index < len(goal_payloads) else {}
-            task_spec = task_specs[goal_index] if goal_index < len(task_specs) else None
-
-            modality = str(
-                payload.get("modality")
-                or (task_spec[1] if isinstance(task_spec, (list, tuple)) and len(task_spec) >= 2 else "object")
-            )
-            fallback_category = (
-                task_spec[0]
-                if isinstance(task_spec, (list, tuple)) and len(task_spec) >= 1
-                else f"goal_{goal_index:03d}"
-            )
-            category = normalize_text(payload.get("category") or fallback_category)
-            text_query = normalize_text(payload.get("text") or category)
-            reference_image = payload.get("image") if isinstance(payload.get("image"), np.ndarray) else None
-            image_description = normalize_text(
-                payload.get("image_description")
-                or (f"参考图像中的 {category}" if reference_image is not None else "")
-            )
-            image_embedding = (
-                image_histogram_embedding(reference_image, embedding_bins)
-                if reference_image is not None
-                else None
-            )
-
-            goal_specs.append(
-                GoalSpec(
-                    goal_id=f"goal_{goal_index:03d}",
-                    goal_index=int(goal_index),
-                    modality=modality,
-                    category=category or f"goal_{goal_index:03d}",
-                    text_query=text_query or category or f"goal_{goal_index:03d}",
-                    image_description=image_description,
-                    image_embedding=image_embedding,
-                    reference_image=reference_image,
-                    semantic_id=None,
-                    room_name=normalize_text(payload.get("room_name", "")),
-                    sound_id=normalize_text(payload.get("sound_id", "")),
-                    object_position=None,
-                    sound_position=None,
-                    view_positions=(),
-                    metadata={
-                        "instance_key": (
-                            str(task_spec[0])
-                            if isinstance(task_spec, (list, tuple)) and len(task_spec) >= 1
-                            else ""
-                        ),
-                    },
-                )
-            )
-        return goal_specs
-
-    def encode(
-        self,
-        *,
-        step_index: int,
-        env: Any,
-        episode: Any,
-        observations: Dict[str, Any],
-        goal_specs: Sequence[GoalSpec],
-        pending_goal_ids: Optional[Sequence[str]] = None,
-        order_mode: str = "ordered",
-    ) -> PerceptionOutput:
-        goal_ids = tuple(goal.goal_id for goal in goal_specs)
-        if goal_ids != self._prepared_goal_ids:
-            self._clap.reset(goal_specs)
-            self._prepared_goal_ids = goal_ids
-
-        semantic_map = self._depth.update(env, observations)
-        visual_matches, top_clip_matches = self._clip.detect(observations, goal_specs)
-        audio_matches = self._clap.match(
-            env,
-            episode,
+    def _build_observation(self, observations: Dict[str, Any], step_index: int) -> MapObservation:
+        rgb = extract_rgb(observations)
+        depth = extract_depth(
             observations,
-            goal_specs,
-            pending_goal_ids=pending_goal_ids,
-            order_mode=order_mode,
+            max_depth_m=self._max_depth_m,
+            assume_normalized=self._assume_normalized_depth,
         )
-        scene_description = self._vlm.describe(
+        pose = extract_pose(observations)
+        position = pose_to_position(pose)
+        heading = pose_to_heading(pose)
+        assert rgb is not None
+        assert depth is not None
+        assert position is not None
+        assert heading is not None
+        return MapObservation(
+            rgb=np.asarray(rgb, dtype=np.uint8),
+            depth=np.asarray(depth, dtype=np.float32),
+            position=np.asarray(position, dtype=np.float32),
+            heading_rad=float(heading),
             step_index=int(step_index),
-            goal_specs=goal_specs,
-            visual_matches=visual_matches,
-            semantic_map=semantic_map,
-        )
-
-        clip_summary = ", ".join(
-            f"{match.category}:{match.similarity:.2f}"
-            for match in top_clip_matches
-            if match.similarity > 0.0
-        ) or "none"
-        audio_detected = [match for match in audio_matches.values() if match.detected]
-        audio_summary = ", ".join(
-            f"{match.category}:{match.aggregated_similarity:.2f}@{match.direction_text}"
-            for match in sorted(audio_detected, key=lambda item: float(item.aggregated_similarity), reverse=True)[:3]
-        ) or "none"
-        observation_summary = (
-            f"visual={clip_summary} | audio={audio_summary} | explored={semantic_map.explored_ratio * 100.0:.1f}%"
-        )
-
-        return PerceptionOutput(
-            step_index=int(step_index),
-            scene_description=scene_description,
-            visual_matches=visual_matches,
-            audio_matches=audio_matches,
-            top_clip_matches=top_clip_matches,
-            semantic_map=semantic_map,
-            observation_summary=observation_summary,
         )

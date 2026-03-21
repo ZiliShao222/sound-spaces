@@ -178,31 +178,16 @@ def send_message(socket: zmq.Socket, payload: Dict[str, Any]) -> None:
     socket.send_multipart([header, *frames], copy=False)
 
 
-def _goal_input_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
-    modality = str(payload.get("modality", "object"))
-    summary: Dict[str, Any] = {
-        "modality": modality,
-        "category": str(payload.get("category", "")),
-    }
-    if modality == "description":
-        summary["text"] = str(payload.get("text", ""))
-        return summary
-    if modality == "image":
-        image = payload.get("image")
-        summary["image_shape"] = list(image.shape) if isinstance(image, np.ndarray) else None
-    return summary
-
-
 def _episode_payload(
     episode: Any,
-    goal_payloads: Optional[Sequence[Dict[str, Any]]] = None,
+    goal_inputs: Optional[Sequence[Dict[str, Any]]] = None,
     goal_order_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "episode_id": str(getattr(episode, "episode_id", "")),
         "scene_id": str(getattr(episode, "scene_id", "")),
         "scene_name": _scene_key(str(getattr(episode, "scene_id", ""))),
-        "goal_inputs": [_goal_input_summary(payload) for payload in list(goal_payloads or ())],
+        "goal_inputs": list(goal_inputs or ()),
         "goal_count": len(list(getattr(episode, "goals", []) or [])),
         "goal_order_mode": str(
             goal_order_mode
@@ -248,15 +233,17 @@ def _scene_mean_summary(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any
     return summaries
 
 
-def _force_pose_sensor(cfg: habitat.Config) -> habitat.Config:
+def _force_full_pose_sensor(cfg: habitat.Config) -> habitat.Config:
     cfg.defrost()
-    sensors = [str(sensor) for sensor in list(cfg.TASK.SENSORS)]
-    if "POSE_SENSOR" not in sensors:
-        sensors.append("POSE_SENSOR")
+    sensors = ["FULL_POSE_SENSOR" if str(sensor) == "POSE_SENSOR" else str(sensor) for sensor in list(cfg.TASK.SENSORS)]
+    if "FULL_POSE_SENSOR" not in sensors:
+        sensors.append("FULL_POSE_SENSOR")
     cfg.TASK.SENSORS = sensors
-    if not hasattr(cfg.TASK, "POSE_SENSOR"):
-        cfg.TASK.POSE_SENSOR = Config()
-    cfg.TASK.POSE_SENSOR.TYPE = "PoseSensor"
+    if hasattr(cfg.TASK, "POSE_SENSOR") and not hasattr(cfg.TASK, "FULL_POSE_SENSOR"):
+        cfg.TASK.FULL_POSE_SENSOR = cfg.TASK.POSE_SENSOR
+    if not hasattr(cfg.TASK, "FULL_POSE_SENSOR"):
+        cfg.TASK.FULL_POSE_SENSOR = Config()
+    cfg.TASK.FULL_POSE_SENSOR.TYPE = "FullPoseSensor"
     cfg.freeze()
     return cfg
 
@@ -332,7 +319,7 @@ def parse_args() -> argparse.Namespace:
 class OmniLongEnvServer:
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        self.cfg = _force_video_measurements(_force_pose_sensor(build_config(args)))
+        self.cfg = _force_video_measurements(_force_full_pose_sensor(build_config(args)))
         self.dataset_payload = _load_dataset_payload(args.dataset_path)
 
         self.env = habitat.Env(config=self.cfg)
@@ -367,6 +354,40 @@ class OmniLongEnvServer:
         self.completed_records: List[Dict[str, Any]] = []
         self.run_base_dir = self._ensure_output_paths()
         self.scene_mean_log = os.path.join(self.run_base_dir, "scene_mean.json")
+
+    def _next_episode_summary(self) -> Optional[Dict[str, Any]]:
+        next_episode_index = self.current_episode_index + 1
+        if next_episode_index < 0 or next_episode_index >= len(self.episodes):
+            return None
+
+        episode = self.episodes[next_episode_index]
+        return {
+            "episode_index": int(next_episode_index),
+            "episode_id": str(getattr(episode, "episode_id", "")),
+            "scene": _scene_key(str(getattr(episode, "scene_id", ""))),
+        }
+
+    def _print_next_episode_summary(self) -> None:
+        next_episode = self._next_episode_summary()
+        if next_episode is None:
+            print("[env_server] next_eval_episode=None")
+            return
+        print("[env_server] next_eval_episode=" + json.dumps(next_episode, ensure_ascii=False))
+
+    def _print_current_episode_summary(self) -> None:
+        if self.current_episode is None or self.current_episode_index < 0:
+            return
+        print(
+            "[env_server] episode_start="
+            + json.dumps(
+                {
+                    "episode_index": int(self.current_episode_index),
+                    "episode_id": str(getattr(self.current_episode, "episode_id", "")),
+                    "scene": _scene_key(str(getattr(self.current_episode, "scene_id", ""))),
+                },
+                ensure_ascii=False,
+            )
+        )
 
     def _scene_instance_records(self, scene_id: str) -> Dict[str, Dict[str, Any]]:
         key = str(scene_id)
@@ -466,12 +487,12 @@ class OmniLongEnvServer:
         episode = self.episodes[self.current_episode_index]
         self.env.current_episode = episode
         observations = self.env.reset()
-        goal_payloads: List[Dict[str, Any]] = []
+        goal_inputs: List[Dict[str, Any]] = []
         scene_records = self._scene_instance_records(str(getattr(episode, "scene_id", "")))
         for instance_key, modality in _normalize_task_specs(
             getattr(episode, "tasks", None) or getattr(episode, "goals", None)
         ):
-            goal_payloads.append(
+            goal_inputs.append(
                 _build_goal_input_payload(
                     env=self.env,
                     instance_key=instance_key,
@@ -482,21 +503,22 @@ class OmniLongEnvServer:
 
         self.current_episode = episode
         self.current_observations = observations
-        self.current_goal_payloads = goal_payloads
+        self.current_goal_payloads = goal_inputs
         self.current_step_index = 0
         self.current_done = False
         self.current_video_frames = []
         self.current_video_audios = []
+        self._print_current_episode_summary()
+        self._print_next_episode_summary()
         return {
             "op": "episode_start",
             "episode_index": self.current_episode_index,
             "episode": _episode_payload(
                 episode,
-                goal_payloads,
+                goal_inputs,
                 getattr(episode, "goal_order_mode", None) or self.args.goal_order_mode,
             ),
             "observations": observations,
-            "goal_payloads": goal_payloads,
             "scene": _scene_key(str(getattr(episode, "scene_id", ""))),
             "step_index": 0,
         }
@@ -623,6 +645,7 @@ class OmniLongEnvServer:
                     ensure_ascii=False,
                 )
             )
+            self._print_next_episode_summary()
 
         return message
 
@@ -664,6 +687,7 @@ def main() -> None:
     print(f"[env_server] episode_log={server.args.episode_log}")
     print(f"[env_server] mean_log={server.args.mean_log}")
     print(f"[env_server] scene_mean_log={server.scene_mean_log}")
+    server._print_next_episode_summary()
     while not should_stop:
         request = recv_message(
             socket,

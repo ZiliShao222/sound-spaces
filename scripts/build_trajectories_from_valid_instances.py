@@ -371,6 +371,32 @@ def _resolve_goal_navmesh_point(
     return None
 
 
+def _view_point_positions(instance_record: Dict[str, Any]) -> List[List[float]]:
+    view_points = instance_record.get("view_points")
+    if not isinstance(view_points, list):
+        return []
+
+    positions: List[List[float]] = []
+    seen: Set[Tuple[float, float, float]] = set()
+    for view_point in view_points:
+        if not isinstance(view_point, dict):
+            continue
+        agent_state = view_point.get("agent_state")
+        position = None
+        if isinstance(agent_state, dict):
+            position = agent_state.get("position")
+        if position is None:
+            position = view_point.get("position")
+        if not _is_vec3(position):
+            continue
+        rounded = tuple(round(float(v), 3) for v in position)
+        if rounded in seen:
+            continue
+        seen.add(rounded)
+        positions.append([float(v) for v in position])
+    return positions
+
+
 def _build_start_state(
     multimodal_module: Any,
     sim: Any,
@@ -1532,7 +1558,7 @@ def _build_goal_compatibility_map(
     for idx, (record_key_a, record_a) in enumerate(deduped_records):
         for record_key_b, record_b in deduped_records[idx + 1 :]:
             distance = goal_pair_distance_fn(record_a, record_b)
-            if distance is None or float(distance) < float(min_goal_distance):
+            if distance is None or float(distance) > float(min_goal_distance):
                 continue
             compatibility_map[record_key_a].add(record_key_b)
             compatibility_map[record_key_b].add(record_key_a)
@@ -1560,6 +1586,12 @@ def _build_trajectories(
     ] = None,
     goal_pair_distance_fn: Optional[
         Callable[[Dict[str, Any], Dict[str, Any]], Optional[float]]
+    ] = None,
+    route_distance_matrix_builder: Optional[
+        Callable[
+            [List[float], List[Dict[str, Any]], random.Random],
+            Optional[List[List[Optional[float]]]],
+        ]
     ] = None,
     goal_compatibility_map: Optional[Dict[str, FrozenSet[str]]] = None,
     distance_max_attempts: int = 100,
@@ -1850,6 +1882,7 @@ def _build_trajectories(
                     )
 
                     distance_matrix: Optional[List[List[Optional[float]]]] = None
+                    constraint_distance_matrix: Optional[List[List[Optional[float]]]] = None
                     ordered_total_geodesic_distance: Optional[float] = None
                     unordered_total_geodesic_distance: Optional[float] = None
                     valid_distances = False
@@ -1861,17 +1894,17 @@ def _build_trajectories(
                         valid_distances = True
                         start_position = [float(v) for v in start_state["position"]]
                         n_goals = int(len(sampled_records))
-                        distance_matrix = [
+                        constraint_distance_matrix = [
                             [None for _ in range(n_goals + 1)] for _ in range(n_goals + 1)
                         ]
                         for idx in range(n_goals + 1):
-                            distance_matrix[idx][idx] = 0.0
+                            constraint_distance_matrix[idx][idx] = 0.0
 
                         for goal_idx, goal_record in enumerate(sampled_records):
                             distance = start_goal_distance_fn(start_position, goal_record)
-                            distance_matrix[0][goal_idx + 1] = distance
-                            distance_matrix[goal_idx + 1][0] = distance
-                            if distance is None or float(distance) < float(min_goal_distance):
+                            constraint_distance_matrix[0][goal_idx + 1] = distance
+                            constraint_distance_matrix[goal_idx + 1][0] = distance
+                            if distance is None or float(distance) > float(min_goal_distance):
                                 valid_distances = False
                                 break
 
@@ -1884,22 +1917,37 @@ def _build_trajectories(
                                         sampled_records[idx],
                                         sampled_records[jdx],
                                     )
-                                    distance_matrix[idx + 1][jdx + 1] = pair_distance
-                                    distance_matrix[jdx + 1][idx + 1] = pair_distance
+                                    constraint_distance_matrix[idx + 1][jdx + 1] = pair_distance
+                                    constraint_distance_matrix[jdx + 1][idx + 1] = pair_distance
                                     if (
                                         pair_distance is None
-                                        or float(pair_distance) < float(min_goal_distance)
+                                        or float(pair_distance) > float(min_goal_distance)
                                     ):
                                         valid_distances = False
                                         break
 
                         if valid_distances:
-                            (
-                                ordered_total_geodesic_distance,
-                                unordered_total_geodesic_distance,
-                            ) = _compute_total_geodesic_distances_from_matrix(
-                                distance_matrix
-                            )
+                            if route_distance_matrix_builder is not None:
+                                distance_matrix = route_distance_matrix_builder(
+                                    start_position,
+                                    sampled_records,
+                                    rng,
+                                )
+                            else:
+                                distance_matrix = constraint_distance_matrix
+
+                            if distance_matrix is None:
+                                valid_distances = False
+                            else:
+                                (
+                                    ordered_total_geodesic_distance,
+                                    unordered_total_geodesic_distance,
+                                ) = _compute_total_geodesic_distances_from_matrix(
+                                    distance_matrix
+                                )
+
+                        if distance_matrix is None:
+                            distance_matrix = constraint_distance_matrix
 
                     start_position_payload = [0.0, 0.0, 0.0]
                     start_rotation_payload = [0.0, 0.0, 0.0, 1.0]
@@ -1995,10 +2043,10 @@ def _build_trajectories(
             ):
                 if retry_round % 20 == 0:
                     tqdm.write(
-                        "[trajectory-builder] Failed min-distance constraints; resampling goals/start: "
+                        "[trajectory-builder] Failed view-point distance constraints; resampling goals/start: "
                         f"episode={trajectory_index}, retry_round={retry_round}, goal_count={int(goal_count)}, "
                         f"distance_max_attempts={int(distance_max_attempts)}, "
-                        f"min_goal_distance={float(min_goal_distance):.3f}"
+                        f"distance_threshold={float(min_goal_distance):.3f}"
                     )
                 continue
 
@@ -2187,7 +2235,7 @@ def parse_args() -> argparse.Namespace:
         "--max-snap-distance",
         type=float,
         default=2.0,
-        help="Maximum x-z snap distance when projecting goals to navmesh",
+        help="Maximum x-z snap distance when projecting sampled start positions to navmesh",
     )
     parser.add_argument(
         "--distance-max-attempts",
@@ -2197,9 +2245,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--min-goal-distance",
+        "--max-goal-viewpoint-distance",
+        dest="min_goal_distance",
         type=float,
         default=4.0,
-        help="Minimum geodesic distance (meters) for start-goal and goal-goal pairs",
+        help="Maximum allowed geodesic distance threshold (meters) over instance view_points for start-goal and goal-goal constraints",
     )
     parser.add_argument(
         "--audio-duration",
@@ -2388,6 +2438,9 @@ def main() -> None:
                     "max_snap_distance": float(args.max_snap_distance),
                     "distance_max_attempts": int(args.distance_max_attempts),
                     "min_goal_distance": float(args.min_goal_distance),
+                    "goal_distance_threshold": float(args.min_goal_distance),
+                    "goal_distance_reference": "instance_view_points",
+                    "goal_distance_constraint_mode": "all_view_points_within_threshold",
                     "audio_duration": int(args.audio_duration),
                     "audio_offset_min": int(args.audio_offset_min),
                     "audio_offset_max": int(args.audio_offset_max),
@@ -2400,21 +2453,16 @@ def main() -> None:
             }
 
             @lru_cache(maxsize=None)
-            def _cached_goal_nav_point(
+            def _cached_goal_view_points(
                 goal_key: str,
-            ) -> Optional[Tuple[float, float, float]]:
+            ) -> Tuple[Tuple[float, float, float], ...]:
                 goal_record = goal_record_cache.get(str(goal_key))
                 if goal_record is None:
-                    return None
-                snapped_goal = _resolve_goal_navmesh_point(
-                    simulator.pathfinder,
-                    goal_record,
-                    dominant_floors,
-                    max_snap_distance=float(args.max_snap_distance),
-                )
-                if snapped_goal is None:
-                    return None
-                return tuple(float(v) for v in snapped_goal.tolist())
+                    return ()
+                instance_key = str(goal_record.get("instance_key", "")).strip()
+                full_record = instance_lookup.get(instance_key, goal_record)
+                view_positions = _view_point_positions(full_record)
+                return tuple(tuple(float(v) for v in position) for position in view_positions)
 
             @lru_cache(maxsize=4096)
             def _cached_start_snap(
@@ -2430,24 +2478,40 @@ def main() -> None:
                 return tuple(float(v) for v in snapped_start.tolist())
 
             @lru_cache(maxsize=None)
-            def _cached_goal_pair_ground_distance(
-                goal_key_a: str,
-                goal_key_b: str,
+            def _cached_path_distance(
+                point_a: Tuple[float, float, float],
+                point_b: Tuple[float, float, float],
             ) -> Optional[float]:
-                cached_nav_a = _cached_goal_nav_point(str(goal_key_a))
-                cached_nav_b = _cached_goal_nav_point(str(goal_key_b))
-                if cached_nav_a is None or cached_nav_b is None:
-                    return None
                 distance = float(
                     multimodal_module._geodesic_distance(
                         simulator.pathfinder,
-                        np.array(cached_nav_a, dtype=np.float32),
-                        np.array(cached_nav_b, dtype=np.float32),
+                        np.array(point_a, dtype=np.float32),
+                        np.array(point_b, dtype=np.float32),
                     )
                 )
                 if not math.isfinite(distance):
                     return None
                 return round(distance, 3)
+
+            @lru_cache(maxsize=None)
+            def _cached_goal_pair_ground_distance(
+                goal_key_a: str,
+                goal_key_b: str,
+            ) -> Optional[float]:
+                view_points_a = _cached_goal_view_points(str(goal_key_a))
+                view_points_b = _cached_goal_view_points(str(goal_key_b))
+                if not view_points_a or not view_points_b:
+                    return None
+
+                worst_distance: Optional[float] = None
+                for point_a in view_points_a:
+                    for point_b in view_points_b:
+                        candidate = _cached_path_distance(point_a, point_b)
+                        if candidate is None:
+                            return None
+                        if worst_distance is None or float(candidate) > float(worst_distance):
+                            worst_distance = float(candidate)
+                return round(float(worst_distance), 3) if worst_distance is not None else None
 
             goal_compatibility_map: Optional[Dict[str, FrozenSet[str]]] = None
 
@@ -2487,20 +2551,18 @@ def main() -> None:
                 if cached_start is None:
                     return None
                 goal_key = _goal_record_cache_key(goal_record)
-                cached_goal = _cached_goal_nav_point(goal_key)
-                if cached_goal is None:
+                cached_goal_view_points = _cached_goal_view_points(goal_key)
+                if not cached_goal_view_points:
                     return None
 
-                distance = float(
-                    multimodal_module._geodesic_distance(
-                        simulator.pathfinder,
-                        np.array(cached_start, dtype=np.float32),
-                        np.array(cached_goal, dtype=np.float32),
-                    )
-                )
-                if not math.isfinite(distance):
-                    return None
-                return round(distance, 3)
+                worst_distance: Optional[float] = None
+                for view_point in cached_goal_view_points:
+                    candidate = _cached_path_distance(cached_start, view_point)
+                    if candidate is None:
+                        return None
+                    if worst_distance is None or float(candidate) > float(worst_distance):
+                        worst_distance = float(candidate)
+                return round(float(worst_distance), 3) if worst_distance is not None else None
 
             start_goal_distance_fn = _start_to_goal_ground_distance
 
@@ -2515,6 +2577,49 @@ def main() -> None:
                 return _cached_goal_pair_ground_distance(goal_key_b, goal_key_a)
 
             goal_pair_distance_fn = _goal_pair_ground_distance
+
+            def _build_route_distance_matrix_from_sampled_view_points(
+                start_position: List[float],
+                sampled_goal_records: List[Dict[str, Any]],
+                rng: random.Random,
+            ) -> Optional[List[List[Optional[float]]]]:
+                if not _is_vec3(start_position):
+                    return None
+                start_key = tuple(round(float(v), 3) for v in start_position)
+                cached_start = _cached_start_snap(start_key)
+                if cached_start is None:
+                    return None
+
+                sampled_goal_points: List[Tuple[float, float, float]] = []
+                for goal_record in sampled_goal_records:
+                    goal_key = _goal_record_cache_key(goal_record)
+                    candidates = list(_cached_goal_view_points(goal_key))
+                    if not candidates:
+                        return None
+                    sampled_goal_points.append(candidates[int(rng.randrange(len(candidates)))])
+
+                n_goals = int(len(sampled_goal_points))
+                distance_matrix: List[List[Optional[float]]] = [
+                    [None for _ in range(n_goals + 1)] for _ in range(n_goals + 1)
+                ]
+                for idx in range(n_goals + 1):
+                    distance_matrix[idx][idx] = 0.0
+
+                for goal_idx, goal_point in enumerate(sampled_goal_points):
+                    distance = _cached_path_distance(cached_start, goal_point)
+                    distance_matrix[0][goal_idx + 1] = distance
+                    distance_matrix[goal_idx + 1][0] = distance
+
+                for idx in range(n_goals):
+                    for jdx in range(idx + 1, n_goals):
+                        pair_distance = _cached_path_distance(
+                            sampled_goal_points[idx],
+                            sampled_goal_points[jdx],
+                        )
+                        distance_matrix[idx + 1][jdx + 1] = pair_distance
+                        distance_matrix[jdx + 1][idx + 1] = pair_distance
+
+                return distance_matrix
 
             if len(records) > 1:
                 goal_compatibility_map = _build_goal_compatibility_map(
@@ -2553,6 +2658,7 @@ def main() -> None:
             start_sampler=start_sampler,
             start_goal_distance_fn=start_goal_distance_fn,
             goal_pair_distance_fn=goal_pair_distance_fn,
+            route_distance_matrix_builder=_build_route_distance_matrix_from_sampled_view_points,
             goal_compatibility_map=goal_compatibility_map,
             distance_max_attempts=int(args.distance_max_attempts),
             min_goal_distance=float(args.min_goal_distance),
