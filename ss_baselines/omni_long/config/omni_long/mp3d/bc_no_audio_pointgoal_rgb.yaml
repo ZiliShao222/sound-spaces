@@ -1,0 +1,108 @@
+BASE_TASK_CONFIG_PATH: "configs/omni-long/mp3d/omni-long_semantic_audio_ppo.yaml"  # 基础任务配置文件路径(定义了任务环境、传感器等)
+TRAINER_NAME: "OmniLongBCTrainer"  # 训练器名称: Behavior Cloning训练器，使用强化学习训练
+ENV_NAME: "OmniLongRLEnv"  # 环境名称: Omni-Long强化学习环境，“仿真环境类”
+NUM_PROCESSES: 8  # 并行进程数: 同时运行8个仿真环境进行训练(脚本中可覆盖为4)
+SENSORS: ["RGB_SENSOR", "DEPTH_SENSOR"]  # 使用的传感器列表: RGB图像 + 深度图
+NUM_UPDATES: 20000  # 总训练步数: 更新20000次神经网络参数
+LOG_INTERVAL: 10  # 日志间隔: 每10步打印一次训练日志
+CHECKPOINT_INTERVAL: 50  # 检查点间隔: 每50步保存一次模型
+VIDEO_OPTION: []  # 视频保存选项: 空数组表示不保存视频
+VISUALIZATION_OPTION: []  # 可视化选项: 空数组表示不保存可视化结果
+CONTINUOUS: True  # 是否连续动作空间: True表示动作是连续的(如速度、角度),False表示离散的(如前进、左转)，有问题后续问问这啥
+
+# Weights & Biases配置: 用于在线跟踪实验
+WANDB:
+  ENABLED: True
+  PROJECT: "omni-long"  # WANDB项目名称
+  ENTITY: ""  # WANDB团队/实体名称: 空表示使用个人账号
+  NAME: ""  # 实验名称: 空表示自动生成
+  GROUP: ""  # 实验分组: 用于组织相关实验
+  JOB_TYPE: "bc"  # 任务类型: bc=Behavior Cloning
+  NOTES: ""  # 实验备注: 可记录实验描述
+  TAGS: []  # 实验标签: 用于分类和搜索
+  MODE: "online"  # 运行模式: online=实时上传,offline=本地缓存
+  DIR: ""  # WANDB本地缓存目录: 空表示默认目录
+  RESUME: "allow"  # 是否允许恢复: allow=允许从断点继续
+  SYNC_TENSORBOARD: True  # 是否同步Tensorboard日志到WANDB
+
+# 强化学习参数配置
+RL:
+  SUCCESS_REWARD: 20.0  # 成功奖励: 找到所有目标时的奖励
+  SLACK_REWARD: -0.01  # 惩罚奖励: 每步都给-0.01,鼓励快速完成任务
+  ORDERED_SUCCESS_REWARD: 20.0  # Ordered模式成功奖励: 按顺序找到目标的奖励
+  UNORDERED_SUCCESS_REWARD: 20.0  # Unordered模式成功奖励: 不按顺序找到目标的奖励
+  ORDERED_SLACK_REWARD: -0.01  # Ordered模式每步惩罚
+  UNORDERED_SLACK_REWARD: -0.01  # Unordered模式每步惩罚
+  DYNAMIC_TIME_PENALTY: False  # 是否启用动态时间惩罚: False表示不启用，指随时间增加，惩罚增加
+  TIME_PENALTY_DECAY: 0.75  # 时间惩罚衰减系数: 0.75表示每步衰减到75%
+  TIME_PENALTY_MIN_SCALE: 0.25  # 时间惩罚最小系数: 最小为0.25倍
+  ORDERED_TIME_PENALTY_DECAY: 0.75  # Ordered模式时间惩罚衰减
+  UNORDERED_TIME_PENALTY_DECAY: 0.75  # Unordered模式时间惩罚衰减
+  ORDERED_TIME_PENALTY_MIN_SCALE: 0.25  # Ordered模式最小时间惩罚系数
+  UNORDERED_TIME_PENALTY_MIN_SCALE: 0.25  # Unordered模式最小时间惩罚系数
+  WITH_TIME_PENALTY: True  # 是否启用时间惩罚: True表示每步都有负奖励
+  WITH_DISTANCE_REWARD: True  # 是否启用距离奖励: True表示越接近目标奖励越高
+  DISTANCE_REWARD_SCALE: 1.0  # 距离奖励缩放系数: 1.0表示原始距离奖励
+  STOP_PENALTY: -5.0  # 停止动作惩罚: 提前停止的惩罚
+  PREMATURE_STOP_PENALTY: 0.0  # 过早停止惩罚: 未完成就停止的惩罚
+  FINAL_STOP_REWARD: 0.0  # 最终停止奖励: 完成任务后停止的奖励
+  SUBMIT_PENALTY: -2.0  # 提交惩罚: 错误提交目标的惩罚
+  INVALID_SUBMIT_PENALTY: 0.0  # 无效提交惩罚: 提交错误目标的惩罚
+  FOUND_GOAL_REWARD: 10.0  # 找到目标奖励: 找到一个目标给10分
+  ORDERED_STOP_PENALTY: -5.0  # Ordered模式停止惩罚
+  ORDERED_PREMATURE_STOP_PENALTY: 0.0  # Ordered模式过早停止惩罚
+  ORDERED_FINAL_STOP_REWARD: 0.0  # Ordered模式最终停止奖励
+  ORDERED_SUBMIT_PENALTY: -2.0  # Ordered模式提交惩罚，抽象点，提交也需要消耗能量
+  ORDERED_INVALID_SUBMIT_PENALTY: 0.0  # Ordered模式无效提交惩罚
+  ORDERED_FOUND_GOAL_REWARD: 10.0  # Ordered模式找到目标奖励
+  UNORDERED_STOP_PENALTY: -5.0  # Unordered模式停止惩罚
+  UNORDERED_PREMATURE_STOP_PENALTY: 0.0  # Unordered模式过早停止惩罚
+  UNORDERED_FINAL_STOP_REWARD: 0.0  # Unordered模式最终停止奖励
+  UNORDERED_SUBMIT_PENALTY: -2.0  # Unordered模式提交惩罚
+  UNORDERED_INVALID_SUBMIT_PENALTY: 0.0  # Unordered模式无效提交惩罚
+  UNORDERED_FOUND_GOAL_REWARD: 10.0  # Unordered模式找到目标奖励
+  REWARD_MEASURE: "omni_long_distance_to_goal_reward"  # 奖励度量函数名称: 距离目标的奖励函数
+  SUCCESS_MEASURE: "lifelong_task_success"  # 成功度量函数名称: 终身任务成功率
+  END_ON_SUCCESS: True  # 成功后是否结束: True表示找到所有目标后立即结束
+
+  # PPO策略网络参数 (PPO=Proximal Policy Optimization)，是一种基于策略梯度的强化学习算法，用于训练模型
+  PPO:
+    hidden_size: 512
+    transformer_memory_size: 32  # Transformer记忆大小: 记住最近32个时间步
+    transformer_nhead: 8
+    transformer_num_layers: 2
+    transformer_dropout: 0.1
+    transformer_dim_feedforward: 1024  # Transformer前馈网络维度: 1024维
+    clip_model: "RN50"  # ResNet-50
+    use_clip_rgb: True  # 是否使用CLIP编码RGB: True表示用CLIP提取RGB特征
+    audio_sensor_uuid: ""  # 音频传感器UUID: 空字符串表示不使用音频
+    goal_embedding_size: 512  # 目标嵌入维度: 目标向量化后的维度为512
+    goal_clip_model: "ViT-B/32"  # 目标CLIP模型: Vision Transformer Base
+    goal_image_uuid: "omni_long_goal_image"  # 目标图像UUID: 环境中目标图像的唯一标识符
+    goal_text_uuid: "omni_long_goal_text"  # 目标文本UUID: 环境中目标文本描述的唯一标识符
+    goal_modality_uuid: "omni_long_goal_modality"  # 目标模态UUID: 表示目标是图像/文本/音频
+    goal_mask_uuid: "goal_mask"  # 目标掩码UUID: 标记哪些目标有效的掩码
+    task_mode_uuid: "task_mode_flag"  # 任务模式UUID: 标记Ordered/Unordered模式
+    depth_embedding_size: 128  # 深度图嵌入维度: 深度图编码后的维度为128
+    audio_embedding_size: 128  # 音频嵌入维度: 音频编码后的维度为128
+    pointgoal_embedding_size: 32  # 点目标嵌入维度: 点目标(距离+角度)编码后的维度为32
+    gps_embedding_size: 32  # GPS嵌入维度: 位置坐标编码后的维度为32
+    compass_embedding_size: 32  # 罗盘嵌入维度: 方向角度编码后的维度为32
+    prev_action_embedding_size: 32  # 上一个动作嵌入维度: 历史动作编码后的维度为32
+    use_depth_encoder: True  # 是否使用深度编码器: True表示编码深度图
+    use_audio_encoder: False  # 是否使用音频编码器: False表示不使用音频编码器
+    goal_attention_debug: False  # 目标注意力调试: False表示不保存注意力权重
+    goal_attention_debug_interval: 200  # 调试保存间隔: 每200步保存一次注意力(如果启用)
+    goal_attention_debug_max_logs: 20  # 最大调试日志数: 最多保存20次注意力日志
+
+  # BC (Behavior Cloning) 训练参数
+  BC:
+    lr: 2.5e-4
+    eps: 1e-5
+    max_grad_norm: 0.5  # 最大梯度范数: 梯度裁剪阈值,防止梯度爆炸
+    num_steps: 64  # 采样步数: 每次更新从64个时间步收集数据
+    bc_epoch: 4
+    num_mini_batch: 1
+    reward_window_size: 50  # 奖励窗口大小: 计算最近50步的平均奖励
+    use_linear_lr_decay: True  # 是否使用线性学习率衰减: True表示学习率逐渐降低
+    expert_success_distance: 1.0

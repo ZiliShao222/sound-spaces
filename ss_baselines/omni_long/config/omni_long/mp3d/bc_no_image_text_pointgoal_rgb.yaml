@@ -1,0 +1,104 @@
+BASE_TASK_CONFIG_PATH: "configs/omni-long/mp3d/omni-long_semantic_audio_bc.yaml"
+TRAINER_NAME: "OmniLongBCTrainer"
+ENV_NAME: "OmniLongRLEnv"
+NUM_PROCESSES: 8
+SENSORS: ["RGB_SENSOR", "DEPTH_SENSOR"]
+NUM_UPDATES: 20000
+LOG_INTERVAL: 10
+CHECKPOINT_INTERVAL: 50
+VIDEO_OPTION: []
+VISUALIZATION_OPTION: []
+CONTINUOUS: True
+
+WANDB:
+  ENABLED: True
+  PROJECT: "omni-long"
+  ENTITY: ""
+  NAME: ""
+  GROUP: ""
+  JOB_TYPE: "bc"
+  NOTES: ""
+  TAGS: []
+  MODE: "online"
+  DIR: ""
+  RESUME: "allow"
+  SYNC_TENSORBOARD: True
+
+RL:
+  SUCCESS_REWARD: 20.0
+  SLACK_REWARD: -0.01
+  ORDERED_SUCCESS_REWARD: 20.0
+  UNORDERED_SUCCESS_REWARD: 20.0
+  ORDERED_SLACK_REWARD: -0.01
+  UNORDERED_SLACK_REWARD: -0.01
+  DYNAMIC_TIME_PENALTY: False
+  TIME_PENALTY_DECAY: 0.75
+  TIME_PENALTY_MIN_SCALE: 0.25
+  ORDERED_TIME_PENALTY_DECAY: 0.75
+  UNORDERED_TIME_PENALTY_DECAY: 0.75
+  ORDERED_TIME_PENALTY_MIN_SCALE: 0.25
+  UNORDERED_TIME_PENALTY_MIN_SCALE: 0.25
+  WITH_TIME_PENALTY: True
+  WITH_DISTANCE_REWARD: True
+  DISTANCE_REWARD_SCALE: 1.0
+  STOP_PENALTY: -5.0
+  PREMATURE_STOP_PENALTY: 0.0
+  FINAL_STOP_REWARD: 0.0
+  SUBMIT_PENALTY: -2.0
+  INVALID_SUBMIT_PENALTY: 0.0
+  FOUND_GOAL_REWARD: 10.0
+  ORDERED_STOP_PENALTY: -5.0
+  ORDERED_PREMATURE_STOP_PENALTY: 0.0
+  ORDERED_FINAL_STOP_REWARD: 0.0
+  ORDERED_SUBMIT_PENALTY: -2.0
+  ORDERED_INVALID_SUBMIT_PENALTY: 0.0
+  ORDERED_FOUND_GOAL_REWARD: 10.0
+  UNORDERED_STOP_PENALTY: -5.0
+  UNORDERED_PREMATURE_STOP_PENALTY: 0.0
+  UNORDERED_FINAL_STOP_REWARD: 0.0
+  UNORDERED_SUBMIT_PENALTY: -2.0
+  UNORDERED_INVALID_SUBMIT_PENALTY: 0.0
+  UNORDERED_FOUND_GOAL_REWARD: 10.0
+  REWARD_MEASURE: "omni_long_distance_to_goal_reward"
+  SUCCESS_MEASURE: "lifelong_task_success"
+  END_ON_SUCCESS: True
+
+  PPO:
+    hidden_size: 512
+    transformer_memory_size: 32
+    transformer_nhead: 8
+    transformer_num_layers: 2
+    transformer_dropout: 0.1
+    transformer_dim_feedforward: 1024
+    clip_model: "RN50"
+    use_clip_rgb: True
+    audio_sensor_uuid: "audiogoal"
+    goal_embedding_size: 512
+    goal_clip_model: "ViT-B/32"
+    goal_image_uuid: ""
+    goal_text_uuid: ""
+    goal_modality_uuid: ""
+    goal_mask_uuid: ""
+    task_mode_uuid: "task_mode_flag"
+    depth_embedding_size: 128
+    audio_embedding_size: 128
+    pointgoal_embedding_size: 32
+    gps_embedding_size: 32
+    compass_embedding_size: 32
+    prev_action_embedding_size: 32
+    use_depth_encoder: True
+    use_audio_encoder: True
+    goal_attention_debug: False
+    goal_attention_debug_interval: 200
+    goal_attention_debug_max_logs: 20
+
+  BC:
+    lr: 2.5e-4
+    eps: 1e-5
+    max_grad_norm: 0.5
+    num_steps: 64
+    bc_epoch: 4
+    num_mini_batch: 1
+    reward_window_size: 50
+    use_linear_lr_decay: True
+    expert_success_distance: 1.0
