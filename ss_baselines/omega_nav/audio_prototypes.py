@@ -74,6 +74,8 @@ class OfflineAcousticPrototypeLibrary:
         encoder_sampling_rate_hz: Optional[int] = None,
         prototype_window_sec: float = 1.0,
         prototype_hop_sec: float = 0.5,
+        prototype_min_window_rms: float = 0.01,
+        prototype_window_rms_ratio: float = 0.25,
         device: Optional[torch.device] = None,
     ) -> None:
         self._clean_sound_dir = Path(clean_sound_dir)
@@ -82,6 +84,8 @@ class OfflineAcousticPrototypeLibrary:
         self._device = device or torch.device("cpu")
         self._prototype_window_sec = max(float(prototype_window_sec), 0.1)
         self._prototype_hop_sec = max(float(prototype_hop_sec), 0.05)
+        self._prototype_min_window_rms = max(float(prototype_min_window_rms), 0.0)
+        self._prototype_window_rms_ratio = max(float(prototype_window_rms_ratio), 0.0)
         self._encoder_sampling_rate_hz = max(
             int(encoder_sampling_rate_hz or observation_sampling_rate_hz),
             1,
@@ -216,6 +220,7 @@ class OfflineAcousticPrototypeLibrary:
         window_size = int(round(self._prototype_window_sec * self._encoder_sampling_rate_hz))
         hop_size = int(round(self._prototype_hop_sec * self._encoder_sampling_rate_hz))
         windows = self._sliding_windows(mono, window_size=window_size, hop_size=hop_size)
+        windows = self._select_informative_windows(windows)
 
         embeddings: List[np.ndarray] = []
         for window in windows:
@@ -224,6 +229,8 @@ class OfflineAcousticPrototypeLibrary:
 
         prototype = np.mean(np.stack(embeddings, axis=0), axis=0).astype(np.float32)
         norm = float(np.linalg.norm(prototype))
+        if norm <= 1e-8:
+            return prototype.astype(np.float32)
         prototype = prototype / norm
         return prototype.astype(np.float32)
 
@@ -256,6 +263,28 @@ class OfflineAcousticPrototypeLibrary:
             end_index = start_index + window_size
             windows.append(self._pad_or_trim(audio[start_index:end_index], window_size))
         return windows
+
+    def _select_informative_windows(self, windows: Sequence[np.ndarray]) -> List[np.ndarray]:
+        if not windows:
+            return []
+        rms_values = np.asarray(
+            [float(np.sqrt(np.mean(np.square(np.asarray(window, dtype=np.float32))))) for window in windows],
+            dtype=np.float32,
+        )
+        max_rms = float(np.max(rms_values)) if rms_values.size > 0 else 0.0
+        threshold = max(
+            float(self._prototype_min_window_rms),
+            float(self._prototype_window_rms_ratio) * max_rms,
+        )
+        selected = [
+            np.asarray(window, dtype=np.float32)
+            for window, rms in zip(windows, rms_values)
+            if float(rms) >= threshold
+        ]
+        if selected:
+            return selected
+        best_index = int(np.argmax(rms_values)) if rms_values.size > 0 else 0
+        return [np.asarray(windows[best_index], dtype=np.float32)]
 
     def _pad_or_trim(self, waveform: np.ndarray, target_size: int) -> np.ndarray:
         audio = np.asarray(waveform, dtype=np.float32).reshape(-1)

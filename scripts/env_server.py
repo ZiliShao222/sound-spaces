@@ -9,7 +9,7 @@ import os
 import signal
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import habitat
 from habitat.config import Config
@@ -374,18 +374,35 @@ class OmniLongEnvServer:
             return
         print("[env_server] next_eval_episode=" + json.dumps(next_episode, ensure_ascii=False))
 
-    def _print_current_episode_summary(self) -> None:
+    def _print_current_episode_summary(
+        self,
+        goal_specs: Optional[Sequence[Tuple[str, str]]] = None,
+    ) -> None:
         if self.current_episode is None or self.current_episode_index < 0:
             return
+        resolved_goal_specs = list(
+            goal_specs
+            or _normalize_task_specs(
+                getattr(self.current_episode, "tasks", None)
+                or getattr(self.current_episode, "goals", None)
+            )
+        )
         print(
-            "[env_server] episode_start="
-            + json.dumps(
-                {
-                    "episode_index": int(self.current_episode_index),
-                    "episode_id": str(getattr(self.current_episode, "episode_id", "")),
-                    "scene": _scene_key(str(getattr(self.current_episode, "scene_id", ""))),
-                },
-                ensure_ascii=False,
+            "[env_server] episode_start "
+            f"index={int(self.current_episode_index)} "
+            f"id={str(getattr(self.current_episode, 'episode_id', ''))} "
+            f"scene={_scene_key(str(getattr(self.current_episode, 'scene_id', '')))} "
+            f"goal_count={len(resolved_goal_specs)}"
+        )
+        print(
+            "[env_server] goals="
+            + (
+                ", ".join(
+                    f"{str(instance_key)}/{str(modality)}"
+                    for instance_key, modality in resolved_goal_specs
+                )
+                if resolved_goal_specs
+                else "none"
             )
         )
 
@@ -487,11 +504,12 @@ class OmniLongEnvServer:
         episode = self.episodes[self.current_episode_index]
         self.env.current_episode = episode
         observations = self.env.reset()
+        goal_specs = _normalize_task_specs(
+            getattr(episode, "tasks", None) or getattr(episode, "goals", None)
+        )
         goal_inputs: List[Dict[str, Any]] = []
         scene_records = self._scene_instance_records(str(getattr(episode, "scene_id", "")))
-        for instance_key, modality in _normalize_task_specs(
-            getattr(episode, "tasks", None) or getattr(episode, "goals", None)
-        ):
+        for instance_key, modality in goal_specs:
             goal_inputs.append(
                 _build_goal_input_payload(
                     env=self.env,
@@ -508,7 +526,7 @@ class OmniLongEnvServer:
         self.current_done = False
         self.current_video_frames = []
         self.current_video_audios = []
-        self._print_current_episode_summary()
+        self._print_current_episode_summary(goal_specs)
         self._print_next_episode_summary()
         return {
             "op": "episode_start",

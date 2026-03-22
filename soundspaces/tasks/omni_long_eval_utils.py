@@ -142,6 +142,9 @@ def _render_reference_image(
     position = render_view.get("agent_base_position")
     if not _is_vec3(position):
         position = render_view.get("position")
+        if _is_vec3(position):
+            sensor_height = float(getattr(getattr(getattr(env.sim, "config", None), "RGB_SENSOR", None), "POSITION", [0.0, 0.0, 0.0])[1])
+            position = [float(position[0]), float(position[1]) - sensor_height, float(position[2])]
     rotation = render_view.get("rotation")
     agent_state = render_view.get("agent_state")
     if isinstance(agent_state, dict):

@@ -55,6 +55,13 @@ class OmegaNavPolicy(LifelongEvalPolicy):
             device=self._device,
         )
         self._image_goal_yolo_model = YOLO("models/yolo26x.pt")
+        self._image_goal_yolo_output_dir = Path("outputs/omega_nav/yolo_detections")
+        existing_yolo_outputs = (
+            tuple(self._image_goal_yolo_output_dir.glob("*.png"))
+            if self._image_goal_yolo_output_dir.exists()
+            else ()
+        )
+        self._image_goal_yolo_output_index = len(existing_yolo_outputs)
         self._audio_prototype_library.ensure_loaded()
         self._perception.set_audio_runtime(self._audio_prototype_library)
         labels = tuple(self._audio_prototype_library.prototype_labels)
@@ -90,14 +97,22 @@ class OmegaNavPolicy(LifelongEvalPolicy):
         self._perception.reset(observations)
         self._goal_ids = tuple(f"goal_{i:03d}" for i in range(len(goal_payloads)))
         self._goal_embeddings = self._perception.encode_goals(self._goal_ids, goal_payloads)
+        episode_label = (
+            re.sub(r"[^0-9A-Za-z._-]+", "_", str(getattr(episode, "episode_id", "")).strip()) or "episode"
+        )
 
-        def detect_image_objects(image: np.ndarray) -> Tuple[str, ...]:
+        def detect_image_objects(image: np.ndarray, goal_id: str) -> Tuple[str, ...]:
             result = self._image_goal_yolo_model.predict(
                 source=np.ascontiguousarray(np.asarray(image)),
                 conf=0.7,
                 iou=0.45,
-                max_det=50,
+                max_det=10,
             )[0]
+            # output_path = self._image_goal_yolo_output_dir / (
+            #     f"{episode_label}_{goal_id}_{self._image_goal_yolo_output_index:06d}.png"
+            # )
+            # result.save(filename=str(output_path))
+            # self._image_goal_yolo_output_index += 1
             class_ids = result.boxes.cls.detach().cpu().numpy().astype(np.int64)
             confidences = result.boxes.conf.detach().cpu().numpy()
             scored: Dict[str, float] = {}
@@ -125,29 +140,12 @@ class OmegaNavPolicy(LifelongEvalPolicy):
                 return ()
             subject = re.split(r"\b(?:is|are)\b", normalized_text, maxsplit=1)[0]
             goal_object = normalize_object_phrase(subject)
-            other_objects: List[str] = []
-            relation_patterns = (
-                r"\bnext to\s+([^.,;]+)",
-                r"\bnear\s+([^.,;]+)",
-                r"\bbeside\s+([^.,;]+)",
-                r"\bby\s+([^.,;]+)",
-                r"\bbetween\s+([^.,;]+)",
-            )
-            for pattern in relation_patterns:
-                for match in re.finditer(pattern, normalized_text):
-                    segment = str(match.group(1)).strip()
-                    pieces = re.split(r"\band\b|,", segment)
-                    for piece in pieces:
-                        obj = normalize_object_phrase(piece)
-                        if obj and obj not in other_objects:
-                            other_objects.append(obj)
-            objects = ([goal_object] if goal_object else []) + other_objects
-            return tuple(objects[:4])
+            return (goal_object,) if goal_object else ()
 
-        def build_goal_json(payload: Dict[str, Any]) -> Dict[str, Any]:
+        def build_goal_json(goal_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             modality = str(payload.get("modality", "")).lower() or "object"
             labels = (
-                detect_image_objects(payload.get("image"))
+                detect_image_objects(payload.get("image"), goal_id)
                 if modality == "image" and isinstance(payload.get("image"), np.ndarray)
                 else detect_text_objects(payload.get("text"))
                 if modality in {"description", "text"}
@@ -169,7 +167,7 @@ class OmegaNavPolicy(LifelongEvalPolicy):
         for goal_id, payload in zip(self._goal_ids, goal_payloads):
             modality = str(payload.get("modality", "")).lower() or "object"
             self._goal_modalities[goal_id] = modality
-            goal_json = build_goal_json(payload)
+            goal_json = build_goal_json(goal_id, payload)
             self._goal_jsons[goal_id] = goal_json
             goal_category = goal_json.get("goal_category")
             other_objects = goal_json.get("other_objects", [])
@@ -202,14 +200,11 @@ class OmegaNavPolicy(LifelongEvalPolicy):
         for label in self._resolve_episode_audio_labels(episode):
             self._audio_episode_dict.setdefault(label, self._audio_global[label])
         self._perception.set_audio_candidates(self._audio_episode_dict)
+        self._perception.set_audio_goal_cycle(self._goal_ids, self._audio_goal_labels)
         print(
             "[omega_nav][start_episode] "
             + json.dumps(
                 {
-                    # "goal_modalities": dict(self._goal_modalities),
-                    # "goal_jsons": dict(self._goal_jsons),
-                    # "goal_embedding_dims": self._perception.goal_embedding_dims(),
-                    # "audio_goal_labels": {k: list(v) for k, v in self._audio_goal_labels.items()},
                     "audio_episode_labels": list(self._audio_episode_dict.keys()),
                 },
                 ensure_ascii=False,
@@ -235,6 +230,7 @@ class OmegaNavPolicy(LifelongEvalPolicy):
             "unsupported_audio_goals": list(self._unsupported_audio_goals),
             "map_summary": self._last_perception.map_state.summary() if self._last_perception is not None else {},
             "audio_summary": self._last_perception.audio_state.summary() if self._last_perception is not None else {},
+            "audio_tracker": self._perception.audio_debug_state(),
             "action": self._last_action,
             "info": self._last_info,
         }

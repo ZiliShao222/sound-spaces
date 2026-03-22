@@ -57,6 +57,10 @@ class SemanticVoxelMap:
         explored = np.zeros((self._grid_size, self._grid_size), dtype=np.uint8)
         frontier = np.zeros((self._grid_size, self._grid_size), dtype=np.uint8)
         goal_maps = {goal_id: np.zeros((self._grid_size, self._grid_size), dtype=np.float32) for goal_id in goal_embeddings}
+        goal_peaks = {
+            goal_id: {"score": 0.0, "position": [], "cell": []}
+            for goal_id in goal_embeddings
+        }
         occupied_voxel_count = 0
         semantic_voxel_count = 0
 
@@ -82,6 +86,12 @@ class SemanticVoxelMap:
                 score = float(np.dot(cell.feature, goal_embedding))
                 if score > float(goal_maps[goal_id][gx, gz]):
                     goal_maps[goal_id][gx, gz] = score
+                if score > float(goal_peaks[goal_id].get("score", 0.0)):
+                    goal_peaks[goal_id] = {
+                        "score": float(score),
+                        "position": np.asarray(center, dtype=np.float32).copy(),
+                        "cell": [int(index[0]), int(index[1]), int(index[2])],
+                    }
 
         for gx in range(1, self._grid_size - 1):
             for gz in range(1, self._grid_size - 1):
@@ -95,6 +105,7 @@ class SemanticVoxelMap:
             explored=explored,
             frontier=frontier,
             goal_maps=goal_maps,
+            goal_peaks=goal_peaks,
             voxel_count=len(self._voxels),
             occupied_voxel_count=occupied_voxel_count,
             semantic_voxel_count=semantic_voxel_count,

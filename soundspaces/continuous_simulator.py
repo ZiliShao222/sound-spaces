@@ -390,7 +390,7 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
 
     @property
     def is_silent(self):
-        return self._episode_step_count > self._duration
+        return (not bool(getattr(self.config.AUDIO, "EVERLASTING", False))) and self._episode_step_count > self._duration
 
     @property
     def pathfinder(self):
@@ -538,7 +538,7 @@ class ContinuousSoundSpacesSim(Simulator, ABC):
         sampling_rate = self.config.AUDIO.RIR_SAMPLING_RATE
         if not self._audio_enabled():
             return np.zeros((2, sampling_rate))
-        if self._episode_step_count > self._duration:
+        if (not bool(getattr(self.config.AUDIO, "EVERLASTING", False))) and self._episode_step_count > self._duration:
             logging.debug('Step count is greater than duration. Empty spectrogram.')
             audiogoal = np.zeros((2, sampling_rate))
         else:

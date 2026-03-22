@@ -11,11 +11,29 @@ visual:
 audio:
   anchor_count: 5
   aggregation_window: 2
+  waveform_window_sec: 1.0
   detection_threshold: 0.65
   embedding_dim: 32
   ear_distance_m: 0.18
   speed_of_sound_mps: 343.0
   reference_rms: 0.05
+  sampling_rate_hz: 16000
+  step_time_s: 0.25
+  protocol_cycle_steps: 25
+  protocol_transient_steps: 3
+  trace_history_size: 32
+  goal_queue_size: 24
+  gcc_interp: 8
+  bearing_peak_exclusion_bins: 8
+  bearing_min_peak_ratio: 1.05
+  bearing_min_confidence: 0.15
+  belief_ray_sigma_m: 0.75
+  belief_max_range_m: 0.0
+  triangulation_min_rays: 3
+  triangulation_history_size: 24
+  triangulation_max_condition_number: 80.0
+  triangulation_min_pair_angle_deg: 5.0
+  target_visual_score_threshold: 0.5
 
 depth:
   map_resolution_m: 0.25
