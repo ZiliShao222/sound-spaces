@@ -24,9 +24,11 @@ class SemanticVoxelMapState:
     frontier: np.ndarray
     goal_maps: Dict[str, np.ndarray] = field(default_factory=dict)
     goal_peaks: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    audio_peak: Dict[str, Any] = field(default_factory=dict)
     voxel_count: int = 0
     occupied_voxel_count: int = 0
     semantic_voxel_count: int = 0
+    audio_voxel_count: int = 0
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -34,6 +36,7 @@ class SemanticVoxelMapState:
             "voxel_count": int(self.voxel_count),
             "occupied_voxel_count": int(self.occupied_voxel_count),
             "semantic_voxel_count": int(self.semantic_voxel_count),
+            "audio_voxel_count": int(self.audio_voxel_count),
             "explored_cells": int(self.explored.sum()),
             "frontier_cells": int(self.frontier.sum()),
             "goal_map_keys": list(self.goal_maps.keys()),
@@ -48,9 +51,11 @@ class SemanticVoxelMapState:
                 "frontier": self.frontier,
                 "goal_maps": self.goal_maps,
                 "goal_peaks": self.goal_peaks,
+                "audio_peak": self.audio_peak,
                 "voxel_count": self.voxel_count,
                 "occupied_voxel_count": self.occupied_voxel_count,
                 "semantic_voxel_count": self.semantic_voxel_count,
+                "audio_voxel_count": self.audio_voxel_count,
             }
         )
 
@@ -110,7 +115,6 @@ class AudioProtocolState:
     stable_end_step: int = -1
     is_transient: bool = False
     is_stable: bool = False
-    queue_depth: int = 0
     expected_labels: Tuple[str, ...] = ()
 
     def summary(self) -> Dict[str, Any]:
@@ -127,7 +131,6 @@ class AudioProtocolState:
             "stable_end_step": int(self.stable_end_step),
             "is_transient": bool(self.is_transient),
             "is_stable": bool(self.is_stable),
-            "queue_depth": int(self.queue_depth),
             "expected_labels": [str(label) for label in self.expected_labels],
         }
 
@@ -139,153 +142,52 @@ class AudioProtocolState:
 class AudioBearingEstimate:
     is_valid: bool = False
     reason: str = ""
+    frame_reason: str = ""
     relative_bearing_rad: float = 0.0
     relative_bearing_deg: float = 0.0
+    world_bearing_rad: float = 0.0
+    world_bearing_deg: float = 0.0
     tau_s: float = 0.0
     tau_samples: float = 0.0
+    predicted_tau_s: float = 0.0
+    predicted_tau_samples: float = 0.0
     max_tau_s: float = 0.0
     peak: float = 0.0
     peak_ratio: float = 0.0
     confidence: float = 0.0
+    posterior_peak: float = 0.0
+    posterior_entropy: float = 1.0
+    posterior_margin: float = 0.0
+    heading_span_deg: float = 0.0
+    evidence_frame_count: int = 0
+    window_frame_count: int = 0
     direction: str = ""
+    valid_subframe_count: int = 0
+    total_subframe_count: int = 0
+    spread_deg: float = 0.0
 
     def summary(self) -> Dict[str, Any]:
         return {
             "is_valid": bool(self.is_valid),
             "reason": str(self.reason),
-            "relative_bearing_rad": round(float(self.relative_bearing_rad), 4),
+            "frame_reason": str(self.frame_reason),
             "relative_bearing_deg": round(float(self.relative_bearing_deg), 2),
-            "tau_s": float(self.tau_s),
+            "world_bearing_deg": round(float(self.world_bearing_deg), 2),
             "tau_samples": round(float(self.tau_samples), 2),
-            "max_tau_s": float(self.max_tau_s),
+            "predicted_tau_samples": round(float(self.predicted_tau_samples), 2),
             "peak": round(float(self.peak), 3),
             "peak_ratio": round(float(self.peak_ratio), 3),
             "confidence": round(float(self.confidence), 3),
+            "posterior_peak": round(float(self.posterior_peak), 4),
+            "posterior_entropy": round(float(self.posterior_entropy), 4),
+            "posterior_margin": round(float(self.posterior_margin), 4),
+            "heading_span_deg": round(float(self.heading_span_deg), 2),
+            "evidence_frame_count": int(self.evidence_frame_count),
+            "window_frame_count": int(self.window_frame_count),
             "direction": str(self.direction),
-        }
-
-    def to_dict(self) -> Dict[str, Any]:
-        return as_serializable(self.summary())
-
-
-@dataclass
-class AudioRay2D:
-    is_valid: bool = False
-    reason: str = ""
-    goal_id: str = ""
-    step_index: int = -1
-    origin_xz: Optional[np.ndarray] = None
-    direction_xz: Optional[np.ndarray] = None
-    world_bearing_rad: float = 0.0
-    world_bearing_deg: float = 0.0
-    confidence: float = 0.0
-
-    def summary(self) -> Dict[str, Any]:
-        return {
-            "is_valid": bool(self.is_valid),
-            "reason": str(self.reason),
-            "goal_id": str(self.goal_id),
-            "step_index": int(self.step_index),
-            "origin_xz": np.round(np.asarray(self.origin_xz, dtype=np.float32), 3).tolist()
-            if self.origin_xz is not None
-            else [],
-            "direction_xz": np.round(np.asarray(self.direction_xz, dtype=np.float32), 4).tolist()
-            if self.direction_xz is not None
-            else [],
-            "world_bearing_rad": round(float(self.world_bearing_rad), 4),
-            "world_bearing_deg": round(float(self.world_bearing_deg), 2),
-            "confidence": round(float(self.confidence), 3),
-        }
-
-    def to_dict(self) -> Dict[str, Any]:
-        return as_serializable(self.summary())
-
-
-@dataclass
-class AudioBelief2DState:
-    goal_id: str = ""
-    ray_count: int = 0
-    total_mass: float = 0.0
-    peak_value: float = 0.0
-    entropy: float = 0.0
-    peak_cell: Tuple[int, int] = (-1, -1)
-    peak_world: Optional[np.ndarray] = None
-
-    def summary(self) -> Dict[str, Any]:
-        return {
-            "goal_id": str(self.goal_id),
-            "ray_count": int(self.ray_count),
-            "total_mass": round(float(self.total_mass), 3),
-            "peak_value": round(float(self.peak_value), 3),
-            "entropy": round(float(self.entropy), 3),
-            "peak_cell": [int(self.peak_cell[0]), int(self.peak_cell[1])],
-            "peak_world": np.round(np.asarray(self.peak_world, dtype=np.float32), 3).tolist()
-            if self.peak_world is not None
-            else [],
-        }
-
-    def to_dict(self) -> Dict[str, Any]:
-        return as_serializable(self.summary())
-
-
-@dataclass
-class AudioTriangulation2D:
-    is_valid: bool = False
-    reason: str = ""
-    goal_id: str = ""
-    ray_count: int = 0
-    point_xz: Optional[np.ndarray] = None
-    condition_number: float = 0.0
-    mean_residual_m: float = 0.0
-    min_pair_angle_deg: float = 0.0
-    confidence: float = 0.0
-
-    def summary(self) -> Dict[str, Any]:
-        return {
-            "is_valid": bool(self.is_valid),
-            "reason": str(self.reason),
-            "goal_id": str(self.goal_id),
-            "ray_count": int(self.ray_count),
-            "point_xz": np.round(np.asarray(self.point_xz, dtype=np.float32), 3).tolist()
-            if self.point_xz is not None
-            else [],
-            "condition_number": round(float(self.condition_number), 3),
-            "mean_residual_m": round(float(self.mean_residual_m), 3),
-            "min_pair_angle_deg": round(float(self.min_pair_angle_deg), 2),
-            "confidence": round(float(self.confidence), 3),
-        }
-
-    def to_dict(self) -> Dict[str, Any]:
-        return as_serializable(self.summary())
-
-
-@dataclass
-class AudioTarget2p5D:
-    goal_id: str = ""
-    is_valid: bool = False
-    reason: str = ""
-    xz_source: str = ""
-    height_source: str = "unknown"
-    target_xz: Optional[np.ndarray] = None
-    target_xyz: Optional[np.ndarray] = None
-    confidence: float = 0.0
-    visual_score: float = 0.0
-
-    def summary(self) -> Dict[str, Any]:
-        return {
-            "goal_id": str(self.goal_id),
-            "is_valid": bool(self.is_valid),
-            "reason": str(self.reason),
-            "xz_source": str(self.xz_source),
-            "height_source": str(self.height_source),
-            "target_xz": np.round(np.asarray(self.target_xz, dtype=np.float32), 3).tolist()
-            if self.target_xz is not None
-            else [],
-            "target_xyz": np.round(np.asarray(self.target_xyz, dtype=np.float32), 3).tolist()
-            if self.target_xyz is not None
-            else [],
-            "confidence": round(float(self.confidence), 3),
-            "visual_score": round(float(self.visual_score), 3),
+            "valid_subframe_count": int(self.valid_subframe_count),
+            "total_subframe_count": int(self.total_subframe_count),
+            "spread_deg": round(float(self.spread_deg), 2),
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -305,11 +207,6 @@ class AudioPerceptionState:
     packet: Optional[AudioObservationPacket] = None
     protocol: AudioProtocolState = field(default_factory=AudioProtocolState)
     bearing: AudioBearingEstimate = field(default_factory=AudioBearingEstimate)
-    ray: AudioRay2D = field(default_factory=AudioRay2D)
-    belief: AudioBelief2DState = field(default_factory=AudioBelief2DState)
-    triangulation: AudioTriangulation2D = field(default_factory=AudioTriangulation2D)
-    target_2p5d: AudioTarget2p5D = field(default_factory=AudioTarget2p5D)
-    queue_depths: Dict[str, int] = field(default_factory=dict)
 
     def summary(self) -> Dict[str, Any]:
         expected_labels = tuple(self.protocol.expected_labels)
@@ -323,14 +220,7 @@ class AudioPerceptionState:
             "score_threshold": round(float(self.score_threshold), 2),
             "scope": str(self.scope),
             "scores": {str(key): round(float(value), 2) for key, value in self.scores.items()},
-            "packet": self.packet.summary() if self.packet is not None else {},
-            "protocol": self.protocol.summary(),
             "bearing": self.bearing.summary(),
-            "ray": self.ray.summary(),
-            "belief": self.belief.summary(),
-            "triangulation": self.triangulation.summary(),
-            "target_2p5d": self.target_2p5d.summary(),
-            "queue_depths": {str(key): int(value) for key, value in self.queue_depths.items()},
             "label_matches_expected": bool(label_matches_expected),
         }
 

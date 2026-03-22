@@ -1,11 +1,8 @@
 from ss_baselines.omega_nav.perception.base import (
     AudioBearingEstimate,
-    AudioBelief2DState,
     AudioObservationPacket,
     AudioPerceptionState,
     AudioProtocolState,
-    AudioRay2D,
-    AudioTriangulation2D,
     MapObservation,
     PerceptionOutput,
     SemanticVoxelMapState,
@@ -13,12 +10,9 @@ from ss_baselines.omega_nav.perception.base import (
 
 __all__ = [
     "AudioBearingEstimate",
-    "AudioBelief2DState",
     "AudioObservationPacket",
     "AudioPerceptionState",
     "AudioProtocolState",
-    "AudioRay2D",
-    "AudioTriangulation2D",
     "MapObservation",
     "PerceptionEncoder",
     "PerceptionOutput",

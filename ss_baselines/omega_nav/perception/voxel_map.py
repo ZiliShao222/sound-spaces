@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -17,6 +17,9 @@ class VoxelCell:
     last_seen_step: int = 0
     feature: Optional[np.ndarray] = None
     feature_weight: float = 0.0
+    audio_support: float = 0.0
+    audio_scores: Dict[str, float] = field(default_factory=dict)
+    audio_last_step: int = -1
 
 
 class SemanticVoxelMap:
@@ -63,6 +66,15 @@ class SemanticVoxelMap:
         }
         occupied_voxel_count = 0
         semantic_voxel_count = 0
+        audio_voxel_count = 0
+        audio_peak: Dict[str, Any] = {
+            "support": 0.0,
+            "position": [],
+            "cell": [],
+            "label": "",
+            "label_score": 0.0,
+            "scores": {},
+        }
 
         for index, cell in self._voxels.items():
             center = self._voxel_center(index)
@@ -79,6 +91,21 @@ class SemanticVoxelMap:
                     occupancy[gx, gz] = 0
             if cell.log_odds >= self._occupied_threshold:
                 occupied_voxel_count += 1
+            if cell.audio_support > 1e-6:
+                audio_voxel_count += 1
+                dominant_label = ""
+                dominant_score = 0.0
+                if len(cell.audio_scores) > 0:
+                    dominant_label, dominant_score = max(cell.audio_scores.items(), key=lambda item: float(item[1]))
+                if float(cell.audio_support) > float(audio_peak.get("support", 0.0)):
+                    audio_peak = {
+                        "support": float(cell.audio_support),
+                        "position": np.asarray(center, dtype=np.float32).copy(),
+                        "cell": [int(index[0]), int(index[1]), int(index[2])],
+                        "label": str(dominant_label),
+                        "label_score": float(dominant_score),
+                        "scores": {str(key): float(value) for key, value in cell.audio_scores.items()},
+                    }
             if cell.feature is None or cell.log_odds < self._occupied_threshold:
                 continue
             semantic_voxel_count += 1
@@ -106,10 +133,46 @@ class SemanticVoxelMap:
             frontier=frontier,
             goal_maps=goal_maps,
             goal_peaks=goal_peaks,
+            audio_peak=audio_peak,
             voxel_count=len(self._voxels),
             occupied_voxel_count=occupied_voxel_count,
             semantic_voxel_count=semantic_voxel_count,
+            audio_voxel_count=audio_voxel_count,
         )
+
+    def audio_summary(self) -> Dict[str, Any]:
+        audio_voxel_count = 0
+        peak: Dict[str, Any] = {
+            "support": 0.0,
+            "position": [],
+            "cell": [],
+            "label": "",
+            "label_score": 0.0,
+            "scores": {},
+        }
+        for index, cell in self._voxels.items():
+            if float(cell.audio_support) <= 1e-6:
+                continue
+            audio_voxel_count += 1
+            if float(cell.audio_support) <= float(peak.get("support", 0.0)):
+                continue
+            center = self._voxel_center(index)
+            dominant_label = ""
+            dominant_score = 0.0
+            if len(cell.audio_scores) > 0:
+                dominant_label, dominant_score = max(cell.audio_scores.items(), key=lambda item: float(item[1]))
+            peak = {
+                "support": float(cell.audio_support),
+                "position": np.asarray(center, dtype=np.float32).copy(),
+                "cell": [int(index[0]), int(index[1]), int(index[2])],
+                "label": str(dominant_label),
+                "label_score": float(dominant_score),
+                "scores": {str(key): float(value) for key, value in cell.audio_scores.items()},
+            }
+        return {
+            "audio_voxel_count": int(audio_voxel_count),
+            "audio_peak": peak,
+        }
 
     def _integrate_depth(self, observation: MapObservation) -> None:
         height, width = observation.depth.shape
@@ -138,8 +201,10 @@ class SemanticVoxelMap:
         stride = self._semantic_patch_stride
         patches: List[np.ndarray] = []
         indices: List[Tuple[int, int, int]] = []
-        for top in range(0, max(height - patch + 1, 1), stride):
-            for left in range(0, max(width - patch + 1, 1), stride):
+        row_stop = max(height - patch + 1, 1)
+        col_stop = max(width - patch + 1, 1)
+        for top in range(0, row_stop, stride):
+            for left in range(0, col_stop, stride):
                 depth_patch = observation.depth[top : top + patch, left : left + patch]
                 finite = depth_patch[np.isfinite(depth_patch)]
                 if finite.size == 0:
@@ -169,7 +234,7 @@ class SemanticVoxelMap:
         x_angle = ((float(col) + 0.5) / float(width) - 0.5) * hfov
         y_angle = ((float(row) + 0.5) / float(height) - 0.5) * vfov
         direction = np.asarray([np.tan(x_angle), -np.tan(y_angle), -1.0], dtype=np.float32)
-        direction /= float(np.linalg.norm(direction))
+        direction /= max(float(np.linalg.norm(direction)), 1e-6)
         local = direction * float(depth)
         xz_offset = rotate_local_offset(observation.heading_rad, (local[0], 0.0, local[2]))
         return np.asarray(
