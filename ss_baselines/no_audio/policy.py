@@ -10,7 +10,7 @@ import torch
 from ss_baselines.common.omni_long_eval_policy import (
     LifelongEvalContext,
     LifelongEvalPolicy,
-    MOVE_FORWARD_ACTION_ID,
+    TURN_RIGHT_ACTION_ID,
     register_lifelong_eval_policy,
 )
 from ss_baselines.omega_nav.perception import PerceptionEncoder, PerceptionOutput
@@ -134,8 +134,8 @@ class NoAudioOmegaNavPolicy(LifelongEvalPolicy):
         self._last_info = context.info
         # 执行感知处理：处理观测数据和当前步数
         self._last_perception = self._perception.percept(observations, context.step_index)
-        # TODO: 根据语义体素地图实现导航决策，当前为占位实现
-        self._last_action = int(MOVE_FORWARD_ACTION_ID)
+        # 当前为占位实现
+        self._last_action = int(TURN_RIGHT_ACTION_ID)
         # 增加轨迹步数计数
         self._trajectory_step_index += 1
         # 返回执行的动作

@@ -177,7 +177,6 @@ class NoImageTextOmegaNavPolicy(LifelongEvalPolicy):
         return int(TURN_RIGHT_ACTION_ID)
 
     def _direction_to_action(self, relative_bearing_deg: float) -> int:
-        """Convert relative bearing (degrees) to action ID."""
         # 使用omega_nav/utils.py中的coarse_direction_from_angle函数来将相对方位角转换为粗略的方向类别
         from ss_baselines.omega_nav.utils import coarse_direction_from_angle
 
