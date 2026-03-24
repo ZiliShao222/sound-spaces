@@ -1,0 +1,72 @@
+goal_encoder:
+  embedding_dim: 32
+  image_histogram_bins: 8
+
+visual:
+  describe_every: 5
+  top_m: 3
+  min_visible_pixels: 24
+  max_summary_objects: 4
+  enabled: false
+
+audio:
+  anchor_count: 5
+  aggregation_window: 2
+  waveform_window_sec: 1.0
+  detection_threshold: 0.60
+  embedding_dim: 32
+  ear_distance_m: 0.18
+  speed_of_sound_mps: 343.0
+  reference_rms: 0.05
+  sampling_rate_hz: 16000
+  step_time_s: 0.25
+  protocol_cycle_steps: 25
+  protocol_transient_steps: 3
+  trace_history_size: 32
+  gcc_interp: 8
+  bearing_peak_exclusion_bins: 8
+  bearing_min_peak_ratio: 1.05
+  bearing_min_confidence: 0.15
+  bearing_subframe_samples: 1024
+  bearing_subframe_hop_samples: 512
+  bearing_min_valid_subframes: 2
+  bearing_max_spread_deg: 12.0
+  world_tracker_angle_bin_deg: 2.0
+  world_tracker_min_evidence_frames: 3
+  world_tracker_min_heading_span_deg: 45.0
+  world_tracker_min_confidence: 0.3
+  world_tracker_max_posterior_entropy: 0.98
+  world_tracker_background_history_size: 8
+  world_tracker_background_min_history: 2
+  world_tracker_background_strength: 0.75
+
+depth:
+  voxel_size_m: 0.10
+  map_resolution_m: 0.04
+  map_size_cells: 800
+  max_depth_m: 6.0
+  min_depth_m: 0.1
+  sample_stride: 16
+  hfov_deg: 90.0
+  frontier_max_points: 24
+  assume_normalized_depth: true
+
+memory:
+  working_window: 8
+  episodic_decay: 0.2
+  episodic_prune_threshold: 0.05
+  revisit_radius_m: 1.5
+
+planner:
+  submit_distance_m: 1.0
+  distance_penalty: 0.05
+  visible_priority_bonus: 0.0
+  audio_priority_bonus: 1.2
+  hint_priority_bonus: 0.8
+
+navigator:
+  follower_goal_radius: 0.001
+
+policy:
+  submit_action_name: LIFELONG_SUBMIT
+  stop_action_name: STOP
